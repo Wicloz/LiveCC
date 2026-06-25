@@ -59,10 +59,14 @@ _FIRST_OUTPUT_TIMEOUT = 45
 _STALL_TIMEOUT = 30
 _DOWNLOAD_TIMEOUT = 1800   # full section download for --loop
 
-# Audio is DFPWM1a: 1 bit/sample, decoded natively on the client by
-# cc.audio.dfpwm (fast, no Lua parse).  8 samples per byte.
+# Audio is DFPWM1a: 1 bit/sample, decoded on the client by cc.audio.dfpwm.
+# 8 samples per byte.
 SAMPLES_PER_BYTE = 8
-AUDIO_READ_BYTES = 6000   # DFPWM -> 48000 samples -> 1.0 s per chunk at 48 kHz
+# Keep chunks short.  The client decodes each chunk inline on the same coroutine
+# that renders video, and a full second of DFPWM (48000 samples) blocked rendering
+# for the whole decode — a visible stutter once per second.  ~0.1 s chunks make
+# each decode short enough to interleave with frame rendering instead.
+AUDIO_READ_BYTES = 600    # DFPWM -> 4800 samples -> 0.1 s per chunk at 48 kHz
 
 # No server-side audio filtering.  Earlier encode-side processing (highpass /
 # lowpass / volume, and before that dynaudnorm / loudnorm / limiter) was reported

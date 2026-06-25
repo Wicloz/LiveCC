@@ -143,7 +143,7 @@ local ws = nil
 local dfpwm = require("cc.audio.dfpwm")
 local decoder = dfpwm.make_decoder()   -- stateful: feed chunks in arrival order
 local audio_queue = {}
-local MAX_AUDIO_CHUNKS = 8             -- ~8 s at 1 s/chunk (safety cap)
+local MAX_AUDIO_CHUNKS = 80            -- ~8 s at 0.1 s/chunk (safety cap)
 
 -- No extra postfilter here: cc.audio.dfpwm's decoder already applies the codec's
 -- advised cleanup internally (antijerk at bit transitions + a 140/256 one-pole
@@ -247,6 +247,9 @@ parallel.waitForAny(
                     render_frame(msg:sub(2))
                 elseif op == 2 then
                     -- Decode here, in arrival order, to keep the decoder in sync.
+                    -- Chunks are kept short server-side (~0.1 s) so this decode
+                    -- stays brief and interleaves with video frames rather than
+                    -- stalling rendering once per chunk.
                     audio_queue[#audio_queue + 1] = decoder(msg:sub(2))
                     while #audio_queue > MAX_AUDIO_CHUNKS do
                         table.remove(audio_queue, 1)   -- drop oldest, stay in sync

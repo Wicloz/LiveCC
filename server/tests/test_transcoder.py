@@ -196,6 +196,14 @@ def test_scan_moov_position():
     assert transcoder._scan_moov_position(b"\x00\x00\x00") is None
 
 
+def test_audio_chunk_is_short_to_avoid_periodic_video_stall():
+    # The CC client decodes each audio chunk inline on the coroutine that also
+    # renders video.  A ~1 s chunk blocked rendering for the whole decode once per
+    # second (visible stutter), so chunks must stay short enough to interleave.
+    chunk_seconds = transcoder.AUDIO_READ_BYTES * transcoder.SAMPLES_PER_BYTE / 48000.0
+    assert chunk_seconds <= 0.2
+
+
 def test_audio_ffmpeg_cmd_has_no_server_side_filtering():
     # Server-side audio filtering was reported to make audio worse, so the source
     # is fed straight into the DFPWM encoder — no -af chain on either path.
