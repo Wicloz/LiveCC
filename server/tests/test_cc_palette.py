@@ -25,6 +25,17 @@ def test_quantize_known_colors(rgb, expected):
     assert int(quantize(_solid(rgb, 3, 3))[0, 0]) == expected
 
 
+def test_neutral_grays_map_to_neutral_palette_entries():
+    # Regression: with RGB-Euclidean nearest-colour, neutral greys mapped to
+    # chromatic entries (light greys -> pink, mid greys -> brown).  CIELAB ΔE
+    # keeps a grey's a*/b* near zero, so every grey on the ramp must land on a
+    # neutral CC colour: black(15), gray(7), light_gray(8) or white(0).
+    NEUTRAL = {0, 7, 8, 15}
+    for v in range(0, 256, 3):
+        idx = int(quantize(_solid((v, v, v), 1, 1))[0, 0])
+        assert idx in NEUTRAL, f"grey ({v},{v},{v}) mapped to non-neutral index {idx}"
+
+
 def test_quantize_each_palette_entry_maps_to_itself():
     for i, rgb in enumerate(_CC_RGB.astype(np.uint8)):
         px = np.array(rgb, dtype=np.uint8).reshape(1, 1, 3)

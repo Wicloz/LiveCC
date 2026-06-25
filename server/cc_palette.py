@@ -49,13 +49,57 @@ _BLIT_LUT = np.frombuffer(b"0123456789abcdef", dtype=np.uint8)
 _BITS = np.array([1, 2, 4, 8, 16], dtype=np.uint8)
 
 
+# Channel precision of the precomputed nearest-colour LUT.  6 bits (input snapped
+# to steps of 4) is plenty: CC's 16 palette colours sit far enough apart that a
+# ±4 input change almost never flips which one is nearest, so 8 bits would 64x the
+# table (16 MiB vs 256 KiB) and the build cost for no visible gain.  The builder
+# is chunked, so 8 bits is *viable* (set _BITS_PER_CHANNEL = 8) — just not worth it.
+_BITS_PER_CHANNEL = 6
+_SHIFT = 8 - _BITS_PER_CHANNEL
+
+
+def _srgb_to_lab(rgb: np.ndarray) -> np.ndarray:
+    """Convert sRGB (last axis = R,G,B in 0..255) to CIELAB (D65 white point)."""
+    rgb = np.asarray(rgb, dtype=np.float32) / 255.0
+    lin = np.where(rgb > 0.04045, ((rgb + 0.055) / 1.055) ** 2.4, rgb / 12.92)
+    m = np.array([                                   # linear sRGB -> XYZ (D65)
+        [0.4124564, 0.3575761, 0.1804375],
+        [0.2126729, 0.7151522, 0.0721750],
+        [0.0193339, 0.1191920, 0.9503041],
+    ], dtype=np.float32)
+    xyz = (lin @ m.T) / np.array([0.95047, 1.0, 1.08883], dtype=np.float32)
+    eps, kappa = 216 / 24389, 24389 / 27
+    f = np.where(xyz > eps, np.cbrt(xyz), (kappa * xyz + 16) / 116)
+    return np.stack([
+        116 * f[..., 1] - 16,            # L*
+        500 * (f[..., 0] - f[..., 1]),   # a*
+        200 * (f[..., 1] - f[..., 2]),   # b*
+    ], axis=-1)
+
+
 def _build_lut() -> np.ndarray:
-    """Pre-compute a 64x64x64 table mapping 6-bit RGB -> nearest palette index."""
-    idx = np.arange(64, dtype=np.float32) * 4.0
-    r, g, b = np.meshgrid(idx, idx, idx, indexing="ij")
-    grid = np.stack([r, g, b], axis=-1).reshape(-1, 3)
-    dists = np.sum((grid[:, None, :] - _CC_RGB[None, :, :]) ** 2, axis=2)
-    return np.argmin(dists, axis=1).reshape(64, 64, 64).astype(np.uint8)
+    """Pre-compute a table mapping reduced-precision RGB -> nearest palette index.
+
+    "Nearest" is CIELAB ΔE (perceptual), not RGB Euclidean distance.  In RGB a
+    luminance gap counts the same as a chroma gap, so neutral greys map to
+    chromatic entries — light greys (~190-210) land on pink, mid greys on brown —
+    because CC's neutral colours are sparse along the brightness axis and pink /
+    brown sit in the gaps.  Lab keeps a neutral grey's a*/b* near 0, so it snaps to
+    black / grey / light-grey / white as expected.
+
+    Built one R-slice at a time so peak memory stays small even at 8-bit.
+    """
+    n = 1 << _BITS_PER_CHANNEL
+    levels = np.arange(n, dtype=np.float32) * (1 << _SHIFT)   # reconstructed 0..256-step
+    pal_lab = _srgb_to_lab(_CC_RGB)                           # (16, 3)
+    gg, bb = np.meshgrid(levels, levels, indexing="ij")      # (n, n) each
+    lut = np.empty((n, n, n), dtype=np.uint8)
+    for ri in range(n):
+        rr = np.full((n, n), levels[ri], dtype=np.float32)
+        lab = _srgb_to_lab(np.stack([rr, gg, bb], axis=-1))  # (n, n, 3)
+        d = ((lab[:, :, None, :] - pal_lab) ** 2).sum(-1)    # (n, n, 16)
+        lut[ri] = np.argmin(d, axis=2).astype(np.uint8)
+    return lut
 
 
 _LUT: np.ndarray = _build_lut()
@@ -63,10 +107,10 @@ _LUT: np.ndarray = _build_lut()
 
 def quantize(frame_rgb: np.ndarray) -> np.ndarray:
     """Map an H x W x 3 uint8 RGB array to an H x W uint8 array of palette indices."""
-    r6 = frame_rgb[:, :, 0] >> 2
-    g6 = frame_rgb[:, :, 1] >> 2
-    b6 = frame_rgb[:, :, 2] >> 2
-    return _LUT[r6, g6, b6]
+    r = frame_rgb[:, :, 0] >> _SHIFT
+    g = frame_rgb[:, :, 1] >> _SHIFT
+    b = frame_rgb[:, :, 2] >> _SHIFT
+    return _LUT[r, g, b]
 
 
 def encode_frame(frame_rgb: np.ndarray) -> bytes:
