@@ -23,8 +23,10 @@ def test_splitter_emits_one_complete_frame():
     frames = list(s.push(bytes([17]) * (px_w * px_h * 3)))   # solid
     assert len(frames) == 1
     assert s.count == 1
-    # header reports W=4, H=2
-    assert frames[0][0:4] == bytes((0, 4, 0, 2))
+    # push() now yields the raw (H, W, 3) array; encoding is done separately.
+    assert frames[0].shape == (px_h, px_w, 3)
+    # encode_frame still produces the right header: W=4, H=2.
+    assert transcoder.encode_frame(frames[0])[0:4] == bytes((0, 4, 0, 2))
 
 
 def test_splitter_buffers_partial_frames():
@@ -198,11 +200,12 @@ def test_ffmpeg_rawvideo_feeds_splitter():
     assert len(proc.stdout) == px_w * px_h * 3 * fps
 
     s = _FrameSplitter(px_w, px_h)
-    frames = list(s.push(proc.stdout))
-    assert len(frames) == fps
-    assert frames[0][0:4] == bytes((0, term_w, 0, term_h))
-    # each frame is header + term_h rows * 3 strings * term_w bytes
-    assert len(frames[0]) == 4 + term_h * 3 * term_w
+    raw_frames = list(s.push(proc.stdout))
+    assert len(raw_frames) == fps
+    enc = transcoder.encode_frame(raw_frames[0])
+    assert enc[0:4] == bytes((0, term_w, 0, term_h))
+    # each encoded frame is header + term_h rows * 3 strings * term_w bytes
+    assert len(enc) == 4 + term_h * 3 * term_w
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")

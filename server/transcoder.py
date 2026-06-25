@@ -166,7 +166,12 @@ async def _read_with_timeout(proc: subprocess.Popen, size: int, timeout: float) 
 # --------------------------------------------------------------------------- #
 
 class _FrameSplitter:
-    """Accumulate raw rgb24 bytes and emit encoded 2x3 frames per complete frame."""
+    """Accumulate raw rgb24 bytes and emit each complete frame as an (H, W, 3) array.
+
+    Splitting only — the CPU-heavy encode_frame() is applied separately (in
+    iter_video) so it can run off the event loop in a worker thread.  Keeping the
+    two apart is what lets the pacing scheduler stay responsive; see iter_video.
+    """
 
     def __init__(self, px_w: int, px_h: int) -> None:
         self.px_w = px_w
@@ -175,14 +180,13 @@ class _FrameSplitter:
         self._buf = bytearray()
         self._n = 0
 
-    def push(self, chunk: bytes) -> Iterator[bytes]:
+    def push(self, chunk: bytes) -> Iterator[np.ndarray]:
         self._buf.extend(chunk)
         while len(self._buf) >= self.frame_bytes:
             raw = bytes(self._buf[: self.frame_bytes])
             del self._buf[: self.frame_bytes]
-            arr = np.frombuffer(raw, dtype=np.uint8).reshape(self.px_h, self.px_w, 3)
-            yield encode_frame(arr)
             self._n += 1
+            yield np.frombuffer(raw, dtype=np.uint8).reshape(self.px_h, self.px_w, 3)
 
     @property
     def count(self) -> int:
@@ -319,6 +323,7 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
     ytdlp: subprocess.Popen | None = None
     ffmpeg: subprocess.Popen | None = None
     splitter = _FrameSplitter(px_w, px_h)
+    loop = asyncio.get_running_loop()
     try:
         if source_path:
             ffmpeg = subprocess.Popen(
@@ -348,8 +353,22 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
                 break
             if not chunk:
                 break
-            for frame in splitter.push(chunk):
-                yield frame
+            for arr in splitter.push(chunk):
+                # Encode off the event loop.  encode_frame() is CPU-heavy numpy;
+                # run inline it would block the single-threaded pacing scheduler
+                # (session.run) between frames, so frames go out in bursts and the
+                # client — which renders each frame on arrival, with no jitter
+                # buffer — stutters.  numpy releases the GIL, so offloading lets the
+                # loop release buffered frames on a steady cadence while this worker
+                # encodes.  Frames are awaited one at a time, preserving order.
+                #
+                # Deferred redesign: move the whole video pipeline (read + encode)
+                # onto its own thread for cleaner isolation.  Bigger change — it
+                # reintroduces backpressure (TimedBuffer.put) and cancellation
+                # (agen.aclose) as things we'd hand-roll across a sync/async queue.
+                # See memory note [[video-encode-offload]].  Not worth it until this
+                # targeted offload proves insufficient.
+                yield await loop.run_in_executor(_executor, encode_frame, arr)
     except asyncio.CancelledError:
         raise
     except Exception:
