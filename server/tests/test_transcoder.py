@@ -238,6 +238,7 @@ NASA_LIVE_STREAMS = [
 _HAS_JS_RUNTIME = any(shutil.which(x) for x in ("deno", "node", "bun"))
 
 
+@pytest.mark.youtube
 @pytest.mark.skipif(
     not (shutil.which("ffmpeg") and shutil.which("yt-dlp") and _HAS_JS_RUNTIME),
     reason="live test needs ffmpeg, yt-dlp and a JS runtime (deno/node) on PATH",
