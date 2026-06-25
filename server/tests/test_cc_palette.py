@@ -36,6 +36,16 @@ def test_neutral_grays_map_to_neutral_palette_entries():
         assert idx in NEUTRAL, f"grey ({v},{v},{v}) mapped to non-neutral index {idx}"
 
 
+def test_light_chromatic_colors_do_not_wash_to_white():
+    # Regression: equal-weight CIELAB ΔE collapsed light, low-chroma colours to
+    # white (CC's only light palette entry), washing light blues out.  The chroma
+    # up-weight (_CHROMA_WEIGHT) must keep a clear light blue mapped to a blue
+    # entry, not white(0).
+    for rgb in [(150, 180, 235), (165, 195, 240)]:
+        idx = int(quantize(_solid(rgb, 1, 1))[0, 0])
+        assert idx in {3, 11}, f"light blue {rgb} washed to index {idx}, expected ltblue/blue"
+
+
 def test_quantize_each_palette_entry_maps_to_itself():
     for i, rgb in enumerate(_CC_RGB.astype(np.uint8)):
         px = np.array(rgb, dtype=np.uint8).reshape(1, 1, 3)

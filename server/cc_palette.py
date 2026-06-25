@@ -57,6 +57,16 @@ _BITS = np.array([1, 2, 4, 8, 16], dtype=np.uint8)
 _BITS_PER_CHANNEL = 6
 _SHIFT = 8 - _BITS_PER_CHANNEL
 
+# Chroma weight in the CIELAB nearest-colour search: distance = ΔL² + w·(Δa²+Δb²).
+# Equal weight (w=1) is "correct" perceptual ΔE, but CC's palette has only one
+# light colour (white) and a big lightness gap below it, so plain ΔE collapses
+# every light, low-chroma pixel to white — light blues, pale tints all wash out.
+# Up-weighting chroma pulls those back toward their hue.  It's safe for neutrals
+# (black/gray/light_gray/white are all chroma-zero, so lightness still separates
+# them — the grey ramp is unchanged) and preserves the palette round-trip.
+# Higher = more colourful / less white (w≈6 ≈ the old RGB look); 1 = literal ΔE.
+_CHROMA_WEIGHT = 4.0
+
 
 def _srgb_to_lab(rgb: np.ndarray) -> np.ndarray:
     """Convert sRGB (last axis = R,G,B in 0..255) to CIELAB (D65 white point)."""
@@ -103,7 +113,8 @@ def _build_lut() -> np.ndarray:
     for ri in range(n):
         rr = np.full((n, n), levels[ri], dtype=np.float32)
         lab = _srgb_to_lab(np.stack([rr, gg, bb], axis=-1))  # (n, n, 3)
-        d = ((lab[:, :, None, :] - pal_lab) ** 2).sum(-1)    # (n, n, 16)
+        diff = lab[:, :, None, :] - pal_lab                  # (n, n, 16, 3)
+        d = diff[..., 0] ** 2 + _CHROMA_WEIGHT * (diff[..., 1:] ** 2).sum(-1)
         lut[ri] = np.argmin(d, axis=2).astype(np.uint8)
     return lut
 
