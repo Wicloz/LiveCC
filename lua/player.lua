@@ -145,25 +145,10 @@ local decoder = dfpwm.make_decoder()   -- stateful: feed chunks in arrival order
 local audio_queue = {}
 local MAX_AUDIO_CHUNKS = 8             -- ~8 s at 1 s/chunk (safety cap)
 
--- DFPWM postfilter.  A raw 1-bit decode carries a ~Nyquist/2 whine that's
--- intrinsic to the codec; cc.audio.dfpwm returns those samples unfiltered.  The
--- reference spec removes it with a one-pole low-pass on the decoded amplitudes:
---   out += (sample - out) * (POSTFILTER_K / 256)
--- Lower K = smoother (less whine, duller); 100/256 is the spec's suggestion.
--- State (out) persists across chunks so the filter stays continuous, so — like
--- the decoder — chunks must be filtered in arrival order.
-local POSTFILTER_K = 100
-local _pf_out = 0
-
-local function postfilter(samples)
-    for i = 1, #samples do
-        _pf_out = _pf_out + (samples[i] - _pf_out) * POSTFILTER_K / 256
-        local v = math.floor(_pf_out + 0.5)
-        if v > 127 then v = 127 elseif v < -128 then v = -128 end
-        samples[i] = v
-    end
-    return samples
-end
+-- No extra postfilter here: cc.audio.dfpwm's decoder already applies the codec's
+-- advised cleanup internally (antijerk at bit transitions + a 140/256 one-pole
+-- low-pass), returning the filtered, listenable PCM.  Adding our own low-pass on
+-- top just cascades a second roll-off and muffles the audio.
 
 local function play_on_all(samples)
     if #samples == 0 then return end
@@ -261,9 +246,8 @@ parallel.waitForAny(
                 if op == 1 then
                     render_frame(msg:sub(2))
                 elseif op == 2 then
-                    -- Decode + postfilter here, in arrival order, to keep both
-                    -- the decoder and the postfilter state in sync.
-                    audio_queue[#audio_queue + 1] = postfilter(decoder(msg:sub(2)))
+                    -- Decode here, in arrival order, to keep the decoder in sync.
+                    audio_queue[#audio_queue + 1] = decoder(msg:sub(2))
                     while #audio_queue > MAX_AUDIO_CHUNKS do
                         table.remove(audio_queue, 1)   -- drop oldest, stay in sync
                     end
