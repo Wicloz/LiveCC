@@ -34,8 +34,9 @@ from transcoder import (
     download_source,
     iter_audio,
     iter_video,
+    needs_seekable_source,
     parse_timestamp,
-    probe_is_live,
+    probe_source_info,
 )
 
 log = logging.getLogger("livecc")
@@ -129,8 +130,9 @@ class StreamSession:
         self.prebuffer = VOD_PREBUFFER
         self._start_eff = 0                             # effective offset (VOD only)
         self._end_eff: Optional[int] = None
-        self._source_path: Optional[str] = None         # temp file when looping
+        self._source_path: Optional[str] = None         # temp file (loop / seekable)
         self._tmpdir: Optional[str] = None
+        self._need_seekable = False                      # MP4-family VOD -> download
 
         self.video_buf: TimedBuffer | None = None
         self.audio_buf: TimedBuffer | None = None
@@ -161,7 +163,7 @@ class StreamSession:
         # not prompt enough and would leave the pipeline running.
         agen = iter_video(self.url, self.w, self.h, self.fps,
                           start=self._start_eff, end=self._end_eff,
-                          source_path=self._source_path)
+                          source_path=self._source_path, loop=self.loop)
         i = 0
         try:
             async for frame in agen:
@@ -175,7 +177,7 @@ class StreamSession:
     async def _produce_audio(self) -> None:
         agen = iter_audio(self.url, self.rate,
                           start=self._start_eff, end=self._end_eff,
-                          source_path=self._source_path)
+                          source_path=self._source_path, loop=self.loop)
         samples = 0
         try:
             async for chunk in agen:
@@ -226,29 +228,38 @@ class StreamSession:
 
     async def run(self, ws) -> None:
         loop = asyncio.get_running_loop()
-        self.is_live = await probe_is_live(self.url)
+        self.is_live, ext = await probe_source_info(self.url)
         # start/end only make sense for VOD; ignore them for live streams.
         self._start_eff = 0 if self.is_live else self.start
         self._end_eff = None if self.is_live else self.end
         self._setup_buffers()
+
+        # A VOD whose container can hide its index at the end (MP4 family) can't be
+        # demuxed from a non-seekable pipe, so decode it from a downloaded file.
+        # Live never hits this (segmented), and --loop already downloads anyway.
+        self._need_seekable = not self.is_live and needs_seekable_source(ext)
+
         await ws.send_text(f"META {self.w} {self.h} {self.fps}")
-        log.info("session: %s is_live=%s audio=%s start=%ss end=%s loop=%s",
-                 self.url, self.is_live, self.want_audio,
-                 self._start_eff, self._end_eff, self.loop and not self.is_live)
+        log.info("session: %s is_live=%s ext=%s audio=%s start=%ss end=%s loop=%s seekable=%s",
+                 self.url, self.is_live, ext, self.want_audio,
+                 self._start_eff, self._end_eff, self.loop and not self.is_live,
+                 self._need_seekable)
 
         tasks: list[asyncio.Task] = []
         try:
             await ws.send_text("BUFFERING")
 
-            # --loop: cache the [start,end] section once, then ffmpeg replays it.
-            if self.loop and not self.is_live:
+            # Download the [start,end] section to a seekable temp file when we
+            # either need to replay it (--loop) or can't pipe-stream the container
+            # (MP4 moov-at-end).  Then ffmpeg decodes the file; --loop also replays.
+            if (self.loop or self._need_seekable) and not self.is_live:
                 self._tmpdir = tempfile.mkdtemp(prefix="livecc_")
                 self._source_path = await download_source(
                     self.url, self._tmpdir, self._start_eff, self._end_eff,
                     self.want_audio)
                 if not self._source_path:
                     await ws.send_text(
-                        "ERROR Failed to prepare loop. Check the server logs.")
+                        "ERROR Failed to prepare source. Check the server logs.")
                     return
 
             tasks.append(asyncio.create_task(self._produce_video()))

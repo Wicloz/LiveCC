@@ -190,7 +190,7 @@ def _ytdlp_cmd(youtube_url: str, fmt: str, start: int = 0,
 
 
 def _video_ffmpeg_cmd(px_w: int, px_h: int, fps: int,
-                      source: Optional[str] = None) -> list[str]:
+                      source: Optional[str] = None, loop: bool = False) -> list[str]:
     # Letterbox aligned to the 2x3 character grid: snap the scaled content to
     # even width / multiple-of-3 height and pad at even-x / multiple-of-3-y
     # offsets.  Otherwise the content edge lands mid-cell, so boundary cells mix
@@ -202,19 +202,24 @@ def _video_ffmpeg_cmd(px_w: int, px_h: int, fps: int,
         f"fps={fps}"
     )
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "info", "-nostats"]
-    if source:                                   # loop a local file
-        cmd += ["-stream_loop", "-1", "-i", source, "-map", "0:v:0"]
+    if source:                                   # decode a local (seekable) file
+        if loop:                                 # --loop: replay the section forever
+            cmd += ["-stream_loop", "-1"]
+        cmd += ["-i", source, "-map", "0:v:0"]
     else:                                        # stream from yt-dlp pipe
         cmd += ["-i", "pipe:0"]
     cmd += ["-vf", scale, "-an", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]
     return cmd
 
 
-def _audio_ffmpeg_cmd(sample_rate: int, source: Optional[str] = None) -> list[str]:
+def _audio_ffmpeg_cmd(sample_rate: int, source: Optional[str] = None,
+                      loop: bool = False) -> list[str]:
     # DFPWM1a mono — CC's native speaker format (cc.audio.dfpwm decodes it).
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "info", "-nostats"]
     if source:
-        cmd += ["-stream_loop", "-1", "-i", source, "-map", "0:a:0?"]
+        if loop:
+            cmd += ["-stream_loop", "-1"]
+        cmd += ["-i", source, "-map", "0:a:0?"]
     else:
         cmd += ["-i", "pipe:0"]
     cmd += ["-vn", "-ar", str(sample_rate), "-ac", "1",
@@ -226,22 +231,49 @@ def _audio_ffmpeg_cmd(sample_rate: int, source: Optional[str] = None) -> list[st
 # is_live probe
 # --------------------------------------------------------------------------- #
 
-def _probe_is_live_blocking(url: str) -> bool:
+# Containers (ISOBMFF/MP4 family) whose index (moov atom) may sit at the end of
+# the file.  ffmpeg can't demux those from a non-seekable pipe — it would have to
+# read the whole stream to reach moov, by which point mdat is gone — so a VOD in
+# one of these is decoded from a downloaded (seekable) temp file instead.  WebM /
+# Matroska stream fine from a pipe and stay on the streaming path.
+_SEEKABLE_REQUIRED_EXTS = {"mp4", "m4v", "mov", "m4a", "3gp", "3g2"}
+
+
+def _probe_source_blocking(url: str) -> tuple[bool, str]:
+    """Return (is_live, video_ext) for the format we'd actually stream.
+
+    The ext is resolved against _VIDEO_FMT so it reflects the selected stream
+    (e.g. YouTube prefers webm), not the default best format.
+    """
     try:
         out = subprocess.run(
             ["yt-dlp", "--no-warnings", "--quiet", "--no-playlist",
-             "--print", "%(is_live)s", url],
+             "-f", _VIDEO_FMT, "--print", "%(is_live)s\n%(ext)s", url],
             capture_output=True, text=True, timeout=40,
         )
-        return out.stdout.strip().lower() == "true"
+        lines = out.stdout.strip().splitlines()
+        is_live = bool(lines) and lines[0].strip().lower() == "true"
+        ext = lines[1].strip().lower() if len(lines) > 1 else ""
+        return is_live, ext
     except Exception:
-        log.exception("is_live probe failed; assuming VOD")
-        return False
+        log.exception("source probe failed; assuming VOD, streamable")
+        return False, ""
+
+
+async def probe_source_info(url: str) -> tuple[bool, str]:
+    """(is_live, video_ext) — see _probe_source_blocking."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_executor, _probe_source_blocking, url)
+
+
+def needs_seekable_source(ext: str) -> bool:
+    """True if a VOD in container `ext` can't be pipe-streamed (moov-at-end risk)."""
+    return ext.lower() in _SEEKABLE_REQUIRED_EXTS
 
 
 async def probe_is_live(url: str) -> bool:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_executor, _probe_is_live_blocking, url)
+    is_live, _ext = await probe_source_info(url)
+    return is_live
 
 
 # --------------------------------------------------------------------------- #
@@ -301,17 +333,22 @@ async def download_source(url: str, out_dir: str, start: int, end: Optional[int]
 
 async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
                      start: int = 0, end: Optional[int] = None,
-                     source_path: Optional[str] = None) -> AsyncGenerator[bytes, None]:
-    """Yield encoded 2x3 binary frames.  Loops forever when source_path is set."""
+                     source_path: Optional[str] = None,
+                     loop: bool = False) -> AsyncGenerator[bytes, None]:
+    """Yield encoded 2x3 binary frames.
+
+    source_path set => decode that local (seekable) file; loop=True replays it
+    forever (--loop).  Otherwise stream from the yt-dlp pipe.
+    """
     px_w, px_h = term_w * 2, term_h * 3
     ytdlp: subprocess.Popen | None = None
     ffmpeg: subprocess.Popen | None = None
     splitter = _FrameSplitter(px_w, px_h)
-    loop = asyncio.get_running_loop()
+    ev_loop = asyncio.get_running_loop()
     try:
         if source_path:
             ffmpeg = subprocess.Popen(
-                _video_ffmpeg_cmd(px_w, px_h, fps, source=source_path),
+                _video_ffmpeg_cmd(px_w, px_h, fps, source=source_path, loop=loop),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             _spawn_stderr_drain(ffmpeg, "ffmpeg")
@@ -352,7 +389,7 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
                 # (agen.aclose) as things we'd hand-roll across a sync/async queue.
                 # See memory note [[video-encode-offload]].  Not worth it until this
                 # targeted offload proves insufficient.
-                yield await loop.run_in_executor(_executor, encode_frame, arr)
+                yield await ev_loop.run_in_executor(_executor, encode_frame, arr)
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -364,15 +401,20 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
 
 async def iter_audio(youtube_url: str, sample_rate: int = 48000,
                      start: int = 0, end: Optional[int] = None,
-                     source_path: Optional[str] = None) -> AsyncGenerator[bytes, None]:
-    """Yield DFPWM1a audio chunks (mono).  Loops forever when source_path is set."""
+                     source_path: Optional[str] = None,
+                     loop: bool = False) -> AsyncGenerator[bytes, None]:
+    """Yield DFPWM1a audio chunks (mono).
+
+    source_path set => decode that local (seekable) file; loop=True replays it
+    forever (--loop).  Otherwise stream from the yt-dlp pipe.
+    """
     ytdlp: subprocess.Popen | None = None
     ffmpeg: subprocess.Popen | None = None
     sent = 0
     try:
         if source_path:
             ffmpeg = subprocess.Popen(
-                _audio_ffmpeg_cmd(sample_rate, source=source_path),
+                _audio_ffmpeg_cmd(sample_rate, source=source_path, loop=loop),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             _spawn_stderr_drain(ffmpeg, "ffmpeg/audio")
