@@ -1,0 +1,47 @@
+name: docker
+
+on:
+  push:
+    paths:
+      - Dockerfile
+      - docker-compose.yml
+      - .github/workflows/docker.yml
+  pull_request:
+    paths:
+      - Dockerfile
+      - docker-compose.yml
+      - .github/workflows/docker.yml
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Builds the image (which fails early if ffmpeg lacks the dfpwm encoder,
+      # per the Dockerfile's own check) and loads it locally for the smoke test.
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: livecc:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Run the suite inside the shipped image: validates the tests against the
+      # exact runtime that ships (bookworm ffmpeg 5.1, pinned deps, deno), not the
+      # runner's apt ffmpeg. The integration tests run (ffmpeg is present); the
+      # YouTube test is deselected (datacenter IPs get bot-blocked). pytest isn't
+      # a runtime dependency, so it's installed just for this run.
+      - name: Run test suite inside the image
+        run: |
+          docker run --rm -w /app/server livecc:ci \
+            sh -c "pip install --no-cache-dir pytest && pytest -q -m 'not youtube'"
