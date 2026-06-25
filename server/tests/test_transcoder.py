@@ -153,19 +153,13 @@ def test_audio_ffmpeg_cmd_loops_a_file():
     assert "0:a:0?" in cmd            # optional audio map (source may be video-only)
 
 
-def test_audio_ffmpeg_cmd_applies_dfpwm_filters():
-    # Encode-side filtering is deliberately static: a lowpass (the main hiss
-    # reducer) plus a fixed headroom cut.  No dynamic gain (dynaudnorm/loudnorm)
-    # — it pulls the codec's fixed noise floor up in quiet passages.  No hard
-    # limiter either: occasional clips on the loudest peaks are left as charm.
-    # The whine is removed downstream by the decode-side postfilter, not here.
+def test_audio_ffmpeg_cmd_has_no_server_side_filtering():
+    # Server-side audio filtering was reported to make audio worse, so the source
+    # is fed straight into the DFPWM encoder — no -af chain on either path.
     for cmd in (transcoder._audio_ffmpeg_cmd(48000),
                 transcoder._audio_ffmpeg_cmd(48000, source="/tmp/s.mkv")):
-        af = cmd[cmd.index("-af") + 1]
-        assert "lowpass" in af          # the main hiss reducer
-        assert "volume" in af
-        assert "dynaudnorm" not in af and "loudnorm" not in af
-        assert "alimiter" not in af     # no hard limiter by design
+        assert "-af" not in cmd
+        assert "-filter:a" not in cmd
 
 
 # --------------------------------------------------------------------------- #
@@ -209,13 +203,13 @@ def test_ffmpeg_rawvideo_feeds_splitter():
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
-def test_audio_filter_chain_is_valid_ffmpeg():
-    # A typo in the DFPWM filter chain would only surface at runtime, killing the
-    # audio pipeline.  Push a sine through the real chain to dfpwm as a guard.
+def test_dfpwm_encode_is_available_in_ffmpeg():
+    # Guard that this ffmpeg can actually produce DFPWM (CC speaker audio) with the
+    # same output args the audio command uses — a missing encoder would only
+    # surface at runtime otherwise.  Push a sine through to dfpwm.
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-f", "lavfi", "-i", "sine=frequency=440:duration=1:sample_rate=48000",
-        "-af", transcoder._AUDIO_FILTERS,
         "-ar", "48000", "-ac", "1", "-c:a", "dfpwm", "-f", "dfpwm", "pipe:1",
     ]
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

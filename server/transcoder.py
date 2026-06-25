@@ -64,26 +64,10 @@ _DOWNLOAD_TIMEOUT = 1800   # full section download for --loop
 SAMPLES_PER_BYTE = 8
 AUDIO_READ_BYTES = 6000   # DFPWM -> 48000 samples -> 1.0 s per chunk at 48 kHz
 
-# Encode-side filtering for the 1-bit DFPWM codec, kept static and predictable.
-# Two artifacts to manage: a ~Nyquist/2 whine intrinsic to 1-bit modulation, and
-# broadband hiss the predictor generates from high frequencies it can't track.
-# The lowpass is the most effective hiss reducer — rolling off highs *before* the
-# encoder means the predictor never has to chase transitions it would turn into
-# noise.  We avoid dynamic gain (dynaudnorm/loudnorm): the codec has a fixed noise
-# floor, so gain riding just pulls that hiss up in quiet passages.  In order:
-#   highpass  drop sub-40 Hz rumble that wastes the codec's limited range
-#   lowpass   roll off highs the predictor can't track -> much less hiss/whine
-#   volume    a fixed -3 dB cut for headroom (the predictor overshoots transients)
-# No hard limiter: the -3 dB cut keeps most peaks in range, and the occasional
-# clip on the loudest transients is left as part of the codec's lo-fi charm.
-# The decode-side one-pole postfilter in player.lua then cleans up the residual.
-# LOWPASS_HZ is the main hiss/brightness knob: lower = less hiss but duller.
-_LOWPASS_HZ = 10000
-_AUDIO_FILTERS = (
-    "highpass=f=40,"
-    f"lowpass=f={_LOWPASS_HZ},"
-    "volume=-3dB"
-)
+# No server-side audio filtering.  Earlier encode-side processing (highpass /
+# lowpass / volume, and before that dynaudnorm / loudnorm / limiter) was reported
+# to make audio worse, so we feed the source straight into the DFPWM encoder and
+# leave any cleanup to the decode-side postfilter in player.lua.
 
 
 # --------------------------------------------------------------------------- #
@@ -233,7 +217,7 @@ def _audio_ffmpeg_cmd(sample_rate: int, source: Optional[str] = None) -> list[st
         cmd += ["-stream_loop", "-1", "-i", source, "-map", "0:a:0?"]
     else:
         cmd += ["-i", "pipe:0"]
-    cmd += ["-vn", "-af", _AUDIO_FILTERS, "-ar", str(sample_rate), "-ac", "1",
+    cmd += ["-vn", "-ar", str(sample_rate), "-ac", "1",
             "-c:a", "dfpwm", "-f", "dfpwm", "pipe:1"]
     return cmd
 
