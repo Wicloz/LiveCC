@@ -90,7 +90,13 @@ def _build_lut() -> np.ndarray:
     Built one R-slice at a time so peak memory stays small even at 8-bit.
     """
     n = 1 << _BITS_PER_CHANNEL
-    levels = np.arange(n, dtype=np.float32) * (1 << _SHIFT)   # reconstructed 0..256-step
+    step = 1 << _SHIFT
+    # Reconstruct each bucket at its CENTRE, not its floor.  quantize() indexes
+    # with a plain >>_SHIFT (floor), so bucket i covers inputs [i*step, i*step +
+    # step-1]; building the grid at i*step biased every lookup ~step/2 low.  The
+    # (step-1)/2 offset removes that bias at build time — no per-frame add/clamp,
+    # unlike rounding before the shift.  For 8-bit step=1, offset=0 (already exact).
+    levels = np.arange(n, dtype=np.float32) * step + (step - 1) / 2.0
     pal_lab = _srgb_to_lab(_CC_RGB)                           # (16, 3)
     gg, bb = np.meshgrid(levels, levels, indexing="ij")      # (n, n) each
     lut = np.empty((n, n, n), dtype=np.uint8)
