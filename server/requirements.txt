@@ -1,0 +1,7 @@
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+# [default] bundles yt-dlp-ejs (the JS challenge solver), so the deno runtime
+# can solve YouTube's n/sig challenges offline — no runtime download, and the
+# full (DASH) format list stays available instead of just HLS.
+yt-dlp[default]>=2025.1.1
+numpy>=1.26.0
