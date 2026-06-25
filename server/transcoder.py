@@ -231,12 +231,19 @@ def _audio_ffmpeg_cmd(sample_rate: int, source: Optional[str] = None,
 # is_live probe
 # --------------------------------------------------------------------------- #
 
-# Containers (ISOBMFF/MP4 family) whose index (moov atom) may sit at the end of
-# the file.  ffmpeg can't demux those from a non-seekable pipe — it would have to
-# read the whole stream to reach moov, by which point mdat is gone — so a VOD in
-# one of these is decoded from a downloaded (seekable) temp file instead.  WebM /
-# Matroska stream fine from a pipe and stay on the streaming path.
-_SEEKABLE_REQUIRED_EXTS = {"mp4", "m4v", "mov", "m4a", "3gp", "3g2"}
+# Containers (the ISOBMFF / MP4 family) whose index (moov atom) may sit at the end
+# of the file.  ffmpeg can't demux those from a non-seekable pipe — it would have
+# to read the whole stream to reach moov, by which point mdat is gone — so such a
+# VOD is checked with the moov probe and, if moov-at-end, decoded from a downloaded
+# (seekable) temp file instead.  All share the moov/mdat box layout, so the same
+# _scan_moov_position() handles every one.  WebM / Matroska stream fine from a pipe.
+_SEEKABLE_REQUIRED_EXTS = {
+    "mp4", "m4v", "m4a", "m4b",   # MPEG-4 (video / audio / audiobook)
+    "mov", "qt",                  # QuickTime
+    "3gp", "3g2",                 # 3GPP / 3GPP2
+    "f4v",                        # Flash MP4
+    "mj2", "mjp2",                # Motion JPEG 2000
+}
 
 
 def _probe_source_blocking(url: str) -> tuple[bool, str]:
@@ -267,8 +274,81 @@ async def probe_source_info(url: str) -> tuple[bool, str]:
 
 
 def needs_seekable_source(ext: str) -> bool:
-    """True if a VOD in container `ext` can't be pipe-streamed (moov-at-end risk)."""
+    """True if a VOD in container `ext` *might* hide its index at the end.
+
+    Only a coarse container gate — pairs with moov_at_end() to decide for real,
+    so a faststart MP4 (moov up front) still streams instead of downloading.
+    """
     return ext.lower() in _SEEKABLE_REQUIRED_EXTS
+
+
+# Cap on how much of the file head to scan for the moov/mdat order.  The decisive
+# top-level box header is almost always in the first few KB; this is just a bound.
+_MOOV_PROBE_BYTES = 256 * 1024
+
+
+def _scan_moov_position(buf: bytes) -> Optional[bool]:
+    """Walk ISOBMFF top-level boxes in `buf`.
+
+    Returns True if `mdat` is reached before `moov` (moov-at-end, not streamable),
+    False if `moov` comes first (faststart, streamable), or None if `buf` doesn't
+    yet contain enough to decide.  Only box headers are read; payloads are skipped
+    by size, so a huge leading mdat is identified without reading it.
+    """
+    pos = 0
+    while pos + 8 <= len(buf):
+        size = int.from_bytes(buf[pos:pos + 4], "big")
+        btype = buf[pos + 4:pos + 8]
+        if btype == b"moov":
+            return False
+        if btype == b"mdat":
+            return True
+        if size == 1:                              # 64-bit largesize after the type
+            if pos + 16 > len(buf):
+                return None
+            size = int.from_bytes(buf[pos + 8:pos + 16], "big")
+        if size < 8:                               # 0 (extends to EOF) or malformed
+            return None
+        pos += size
+    return None
+
+
+def _probe_moov_at_end_blocking(url: str, timeout: float = 30.0) -> bool:
+    """Stream the file head via yt-dlp and report whether moov sits after mdat.
+
+    Defaults to True (treat as moov-at-end -> download) on any uncertainty, so a
+    file we can't classify is still handled correctly, just without the streaming
+    optimisation.
+    """
+    proc = subprocess.Popen(
+        _ytdlp_cmd(url, _VIDEO_FMT), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    killer = threading.Timer(timeout, proc.kill)
+    killer.start()
+    try:
+        buf = b""
+        while len(buf) < _MOOV_PROBE_BYTES:
+            chunk = proc.stdout.read(8192)
+            if not chunk:
+                break
+            buf += chunk
+            verdict = _scan_moov_position(buf)
+            if verdict is not None:
+                return verdict
+        verdict = _scan_moov_position(buf)
+        return True if verdict is None else verdict
+    except Exception:
+        log.exception("moov probe failed; assuming moov-at-end")
+        return True
+    finally:
+        killer.cancel()
+        _kill_wait(proc)
+
+
+async def probe_moov_at_end(url: str) -> bool:
+    """Async wrapper for _probe_moov_at_end_blocking."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_executor, _probe_moov_at_end_blocking, url)
 
 
 async def probe_is_live(url: str) -> bool:

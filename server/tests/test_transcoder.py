@@ -170,11 +170,30 @@ def test_audio_ffmpeg_cmd_decodes_file_without_loop():
 
 
 def test_needs_seekable_source_flags_mp4_family_only():
-    # MP4-family containers may hide moov at the end -> can't pipe-stream.
-    for ext in ("mp4", "m4v", "mov", "m4a", "MP4"):
+    # The whole ISOBMFF / MP4 family may hide moov at the end -> can't pipe-stream.
+    for ext in ("mp4", "m4v", "m4a", "m4b", "mov", "qt",
+                "3gp", "3g2", "f4v", "mj2", "mjp2", "MP4"):
         assert transcoder.needs_seekable_source(ext)
-    for ext in ("webm", "mkv", "", "ts"):
+    for ext in ("webm", "mkv", "", "ts", "avi", "flv", "ogg"):
         assert not transcoder.needs_seekable_source(ext)
+
+
+def _box(btype, payload=b""):
+    return (8 + len(payload)).to_bytes(4, "big") + btype + payload
+
+
+def test_scan_moov_position():
+    ftyp = _box(b"ftyp", b"isom\x00\x00\x02\x00")
+    # moov before mdat -> faststart -> False
+    assert transcoder._scan_moov_position(ftyp + _box(b"moov", b"\x00" * 32)) is False
+    # mdat before moov -> moov-at-end -> True (decided from the mdat header alone)
+    assert transcoder._scan_moov_position(ftyp + _box(b"mdat", b"\x00" * 9999)) is True
+    # leading boxes are skipped by size before the decisive one
+    assert transcoder._scan_moov_position(
+        ftyp + _box(b"free", b"\x00" * 16) + _box(b"moov")) is False
+    # not enough yet to reach the next box header -> undetermined
+    assert transcoder._scan_moov_position(ftyp) is None
+    assert transcoder._scan_moov_position(b"\x00\x00\x00") is None
 
 
 def test_audio_ffmpeg_cmd_has_no_server_side_filtering():
@@ -309,6 +328,19 @@ def test_moov_at_end_mp4_decodes_from_seekable_file(tmp_path):
     mdat, moov = data.find(b"mdat"), data.find(b"moov")
     assert 0 < mdat < moov, "expected a genuine moov-at-end file for this test"
     assert len(_collect_video_from_file(path, limit=3)) > 0
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+def test_scan_moov_position_on_real_files(tmp_path):
+    # The box scanner must classify ffmpeg's real output: default muxing puts moov
+    # at the end (download), +faststart puts it up front (stream).
+    end = tmp_path / "end.mp4"
+    fast = tmp_path / "fast.mp4"
+    if _ffmpeg_make(end, "mpeg4").returncode != 0 or \
+       _ffmpeg_make(fast, "mpeg4", extra=("-movflags", "+faststart")).returncode != 0:
+        pytest.skip("ffmpeg can't build mp4")
+    assert transcoder._scan_moov_position(end.read_bytes()) is True     # moov at end
+    assert transcoder._scan_moov_position(fast.read_bytes()) is False   # faststart
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")

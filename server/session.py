@@ -36,6 +36,7 @@ from transcoder import (
     iter_video,
     needs_seekable_source,
     parse_timestamp,
+    probe_moov_at_end,
     probe_source_info,
 )
 
@@ -234,10 +235,13 @@ class StreamSession:
         self._end_eff = None if self.is_live else self.end
         self._setup_buffers()
 
-        # A VOD whose container can hide its index at the end (MP4 family) can't be
-        # demuxed from a non-seekable pipe, so decode it from a downloaded file.
-        # Live never hits this (segmented), and --loop already downloads anyway.
-        self._need_seekable = not self.is_live and needs_seekable_source(ext)
+        # A VOD whose container *might* hide its index at the end (MP4 family) is
+        # checked for real: only a genuine moov-at-end file (unstreamable from a
+        # pipe) is downloaded; a faststart MP4 streams normally.  Skipped for live
+        # (segmented) and for --loop (which downloads regardless).
+        self._need_seekable = False
+        if not self.is_live and not self.loop and needs_seekable_source(ext):
+            self._need_seekable = await probe_moov_at_end(self.url)
 
         await ws.send_text(f"META {self.w} {self.h} {self.fps}")
         log.info("session: %s is_live=%s ext=%s audio=%s start=%ss end=%s loop=%s seekable=%s",

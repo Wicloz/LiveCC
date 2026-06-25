@@ -73,7 +73,7 @@ class FakeWS:
         self.bins.append(b)
 
 
-def _patch(monkeypatch, n_video, n_audio, is_live, ext="webm"):
+def _patch(monkeypatch, n_video, n_audio, is_live, ext="webm", moov_at_end=True):
     async def fake_video(url, w, h, fps, start=0, end=None, source_path=None, loop=False):
         for _ in range(n_video):
             yield bytes((0, w, 0, h)) + b"\x00" * (w * h * 3)
@@ -85,9 +85,13 @@ def _patch(monkeypatch, n_video, n_audio, is_live, ext="webm"):
     async def fake_probe(url):
         return is_live, ext
 
+    async def fake_moov(url):
+        return moov_at_end
+
     monkeypatch.setattr(session, "iter_video", fake_video)
     monkeypatch.setattr(session, "iter_audio", fake_audio)
     monkeypatch.setattr(session, "probe_source_info", fake_probe)
+    monkeypatch.setattr(session, "probe_moov_at_end", fake_moov)
 
 
 def test_vod_delivers_every_frame_in_order(monkeypatch):
@@ -141,10 +145,10 @@ def test_loop_downloads_section_once_then_streams(monkeypatch):
     assert len([b for b in ws.bins if b[:1] == session.OP_VIDEO]) == 6
 
 
-def test_mp4_vod_downloads_for_seekable_decode(monkeypatch):
-    # A plain MP4 VOD (moov possibly at the end) can't be pipe-streamed, so even
-    # without --loop the session downloads it once and decodes the seekable file.
-    _patch(monkeypatch, n_video=4, n_audio=0, is_live=False, ext="mp4")
+def test_moov_at_end_mp4_vod_downloads_for_seekable_decode(monkeypatch):
+    # A moov-at-end MP4 VOD can't be pipe-streamed, so even without --loop the
+    # session downloads it once and decodes the seekable file.
+    _patch(monkeypatch, n_video=4, n_audio=0, is_live=False, ext="mp4", moov_at_end=True)
     calls = {"n": 0}
 
     async def fake_download(url, out_dir, start, end, want_audio):
@@ -161,8 +165,23 @@ def test_mp4_vod_downloads_for_seekable_decode(monkeypatch):
     assert len([b for b in ws.bins if b[:1] == session.OP_VIDEO]) == 4
 
 
+def test_faststart_mp4_vod_streams_without_download(monkeypatch):
+    # A faststart MP4 (moov up front) pipe-streams fine — the moov probe says so,
+    # so it must NOT be downloaded.
+    _patch(monkeypatch, n_video=3, n_audio=0, is_live=False, ext="mp4", moov_at_end=False)
+
+    async def fail_download(*a, **k):
+        raise AssertionError("faststart MP4 must stream, not download")
+
+    monkeypatch.setattr(session, "download_source", fail_download)
+    ws = FakeWS()
+    s = StreamSession("u", w=4, h=2, fps=50, want_audio=False)
+    run(s.run(ws))
+    assert s._source_path is None
+
+
 def test_webm_vod_streams_without_download(monkeypatch):
-    # WebM streams fine from a pipe — must NOT trigger a download.
+    # WebM streams fine from a pipe — must NOT even probe moov or download.
     _patch(monkeypatch, n_video=3, n_audio=0, is_live=False, ext="webm")
 
     async def fail_download(*a, **k):
