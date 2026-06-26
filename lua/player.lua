@@ -1,4 +1,5 @@
--- LiveCC player  —  watches YouTube videos / live streams on CC monitors
+-- LiveCC player  —  watches YouTube videos / live streams on a CC monitor (or the
+--                   computer's own terminal when none is attached, e.g. a tablet)
 --                   plays audio on ALL attached speakers simultaneously
 -- Run `livecc --help` for usage.
 --
@@ -19,7 +20,7 @@ local function die(msg)
 end
 
 local function print_usage()
-    print("livecc - play videos and live streams on a ComputerCraft monitor")
+    print("livecc - play videos and live streams on a ComputerCraft monitor or terminal")
     print("")
     print("Usage:")
     print("  livecc <url> [options]")
@@ -87,13 +88,27 @@ end
 
 local VIDEO_URL = positional[1]
 
--- ── Monitor + speakers ─────────────────────────────────────────────────────────
+-- ── Display + speakers ──────────────────────────────────────────────────────────
+-- Render to an attached monitor if there is one; otherwise fall back to the
+-- computer's own terminal (e.g. a pocket computer / tablet with no monitor).  Both
+-- expose the same drawing API (blit/setCursorPos/getSize/...); only setTextScale
+-- is monitor-only.
 
 local mon = peripheral.find("monitor")
-if not mon then die("No monitor found — attach a monitor and try again.") end
+local USING_TERM = mon == nil
+if USING_TERM then mon = term end
+
+-- When the render surface IS our own terminal there's no separate console, so
+-- silence the status print()s — otherwise they'd scribble over the video.
+-- mon_print() still shows the important states (buffering/error/...) on-screen.
+local function console(msg)
+    if not USING_TERM then print(msg) end
+end
+
 -- Larger text scale = bigger glyphs = fewer cells = lower resolution.  --crunchy
--- uses 1.0 (~1/4 the cells of the default 0.5), cutting video bandwidth.
-mon.setTextScale(CRUNCHY and 1.0 or 0.5)
+-- uses 1.0 (~1/4 the cells of the default 0.5), cutting video bandwidth.  Monitor
+-- only — a terminal has a fixed size, so there --crunchy just affects audio.
+if mon.setTextScale then mon.setTextScale(CRUNCHY and 1.0 or 0.5) end
 mon.setCursorBlink(false)            -- no blinking cursor in the corner
 local TERM_W, TERM_H = mon.getSize()
 
@@ -130,13 +145,13 @@ for _, name in ipairs(peripheral.getNames()) do
 end
 local speakers = dedupe_speakers(found_speakers)
 if #speakers == 0 then
-    print("LiveCC: no speakers found - audio disabled")
+    console("LiveCC: no speakers found - audio disabled")
 else
     local msg = "LiveCC: " .. #speakers .. " speaker(s)"
     if #found_speakers > #speakers then
         msg = msg .. " (" .. (#found_speakers - #speakers) .. " duplicate ignored)"
     end
-    print(msg)
+    console(msg)
 end
 
 local ws = nil
@@ -217,7 +232,7 @@ end
 
 local function handle_text(msg)
     if msg:sub(1, 4) == "META" then
-        print("LiveCC: connected")
+        console("LiveCC: connected")
         mon_print("Buffering...")
     elseif msg == "BUFFERING" then
         mon_print("Buffering...")
@@ -225,14 +240,14 @@ local function handle_text(msg)
         -- next frame will paint over this
     elseif msg:sub(1, 5) == "ERROR" then
         local detail = msg:sub(7)
-        print("LiveCC error: " .. detail)
+        console("LiveCC error: " .. detail)
         mon_print("Error: " .. detail)
     end
 end
 
 -- ── Connect ───────────────────────────────────────────────────────────────────
 
-print("LiveCC: connecting to server...")
+console("LiveCC: connecting to server...")
 mon_print("Connecting to server...")
 
 local WS_BASE = SERVER:gsub("^http", "ws")
@@ -256,7 +271,7 @@ ws = ok
 
 -- ── Main loop ─────────────────────────────────────────────────────────────────
 
-print("LiveCC: streaming — press Q to quit")
+console("LiveCC: streaming — press Q to quit")
 
 parallel.waitForAny(
 
@@ -283,7 +298,7 @@ parallel.waitForAny(
             end
         end
         mon_print("Stream ended.")
-        print("LiveCC: stream ended.")
+        console("LiveCC: stream ended.")
     end,
 
     -- Audio player: drains the queue; may block on speaker_audio_empty
@@ -305,7 +320,7 @@ parallel.waitForAny(
             if key == keys.q then
                 if ws then ws.close() end
                 mon_print("Stopped.")
-                print("LiveCC: stopped by user.")
+                console("LiveCC: stopped by user.")
                 return
             end
         end
