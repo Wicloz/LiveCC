@@ -24,8 +24,8 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
-      # Builds the image (which fails early if ffmpeg lacks the dfpwm encoder,
-      # per the Dockerfile's own check) and loads it locally for the smoke test.
+      # Builds the image and loads it locally so the next step can run the suite
+      # inside it.
       - name: Build image
         uses: docker/build-push-action@v6
         with:

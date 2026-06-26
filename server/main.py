@@ -6,11 +6,13 @@ whole body, so streaming uses a single multiplexed WebSocket.  Server-side
 buffering, A/V sync and pacing live in session.StreamSession.
 
 WebSocket endpoint (used by the CC player):
-  /ws/play?url=<url>[&width=51&height=19&fps=10&audio=1&start=&end=&loop=0]
+  /ws/play?url=<url>[&width=51&height=19&fps=10&audio=1&start=&end=&loop=0&crunchy=0]
       start/end : timestamps ("90", "1m30s", "3h2m"); seek a VOD section.
       loop      : "1" to cache the section once and replay it forever.
+      crunchy   : "1" for low-bandwidth mode — 1-bit DFPWM audio (the client also
+                  lowers video resolution by sending a smaller width/height).
       video frame -> binary  b"\\x01" + frame
-      audio chunk -> binary  b"\\x02" + dfpwm
+      audio chunk -> binary  b"\\x02" + audio  (raw 8-bit PCM, or DFPWM if crunchy)
       status      -> text    "META ..." / "BUFFERING" / "PLAYING" / "ERROR ..."
 
 Both Lua scripts are served with this server's own URL baked in, so the player
@@ -72,6 +74,7 @@ async def ws_play(websocket: WebSocket):
         start=qp.get("start", ""),
         end=qp.get("end", ""),
         loop=qp.get("loop", "0") == "1",
+        crunchy=qp.get("crunchy", "0") == "1",
     )
 
     # Run the session alongside a disconnect watcher.  Whichever finishes first

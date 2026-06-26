@@ -78,7 +78,8 @@ def _patch(monkeypatch, n_video, n_audio, is_live, ext="webm", moov_at_end=True)
         for _ in range(n_video):
             yield bytes((0, w, 0, h)) + b"\x00" * (w * h * 3)
 
-    async def fake_audio(url, rate, start=0, end=None, source_path=None, loop=False):
+    async def fake_audio(url, rate, codec=None, start=0, end=None,
+                         source_path=None, loop=False):
         for _ in range(n_audio):
             yield b"\x00" * 4096
 
@@ -114,6 +115,52 @@ def test_session_reports_error_when_no_video(monkeypatch):
     s = StreamSession("u", w=4, h=2, fps=50, want_audio=False)
     run(s.run(ws))
     assert any(t.startswith("ERROR") for t in ws.texts)
+
+
+def test_failing_video_producer_reports_error_without_hanging(monkeypatch):
+    # A producer that dies (here: blows up on construction) must still set its
+    # done event so the scheduler finishes — degrading to "no frames" -> ERROR
+    # rather than waiting forever.  The wait_for turns a regression into a failure.
+    _patch(monkeypatch, n_video=0, n_audio=0, is_live=False)
+
+    def boom(*a, **k):
+        raise RuntimeError("video kaboom")
+
+    monkeypatch.setattr(session, "iter_video", boom)
+    ws = FakeWS()
+    s = StreamSession("u", w=4, h=2, fps=50, want_audio=False)
+    run(asyncio.wait_for(s.run(ws), 5))
+    assert any(t.startswith("ERROR") for t in ws.texts)
+
+
+def test_failing_audio_producer_degrades_to_silent_video(monkeypatch):
+    # If only audio fails, video must keep flowing (audio_done still gets set) —
+    # graceful degradation, not a hang.
+    _patch(monkeypatch, n_video=4, n_audio=0, is_live=False)
+
+    def boom(*a, **k):
+        raise RuntimeError("audio kaboom")
+
+    monkeypatch.setattr(session, "iter_audio", boom)
+    ws = FakeWS()
+    s = StreamSession("u", w=4, h=2, fps=50, want_audio=True)
+    run(asyncio.wait_for(s.run(ws), 5))
+    assert len([b for b in ws.bins if b[:1] == session.OP_VIDEO]) == 4
+
+
+def test_unexpected_error_reports_generic_error(monkeypatch):
+    # An error in the run path that nothing handles deeper (here: a socket send
+    # that explodes) must be caught and reported to the client, not dropped.
+    _patch(monkeypatch, n_video=4, n_audio=0, is_live=False)
+
+    class BoomWS(FakeWS):
+        async def send_bytes(self, b):
+            raise RuntimeError("send exploded")
+
+    ws = BoomWS()
+    s = StreamSession("u", w=4, h=2, fps=50, want_audio=False)
+    run(asyncio.wait_for(s.run(ws), 5))
+    assert any(t.startswith("ERROR Internal server error") for t in ws.texts)
 
 
 def test_audio_disabled_sends_no_audio(monkeypatch):
@@ -180,6 +227,13 @@ def test_faststart_mp4_vod_streams_without_download(monkeypatch):
     assert s._source_path is None
 
 
+def test_crunchy_selects_dfpwm_codec():
+    # --crunchy trades fidelity for bandwidth: 1-bit DFPWM instead of raw PCM.
+    assert StreamSession("u", w=4, h=2, fps=24, want_audio=True).codec.name == "pcm"
+    assert StreamSession("u", w=4, h=2, fps=24, want_audio=True,
+                         crunchy=True).codec.name == "dfpwm"
+
+
 def test_webm_vod_streams_without_download(monkeypatch):
     # WebM streams fine from a pipe — must NOT even probe moov or download.
     _patch(monkeypatch, n_video=3, n_audio=0, is_live=False, ext="webm")
@@ -207,7 +261,8 @@ def test_cancel_finalizes_producer_generator(monkeypatch):
         finally:
             closed["video"] = True
 
-    async def fake_audio(url, rate, start=0, end=None, source_path=None, loop=False):
+    async def fake_audio(url, rate, codec=None, start=0, end=None,
+                         source_path=None, loop=False):
         if False:
             yield b""
 

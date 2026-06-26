@@ -76,9 +76,9 @@ def test_ytdlp_cmd_section_start_and_end():
 
 
 def test_audio_fmt_prefers_best_source():
-    # The DFPWM encoder is 1-bit; feeding it the *worst* YouTube stream stacks a
-    # second lossy pass on an already-crushed one (audible clipping/hiss).  Pin
-    # bestaudio so the encoder always gets a clean source.
+    # We resample to 8-bit PCM; feeding it the *worst* YouTube stream stacks a
+    # second lossy pass on an already-crushed one (audible artifacts).  Pin
+    # bestaudio so the resampler always gets a clean source.
     fmt = transcoder._AUDIO_FMT
     assert "bestaudio" in fmt
     assert "worstaudio" not in fmt
@@ -149,12 +149,29 @@ def test_requirements_bundle_ejs_solver():
     assert "yt-dlp[default]" in req
 
 
-def test_audio_ffmpeg_cmd_is_dfpwm_mono():
-    cmd = transcoder._audio_ffmpeg_cmd(48000)
-    assert "dfpwm" in cmd             # CC-native DFPWM1a
-    assert cmd[cmd.index("-c:a") + 1] == "dfpwm"
+def test_audio_ffmpeg_cmd_is_raw_pcm_mono():
+    cmd = transcoder._audio_ffmpeg_cmd(48000)            # default codec = PCM
+    assert cmd[cmd.index("-c:a") + 1] == "pcm_u8"   # CC speaker's native format
+    assert cmd[cmd.index("-f") + 1] == "u8"         # raw, no container
     assert cmd[cmd.index("-ac") + 1] == "1"
     assert cmd[cmd.index("-ar") + 1] == "48000"
+    assert "dfpwm" not in cmd
+
+
+def test_audio_ffmpeg_cmd_dfpwm_for_crunchy():
+    cmd = transcoder._audio_ffmpeg_cmd(48000, transcoder.DFPWM)
+    assert cmd[cmd.index("-c:a") + 1] == "dfpwm"
+    assert cmd[cmd.index("-f") + 1] == "dfpwm"
+    assert "pcm_u8" not in cmd
+
+
+def test_audio_codecs_share_chunk_duration():
+    # Both codecs read the same number of samples per chunk (~0.1 s), just packed
+    # into a different number of bytes — so A/V buffering stays codec-independent.
+    for codec in (transcoder.PCM, transcoder.DFPWM):
+        assert codec.read_bytes * codec.samples_per_byte == transcoder.AUDIO_CHUNK_SAMPLES
+    assert transcoder.PCM.samples_per_byte == 1
+    assert transcoder.DFPWM.samples_per_byte == 8
 
 
 def test_audio_ffmpeg_cmd_loops_a_file():
@@ -200,13 +217,12 @@ def test_audio_chunk_is_short_to_avoid_periodic_video_stall():
     # The CC client decodes each audio chunk inline on the coroutine that also
     # renders video.  A ~1 s chunk blocked rendering for the whole decode once per
     # second (visible stutter), so chunks must stay short enough to interleave.
-    chunk_seconds = transcoder.AUDIO_READ_BYTES * transcoder.SAMPLES_PER_BYTE / 48000.0
-    assert chunk_seconds <= 0.2
+    assert transcoder.AUDIO_CHUNK_SECONDS <= 0.2
 
 
 def test_audio_ffmpeg_cmd_has_no_server_side_filtering():
     # Server-side audio filtering was reported to make audio worse, so the source
-    # is fed straight into the DFPWM encoder — no -af chain on either path.
+    # is fed straight into the PCM encoder — no -af chain on either path.
     for cmd in (transcoder._audio_ffmpeg_cmd(48000),
                 transcoder._audio_ffmpeg_cmd(48000, source="/tmp/s.mkv")):
         assert "-af" not in cmd
@@ -254,18 +270,17 @@ def test_ffmpeg_rawvideo_feeds_splitter():
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
-def test_dfpwm_encode_is_available_in_ffmpeg():
-    # Guard that this ffmpeg can actually produce DFPWM (CC speaker audio) with the
-    # same output args the audio command uses — a missing encoder would only
-    # surface at runtime otherwise.  Push a sine through to dfpwm.
+def test_raw_pcm_output_is_one_byte_per_sample():
+    # Push a 1 s sine through the audio command's output args and confirm raw
+    # u8 PCM: exactly 48000 mono bytes (1 byte/sample), the client's unpack input.
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-f", "lavfi", "-i", "sine=frequency=440:duration=1:sample_rate=48000",
-        "-ar", "48000", "-ac", "1", "-c:a", "dfpwm", "-f", "dfpwm", "pipe:1",
+        "-ar", "48000", "-ac", "1", "-c:a", "pcm_u8", "-f", "u8", "pipe:1",
     ]
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
-    assert len(proc.stdout) > 0
+    assert len(proc.stdout) == 48000   # 1 s * 48 kHz * 1 byte/sample
 
 
 # --------------------------------------------------------------------------- #
@@ -371,7 +386,7 @@ def test_decode_audio_from_generated_file(tmp_path):
             await agen.aclose()
 
     asyncio.run(go())
-    assert sum(len(c) for c in chunks) > 0         # produced DFPWM bytes
+    assert sum(len(c) for c in chunks) > 0         # produced raw PCM bytes
 
 
 # --------------------------------------------------------------------------- #

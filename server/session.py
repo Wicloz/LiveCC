@@ -29,8 +29,9 @@ import tempfile
 from typing import Optional
 
 from transcoder import (
-    AUDIO_READ_BYTES,
-    SAMPLES_PER_BYTE,
+    AUDIO_CHUNK_SECONDS,
+    DFPWM,
+    PCM,
     download_source,
     iter_audio,
     iter_video,
@@ -57,7 +58,7 @@ LIVE_MAX_BUFFER = 4.0
 # exactly the clock).
 AUDIO_LEAD = 2.0
 
-_AUDIO_CHUNK_SECONDS = AUDIO_READ_BYTES * SAMPLES_PER_BYTE / 48000.0  # ~1.0 s
+_AUDIO_CHUNK_SECONDS = AUDIO_CHUNK_SECONDS   # ~0.1 s, same for both codecs
 
 
 class TimedBuffer:
@@ -116,11 +117,15 @@ class TimedBuffer:
 class StreamSession:
     def __init__(self, url: str, w: int, h: int, fps: int, want_audio: bool,
                  start: str = "", end: str = "", loop: bool = False,
-                 rate: int = 48000) -> None:
+                 rate: int = 48000, crunchy: bool = False) -> None:
         self.url = url
         self.w, self.h, self.fps = w, h, fps
         self.want_audio = want_audio
         self.rate = rate
+        # --crunchy trades audio fidelity for bandwidth: 1-bit DFPWM instead of
+        # raw 8-bit PCM.  (It also lowers video resolution, but that's driven by
+        # the smaller w/h the client sends, not here.)
+        self.codec = DFPWM if crunchy else PCM
 
         self.start = parse_timestamp(start)             # seconds, 0 if absent
         _end = parse_timestamp(end)
@@ -162,30 +167,46 @@ class StreamSession:
         # cancelled mid-buffer.put() the generator is suspended at its yield,
         # and only aclose() runs its finally (which kills yt-dlp/ffmpeg) — GC is
         # not prompt enough and would leave the pipeline running.
-        agen = iter_video(self.url, self.w, self.h, self.fps,
-                          start=self._start_eff, end=self._end_eff,
-                          source_path=self._source_path, loop=self.loop)
+        #
+        # Everything is inside try/finally so video_done is ALWAYS set, even if the
+        # generator can't be constructed or dies unexpectedly.  Otherwise the
+        # scheduler would wait forever on a producer that will never report done.
+        # CancelledError (BaseException) still propagates; only real errors are
+        # swallowed-and-logged, degrading to "no frames" -> ERROR downstream.
+        agen = None
         i = 0
         try:
+            agen = iter_video(self.url, self.w, self.h, self.fps,
+                              start=self._start_eff, end=self._end_eff,
+                              source_path=self._source_path, loop=self.loop)
             async for frame in agen:
                 await self.video_buf.put(i / self.fps, frame)
                 i += 1
+        except Exception:
+            log.exception("video producer failed")
         finally:
-            await agen.aclose()
+            if agen is not None:
+                await agen.aclose()
             self.video_buf.close()
             self.video_done.set()
 
     async def _produce_audio(self) -> None:
-        agen = iter_audio(self.url, self.rate,
-                          start=self._start_eff, end=self._end_eff,
-                          source_path=self._source_path, loop=self.loop)
+        # Same guarantee as video: audio_done is always set so a failed audio
+        # producer degrades to a silent stream rather than hanging the scheduler.
+        agen = None
         samples = 0
         try:
+            agen = iter_audio(self.url, self.rate, self.codec,
+                              start=self._start_eff, end=self._end_eff,
+                              source_path=self._source_path, loop=self.loop)
             async for chunk in agen:
                 await self.audio_buf.put(samples / self.rate, chunk)
-                samples += len(chunk) * SAMPLES_PER_BYTE   # DFPWM: 8 samples/byte
+                samples += len(chunk) * self.codec.samples_per_byte
+        except Exception:
+            log.exception("audio producer failed")
         finally:
-            await agen.aclose()
+            if agen is not None:
+                await agen.aclose()
             self.audio_buf.close()
             self.audio_done.set()
 
@@ -302,6 +323,17 @@ class StreamSession:
 
             if self.video_sent == 0:
                 await ws.send_text("ERROR Failed to load video. Check the server logs.")
+        except Exception:
+            # Catch-all for anything not handled deeper (producers self-contain
+            # their errors): log the traceback and tell the client something broke
+            # rather than dropping the socket silently.  CancelledError (client
+            # disconnect) is a BaseException, so it isn't caught here and tears
+            # down normally.
+            log.exception("session: unexpected error")
+            try:
+                await ws.send_text("ERROR Internal server error. Check the server logs.")
+            except Exception:
+                pass   # socket may already be gone; don't mask the original error
         finally:
             for t in tasks:
                 t.cancel()

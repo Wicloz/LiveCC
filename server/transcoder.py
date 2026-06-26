@@ -48,9 +48,9 @@ _executor = ThreadPoolExecutor(max_workers=16, thread_name_prefix="pipe-reader")
 
 # yt-dlp format selectors — webm first for streaming-pipe compatibility.
 # Video picks the smallest stream (frames are downscaled to the cell grid anyway).
-# Audio picks the *best* stream: it's transcoded to 1-bit DFPWM, so feeding the
-# encoder a clean source avoids stacking a second lossy pass on an already-crushed
-# one.  Audio streams are tiny next to video, so the bandwidth cost is negligible.
+# Audio picks the *best* stream: it's resampled down to 8-bit PCM, so feeding the
+# resampler a clean source avoids stacking a second lossy pass on an already-
+# crushed one.  Source audio is tiny next to video, so the download cost is negligible.
 _VIDEO_FMT = "worstvideo[ext=webm]/worstvideo[vcodec^=vp9]/worstvideo/worst"
 _AUDIO_FMT = "bestaudio[ext=webm]/bestaudio[acodec^=opus]/bestaudio/best"
 
@@ -59,19 +59,35 @@ _FIRST_OUTPUT_TIMEOUT = 45
 _STALL_TIMEOUT = 30
 _DOWNLOAD_TIMEOUT = 1800   # full section download for --loop
 
-# Audio is DFPWM1a: 1 bit/sample, decoded on the client by cc.audio.dfpwm.
-# 8 samples per byte.
-SAMPLES_PER_BYTE = 8
-# Keep chunks short.  The client decodes each chunk inline on the same coroutine
-# that renders video, and a full second of DFPWM (48000 samples) blocked rendering
-# for the whole decode — a visible stutter once per second.  ~0.1 s chunks make
-# each decode short enough to interleave with frame rendering instead.
-AUDIO_READ_BYTES = 600    # DFPWM -> 4800 samples -> 0.1 s per chunk at 48 kHz
+# Audio codecs.  Default is raw unsigned 8-bit PCM — the CC speaker's native format
+# (1 byte/sample, no client decode, no 1-bit noise).  --crunchy switches to DFPWM
+# (1 bit/sample) to cut audio bandwidth ~8x at the cost of fidelity.
+#
+# Chunks stay short (~0.1 s): the client processes each chunk inline on the same
+# coroutine that renders video, so a large chunk would stall rendering for the
+# whole decode/unpack.  Sample count per chunk is the same for both codecs, so the
+# A/V buffering downstream is codec-independent.
+SAMPLE_RATE = 48000
+AUDIO_CHUNK_SECONDS = 0.1
+AUDIO_CHUNK_SAMPLES = int(SAMPLE_RATE * AUDIO_CHUNK_SECONDS)   # 4800
+
+AudioCodec = collections.namedtuple(
+    "AudioCodec", "name ffmpeg_codec ffmpeg_fmt samples_per_byte read_bytes")
+
+
+def _audio_codec(name: str, ffmpeg_codec: str, ffmpeg_fmt: str,
+                 samples_per_byte: int) -> AudioCodec:
+    return AudioCodec(name, ffmpeg_codec, ffmpeg_fmt, samples_per_byte,
+                      AUDIO_CHUNK_SAMPLES // samples_per_byte)
+
+
+PCM = _audio_codec("pcm", "pcm_u8", "u8", 1)         # default
+DFPWM = _audio_codec("dfpwm", "dfpwm", "dfpwm", 8)   # --crunchy
+AUDIO_CODECS = {c.name: c for c in (PCM, DFPWM)}
 
 # No server-side audio filtering.  Earlier encode-side processing (highpass /
 # lowpass / volume, and before that dynaudnorm / loudnorm / limiter) was reported
-# to make audio worse, so we feed the source straight into the DFPWM encoder and
-# leave any cleanup to the decode-side postfilter in player.lua.
+# to make audio worse, so we resample the source straight to PCM with no filters.
 
 
 # --------------------------------------------------------------------------- #
@@ -216,9 +232,10 @@ def _video_ffmpeg_cmd(px_w: int, px_h: int, fps: int,
     return cmd
 
 
-def _audio_ffmpeg_cmd(sample_rate: int, source: Optional[str] = None,
-                      loop: bool = False) -> list[str]:
-    # DFPWM1a mono — CC's native speaker format (cc.audio.dfpwm decodes it).
+def _audio_ffmpeg_cmd(sample_rate: int, codec: AudioCodec = PCM,
+                      source: Optional[str] = None, loop: bool = False) -> list[str]:
+    # Mono at the speaker rate, encoded as `codec` (raw PCM by default, DFPWM for
+    # --crunchy).  The client decodes/unpacks per the codec it requested.
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "info", "-nostats"]
     if source:
         if loop:
@@ -227,7 +244,7 @@ def _audio_ffmpeg_cmd(sample_rate: int, source: Optional[str] = None,
     else:
         cmd += ["-i", "pipe:0"]
     cmd += ["-vn", "-ar", str(sample_rate), "-ac", "1",
-            "-c:a", "dfpwm", "-f", "dfpwm", "pipe:1"]
+            "-c:a", codec.ffmpeg_codec, "-f", codec.ffmpeg_fmt, "pipe:1"]
     return cmd
 
 
@@ -484,10 +501,11 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
 
 
 async def iter_audio(youtube_url: str, sample_rate: int = 48000,
+                     codec: AudioCodec = PCM,
                      start: int = 0, end: Optional[int] = None,
                      source_path: Optional[str] = None,
                      loop: bool = False) -> AsyncGenerator[bytes, None]:
-    """Yield DFPWM1a audio chunks (mono).
+    """Yield audio chunks (mono) encoded as `codec` (raw PCM, or DFPWM for crunchy).
 
     source_path set => decode that local (seekable) file; loop=True replays it
     forever (--loop).  Otherwise stream from the yt-dlp pipe.
@@ -498,7 +516,7 @@ async def iter_audio(youtube_url: str, sample_rate: int = 48000,
     try:
         if source_path:
             ffmpeg = subprocess.Popen(
-                _audio_ffmpeg_cmd(sample_rate, source=source_path, loop=loop),
+                _audio_ffmpeg_cmd(sample_rate, codec, source=source_path, loop=loop),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             _spawn_stderr_drain(ffmpeg, "ffmpeg/audio")
@@ -508,7 +526,7 @@ async def iter_audio(youtube_url: str, sample_rate: int = 48000,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             ffmpeg = subprocess.Popen(
-                _audio_ffmpeg_cmd(sample_rate),
+                _audio_ffmpeg_cmd(sample_rate, codec),
                 stdin=ytdlp.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             ytdlp.stdout.close()
@@ -518,7 +536,7 @@ async def iter_audio(youtube_url: str, sample_rate: int = 48000,
         while True:
             timeout = _FIRST_OUTPUT_TIMEOUT if sent == 0 else _STALL_TIMEOUT
             try:
-                chunk = await _read_with_timeout(ffmpeg, AUDIO_READ_BYTES, timeout)
+                chunk = await _read_with_timeout(ffmpeg, codec.read_bytes, timeout)
             except TimeoutError:
                 log.warning("audio: no output for %ss — stopping", timeout)
                 break

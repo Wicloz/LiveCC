@@ -3,7 +3,7 @@
 -- Run `livecc --help` for usage.
 --
 -- One WebSocket carries everything.  Binary messages are tagged by a leading
--- opcode byte: 0x01 = video frame, 0x02 = audio (DFPWM).  Text messages are
+-- opcode byte: 0x01 = video frame, 0x02 = audio (raw 8-bit PCM).  Text messages are
 -- status: "META w h fps", "BUFFERING", "PLAYING", "ERROR ...".
 
 local DEFAULT_FPS = 24
@@ -32,6 +32,7 @@ local function print_usage()
     print("  --start TS    Start a VOD at timestamp TS")
     print("  --end TS      Stop a VOD at timestamp TS")
     print("  --loop        Loop the selected section forever")
+    print("  --crunchy     Low-bandwidth mode: lower resolution + 1-bit audio")
     print("  -h, --help    Show this help and exit")
     print("")
     print("Timestamps (TS): 90, 90s, 1m30s, 3h2m  (default unit: seconds)")
@@ -44,7 +45,7 @@ end
 
 -- Parse: one positional (url) plus optional flags.
 local positional = {}
-local START_TS, END_TS, LOOP, HELP = nil, nil, false, false
+local START_TS, END_TS, LOOP, HELP, CRUNCHY = nil, nil, false, false, false
 local WANTED_FPS = DEFAULT_FPS
 do
     local i = 1
@@ -60,6 +61,8 @@ do
             i = i + 1; END_TS = args[i]
         elseif a == "--loop" then
             LOOP = true
+        elseif a == "--crunchy" then
+            CRUNCHY = true
         else
             positional[#positional + 1] = a
         end
@@ -88,7 +91,9 @@ local VIDEO_URL = positional[1]
 
 local mon = peripheral.find("monitor")
 if not mon then die("No monitor found — attach a monitor and try again.") end
-mon.setTextScale(0.5)
+-- Larger text scale = bigger glyphs = fewer cells = lower resolution.  --crunchy
+-- uses 1.0 (~1/4 the cells of the default 0.5), cutting video bandwidth.
+mon.setTextScale(CRUNCHY and 1.0 or 0.5)
 mon.setCursorBlink(false)            -- no blinking cursor in the corner
 local TERM_W, TERM_H = mon.getSize()
 
@@ -140,15 +145,33 @@ local ws = nil
 -- Decoding is fast (C-backed) so it never hitches video.  A bounded queue keeps
 -- back-pressure from blocking rendering; drop oldest if the client falls behind.
 
-local dfpwm = require("cc.audio.dfpwm")
-local decoder = dfpwm.make_decoder()   -- stateful: feed chunks in arrival order
 local audio_queue = {}
 local MAX_AUDIO_CHUNKS = 80            -- ~8 s at 0.1 s/chunk (safety cap)
 
--- No extra postfilter here: cc.audio.dfpwm's decoder already applies the codec's
--- advised cleanup internally (antijerk at bit transitions + a 140/256 one-pole
--- low-pass), returning the filtered, listenable PCM.  Adding our own low-pass on
--- top just cascades a second roll-off and muffles the audio.
+-- Audio decode depends on the codec the server is sending (chosen by --crunchy):
+--   default  raw unsigned 8-bit PCM — the speaker's native format; just unpack
+--            each byte to a signed amplitude (byte - 128 gives -128..127), no
+--            decode state.  Sliced to stay under string.byte's multi-return limit.
+--   crunchy  1-bit DFPWM — lower bandwidth, but needs the stateful CC decoder.
+-- Either way chunks are short (~0.1 s) so this stays brief and interleaves with
+-- video rendering instead of stalling it.
+local decode_audio
+if CRUNCHY then
+    local decoder = require("cc.audio.dfpwm").make_decoder()
+    decode_audio = function(data) return decoder(data) end
+else
+    decode_audio = function(data)
+        local out, k, n = {}, 0, #data
+        for i = 1, n, 4096 do
+            local bytes = { data:byte(i, math.min(i + 4095, n)) }
+            for m = 1, #bytes do
+                k = k + 1
+                out[k] = bytes[m] - 128
+            end
+        end
+        return out
+    end
+end
 
 local function play_on_all(samples)
     if #samples == 0 then return end
@@ -223,6 +246,7 @@ local url = WS_BASE
     .. (START_TS and ("&start=" .. textutils.urlEncode(START_TS)) or "")
     .. (END_TS   and ("&end="   .. textutils.urlEncode(END_TS))   or "")
     .. (LOOP and "&loop=1" or "")
+    .. (CRUNCHY and "&crunchy=1" or "")
 
 local ok, err = http.websocket(url)
 if not ok then
@@ -246,11 +270,9 @@ parallel.waitForAny(
                 if op == 1 then
                     render_frame(msg:sub(2))
                 elseif op == 2 then
-                    -- Decode here, in arrival order, to keep the decoder in sync.
-                    -- Chunks are kept short server-side (~0.1 s) so this decode
-                    -- stays brief and interleaves with video frames rather than
-                    -- stalling rendering once per chunk.
-                    audio_queue[#audio_queue + 1] = decoder(msg:sub(2))
+                    -- Decode/unpack audio (codec per --crunchy) and enqueue, in
+                    -- arrival order to keep the DFPWM decoder's state in sync.
+                    audio_queue[#audio_queue + 1] = decode_audio(msg:sub(2))
                     while #audio_queue > MAX_AUDIO_CHUNKS do
                         table.remove(audio_queue, 1)   -- drop oldest, stay in sync
                     end
