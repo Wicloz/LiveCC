@@ -34,6 +34,8 @@ local function print_usage()
     print("  --end TS      Stop a VOD at timestamp TS")
     print("  --loop        Loop the selected section forever")
     print("  --crunchy     Low-bandwidth mode: lower resolution + 1-bit audio")
+    print("  --no-audio    Don't stream audio (also implied when no speakers)")
+    print("  --no-video    Don't stream video (audio only)")
     print("  -h, --help    Show this help and exit")
     print("")
     print("Timestamps (TS): 90, 90s, 1m30s, 3h2m  (default unit: seconds)")
@@ -47,6 +49,7 @@ end
 -- Parse: one positional (url) plus optional flags.
 local positional = {}
 local START_TS, END_TS, LOOP, HELP, CRUNCHY = nil, nil, false, false, false
+local NO_AUDIO, NO_VIDEO = false, false
 local WANTED_FPS = DEFAULT_FPS
 do
     local i = 1
@@ -64,6 +67,10 @@ do
             LOOP = true
         elseif a == "--crunchy" then
             CRUNCHY = true
+        elseif a == "--no-audio" then
+            NO_AUDIO = true
+        elseif a == "--no-video" then
+            NO_VIDEO = true
         else
             positional[#positional + 1] = a
         end
@@ -144,7 +151,16 @@ for _, name in ipairs(peripheral.getNames()) do
     end
 end
 local speakers = dedupe_speakers(found_speakers)
-if #speakers == 0 then
+
+-- A stream is on unless disabled by flag; audio additionally needs a speaker, so
+-- the no-speaker case folds into --no-audio (which is what fixes the old hang:
+-- the audio coroutine no longer joins parallel.waitForAny when there's no audio).
+local WANT_VIDEO = not NO_VIDEO
+local WANT_AUDIO = not NO_AUDIO and #speakers > 0
+
+if NO_AUDIO then
+    console("LiveCC: audio disabled (--no-audio)")
+elseif #speakers == 0 then
     console("LiveCC: no speakers found - audio disabled")
 else
     local msg = "LiveCC: " .. #speakers .. " speaker(s)"
@@ -152,6 +168,10 @@ else
         msg = msg .. " (" .. (#found_speakers - #speakers) .. " duplicate ignored)"
     end
     console(msg)
+end
+
+if not WANT_VIDEO and not WANT_AUDIO then
+    die("Nothing to play: video is off (--no-video) and there's no audio.")
 end
 
 local ws = nil
@@ -237,7 +257,10 @@ local function handle_text(msg)
     elseif msg == "BUFFERING" then
         mon_print("Buffering...")
     elseif msg == "PLAYING" then
-        -- next frame will paint over this
+        if not WANT_VIDEO then
+            mon_print("Playing (audio only)")   -- no frames will paint over this
+        end
+        -- else the next video frame paints over the "Buffering..." message
     elseif msg:sub(1, 5) == "ERROR" then
         local detail = msg:sub(7)
         console("LiveCC error: " .. detail)
@@ -257,7 +280,8 @@ local url = WS_BASE
     .. "&width="  .. tostring(TERM_W)
     .. "&height=" .. tostring(TERM_H)
     .. "&fps="    .. tostring(WANTED_FPS)
-    .. "&audio="  .. (#speakers > 0 and "1" or "0")
+    .. "&audio="  .. (WANT_AUDIO and "1" or "0")
+    .. "&video="  .. (WANT_VIDEO and "1" or "0")
     .. (START_TS and ("&start=" .. textutils.urlEncode(START_TS)) or "")
     .. (END_TS   and ("&end="   .. textutils.urlEncode(END_TS))   or "")
     .. (LOOP and "&loop=1" or "")
@@ -273,37 +297,43 @@ ws = ok
 
 console("LiveCC: streaming — press Q to quit")
 
-parallel.waitForAny(
+-- Build the coroutine set.  parallel.waitForAny stops as soon as ANY function
+-- returns, so the audio player must only join when audio is actually on — adding
+-- a no-op coroutine that returns immediately would tear the whole player down
+-- before the receiver rendered anything (the old no-speaker "stuck on Connecting"
+-- bug).
+local tasks = {}
 
-    -- Receiver: render video, enqueue audio, handle status
-    function()
-        while true do
-            local msg, is_binary = ws.receive()
-            if msg == nil then break end
-            if is_binary then
-                local op = msg:byte(1)
-                if op == 1 then
-                    render_frame(msg:sub(2))
-                elseif op == 2 then
-                    -- Decode/unpack audio (codec per --crunchy) and enqueue, in
-                    -- arrival order to keep the DFPWM decoder's state in sync.
-                    audio_queue[#audio_queue + 1] = decode_audio(msg:sub(2))
-                    while #audio_queue > MAX_AUDIO_CHUNKS do
-                        table.remove(audio_queue, 1)   -- drop oldest, stay in sync
-                    end
-                    os.queueEvent("livecc_audio")      -- wake the audio player
+-- Receiver: render video, enqueue audio, handle status
+tasks[#tasks + 1] = function()
+    while true do
+        local msg, is_binary = ws.receive()
+        if msg == nil then break end
+        if is_binary then
+            local op = msg:byte(1)
+            if op == 1 then
+                render_frame(msg:sub(2))
+            elseif op == 2 and WANT_AUDIO then
+                -- Decode/unpack audio (codec per --crunchy) and enqueue, in
+                -- arrival order to keep the DFPWM decoder's state in sync.
+                audio_queue[#audio_queue + 1] = decode_audio(msg:sub(2))
+                while #audio_queue > MAX_AUDIO_CHUNKS do
+                    table.remove(audio_queue, 1)   -- drop oldest, stay in sync
                 end
-            else
-                handle_text(msg)
+                os.queueEvent("livecc_audio")      -- wake the audio player
             end
+        else
+            handle_text(msg)
         end
-        mon_print("Stream ended.")
-        console("LiveCC: stream ended.")
-    end,
+    end
+    mon_print("Stream ended.")
+    console("LiveCC: stream ended.")
+end
 
-    -- Audio player: drains the queue; may block on speaker_audio_empty
-    function()
-        if #speakers == 0 then return end
+-- Audio player: drains the queue; may block on speaker_audio_empty.  Only present
+-- when audio is on (WANT_AUDIO already requires at least one speaker).
+if WANT_AUDIO then
+    tasks[#tasks + 1] = function()
         while true do
             if #audio_queue > 0 then
                 play_on_all(table.remove(audio_queue, 1))
@@ -311,18 +341,20 @@ parallel.waitForAny(
                 os.pullEvent("livecc_audio")   -- sleep until a chunk arrives
             end
         end
-    end,
+    end
+end
 
-    -- Key watcher
-    function()
-        while true do
-            local _, key = os.pullEvent("key")
-            if key == keys.q then
-                if ws then ws.close() end
-                mon_print("Stopped.")
-                console("LiveCC: stopped by user.")
-                return
-            end
+-- Key watcher
+tasks[#tasks + 1] = function()
+    while true do
+        local _, key = os.pullEvent("key")
+        if key == keys.q then
+            if ws then ws.close() end
+            mon_print("Stopped.")
+            console("LiveCC: stopped by user.")
+            return
         end
     end
-)
+end
+
+parallel.waitForAny(table.unpack(tasks))

@@ -171,6 +171,27 @@ def test_audio_disabled_sends_no_audio(monkeypatch):
     assert all(b[:1] != session.OP_AUDIO for b in ws.bins)
 
 
+def test_no_video_streams_audio_only(monkeypatch):
+    # --no-video: audio-only.  The scheduler keys off the audio buffer instead of
+    # video; no video frames are produced and it must not hang.  n_video=99 is a
+    # canary — if a video producer were wrongly created we'd see frames.
+    _patch(monkeypatch, n_video=99, n_audio=4, is_live=False)
+    ws = FakeWS()
+    s = StreamSession("u", w=4, h=2, fps=50, want_audio=True, want_video=False)
+    run(asyncio.wait_for(s.run(ws), 5))
+    assert len([b for b in ws.bins if b[:1] == session.OP_AUDIO]) == 4
+    assert all(b[:1] != session.OP_VIDEO for b in ws.bins)
+    assert "PLAYING" in ws.texts
+
+
+def test_both_streams_disabled_reports_error(monkeypatch):
+    _patch(monkeypatch, n_video=0, n_audio=0, is_live=False)
+    ws = FakeWS()
+    s = StreamSession("u", w=4, h=2, fps=50, want_audio=False, want_video=False)
+    run(asyncio.wait_for(s.run(ws), 5))
+    assert any(t.startswith("ERROR Nothing to play") for t in ws.texts)
+
+
 def test_loop_downloads_section_once_then_streams(monkeypatch):
     _patch(monkeypatch, n_video=6, n_audio=0, is_live=False)
     calls = {"n": 0, "args": None}

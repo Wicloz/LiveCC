@@ -6,7 +6,8 @@ whole body, so streaming uses a single multiplexed WebSocket.  Server-side
 buffering, A/V sync and pacing live in session.StreamSession.
 
 WebSocket endpoint (used by the CC player):
-  /ws/play?url=<url>[&width=51&height=19&fps=10&audio=1&start=&end=&loop=0&crunchy=0]
+  /ws/play?url=<url>[&width=51&height=19&fps=10&audio=1&video=1&start=&end=&loop=0&crunchy=0]
+      audio/video : "0" to disable that stream (audio-only / video-only).
       start/end : timestamps ("90", "1m30s", "3h2m"); seek a VOD section.
       loop      : "1" to cache the section once and replay it forever.
       crunchy   : "1" for low-bandwidth mode — 1-bit DFPWM audio (the client also
@@ -71,6 +72,7 @@ async def ws_play(websocket: WebSocket):
         h=_int(qp, "height", 19, 1, 500),
         fps=_int(qp, "fps", 24, 1, 30),
         want_audio=qp.get("audio", "1") != "0",
+        want_video=qp.get("video", "1") != "0",
         start=qp.get("start", ""),
         end=qp.get("end", ""),
         loop=qp.get("loop", "0") == "1",

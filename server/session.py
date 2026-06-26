@@ -116,11 +116,12 @@ class TimedBuffer:
 
 class StreamSession:
     def __init__(self, url: str, w: int, h: int, fps: int, want_audio: bool,
-                 start: str = "", end: str = "", loop: bool = False,
-                 rate: int = 48000, crunchy: bool = False) -> None:
+                 want_video: bool = True, start: str = "", end: str = "",
+                 loop: bool = False, rate: int = 48000, crunchy: bool = False) -> None:
         self.url = url
         self.w, self.h, self.fps = w, h, fps
         self.want_audio = want_audio
+        self.want_video = want_video
         self.rate = rate
         # --crunchy trades audio fidelity for bandwidth: 1-bit DFPWM instead of
         # raw 8-bit PCM.  (It also lowers video resolution, but that's driven by
@@ -213,24 +214,37 @@ class StreamSession:
     # ----- scheduler helpers ----------------------------------------------
 
     def _producing_video(self) -> bool:
-        return not self.video_done.is_set()
+        return self.want_video and not self.video_done.is_set()
 
     def _producing_audio(self) -> bool:
         return self.want_audio and not self.audio_done.is_set()
 
+    # The "primary" stream drives prebuffer/underrun gating: video when present,
+    # else audio (audio-only / --no-video).  Both streams are still released by PTS
+    # against the shared clock — this only picks what startup/underrun keys off.
+    def _primary_buf(self) -> TimedBuffer:
+        return self.video_buf if self.want_video else self.audio_buf
+
+    def _primary_done(self) -> asyncio.Event:
+        return self.video_done if self.want_video else self.audio_done
+
+    def _primary_producing(self) -> bool:
+        return self._producing_video() if self.want_video else self._producing_audio()
+
     def _oldest_pts(self) -> Optional[float]:
-        cands = [p for p in (self.video_buf.head_pts(),
+        cands = [p for p in (self.video_buf.head_pts() if self.want_video else None,
                              self.audio_buf.head_pts() if self.want_audio else None)
                  if p is not None]
         return min(cands) if cands else None
 
     def _all_done_and_empty(self) -> bool:
-        v = self.video_done.is_set() and self.video_buf.empty()
+        v = (not self.want_video) or (self.video_done.is_set() and self.video_buf.empty())
         a = (not self.want_audio) or (self.audio_done.is_set() and self.audio_buf.empty())
         return v and a
 
     async def _prebuffer(self) -> None:
-        while not self.video_done.is_set() and self.video_buf.seconds() < self.prebuffer:
+        buf, done = self._primary_buf(), self._primary_done()
+        while not done.is_set() and buf.seconds() < self.prebuffer:
             await asyncio.sleep(0.05)
 
     async def _release(self, ws, media_now: float) -> bool:
@@ -249,6 +263,9 @@ class StreamSession:
     # ----- main loop -------------------------------------------------------
 
     async def run(self, ws) -> None:
+        if not self.want_video and not self.want_audio:
+            await ws.send_text("ERROR Nothing to play (audio and video both disabled).")
+            return
         loop = asyncio.get_running_loop()
         self.is_live, ext = await probe_source_info(self.url)
         # start/end only make sense for VOD; ignore them for live streams.
@@ -287,7 +304,8 @@ class StreamSession:
                         "ERROR Failed to prepare source. Check the server logs.")
                     return
 
-            tasks.append(asyncio.create_task(self._produce_video()))
+            if self.want_video:
+                tasks.append(asyncio.create_task(self._produce_video()))
             if self.want_audio:
                 tasks.append(asyncio.create_task(self._produce_audio()))
 
@@ -313,7 +331,7 @@ class StreamSession:
                     elif not sent:
                         await asyncio.sleep(0.005)
                 else:  # VOD
-                    if self.video_buf.empty() and self._producing_video():
+                    if self._primary_buf().empty() and self._primary_producing():
                         await ws.send_text("BUFFERING")     # underrun -> pause
                         await self._prebuffer()
                         await ws.send_text("PLAYING")
@@ -321,8 +339,9 @@ class StreamSession:
                     elif not sent:
                         await asyncio.sleep(0.005)
 
-            if self.video_sent == 0:
-                await ws.send_text("ERROR Failed to load video. Check the server logs.")
+            if (self.video_sent if self.want_video else self.audio_sent) == 0:
+                what = "video" if self.want_video else "audio"
+                await ws.send_text(f"ERROR Failed to load {what}. Check the server logs.")
         except Exception:
             # Catch-all for anything not handled deeper (producers self-contain
             # their errors): log the traceback and tell the client something broke
