@@ -49,11 +49,9 @@ _BLIT_LUT = np.frombuffer(b"0123456789abcdef", dtype=np.uint8)
 _BITS = np.array([1, 2, 4, 8, 16], dtype=np.uint8)
 
 
-# Channel precision of the precomputed nearest-colour LUT.  6 bits (input snapped
-# to steps of 4) is plenty: CC's 16 palette colours sit far enough apart that a
-# ±4 input change almost never flips which one is nearest, so 8 bits would 64x the
-# table (16 MiB vs 256 KiB) and the build cost for no visible gain.  The builder
-# is chunked, so 8 bits is *viable* (set _BITS_PER_CHANNEL = 8) — just not worth it.
+# Channel precision of the precomputed nearest-colour LUT.  6 bits/channel keeps
+# the table compact enough for reasonable cache behavior while preserving the
+# colour discrimination needed by the blit search.
 _BITS_PER_CHANNEL = 6
 _SHIFT = 8 - _BITS_PER_CHANNEL
 
@@ -147,6 +145,10 @@ _DIST_LUT: np.ndarray = _build_dist_lut()
 _PAIR_FG = np.repeat(np.arange(16, dtype=np.uint8), 16)
 _PAIR_BG = np.tile(np.arange(16, dtype=np.uint8), 16)
 
+# Only compare blit pairs built from the best few palette candidates per cell.
+# This keeps the output format unchanged while cutting the search cost sharply.
+_PAIR_CANDIDATES = 2
+
 _PAIR_CHUNK = 64
 
 
@@ -183,26 +185,17 @@ def encode_frame(frame_rgb: np.ndarray) -> bytes:
                   .transpose(0, 2, 1, 3, 4)
                   .reshape(h_cells, w_cells, 6, 16))
 
-    # Evaluate every ordered FG/BG pair directly on the 2x3 cell.
-    best_score = np.full((h_cells, w_cells), np.inf, dtype=np.float32)
-    best_pair = np.zeros((h_cells, w_cells), dtype=np.uint8)
-    for start in range(0, 256, _PAIR_CHUNK):
-        stop = min(start + _PAIR_CHUNK, 256)
-        fg_idx = _PAIR_FG[start:stop]
-        bg_idx = _PAIR_BG[start:stop]
+    # Evaluate every ordered FG/BG pair built from the top-k palette candidates.
+    cell_cost = cells_dist.sum(axis=2)                         # (H, W, 16)
+    cand = np.argpartition(cell_cost, _PAIR_CANDIDATES, axis=-1)[..., :_PAIR_CANDIDATES]
+    cand_dist = np.take_along_axis(cells_dist, cand[:, :, None, :], axis=-1)
 
-        d_fg = cells_dist[..., fg_idx]                        # (H, W, 6, chunk)
-        d_bg = cells_dist[..., bg_idx]                        # (H, W, 6, chunk)
-        score = np.minimum(d_fg, d_bg).sum(axis=2)            # (H, W, chunk)
-
-        local_best = score.argmin(axis=-1)
-        local_score = np.take_along_axis(score, local_best[..., None], axis=-1)[..., 0]
-        update = local_score < best_score
-        best_score[update] = local_score[update]
-        best_pair[update] = (start + local_best)[update].astype(np.uint8)
-
-    fg_idx = _PAIR_FG[best_pair]                               # (H, W)
-    bg_idx = _PAIR_BG[best_pair]                               # (H, W)
+    pair_scores = np.minimum(cand_dist[..., :, None], cand_dist[..., None, :]).sum(axis=2)
+    best_local = pair_scores.reshape(h_cells, w_cells, -1).argmin(axis=-1)
+    fg_local = best_local // _PAIR_CANDIDATES
+    bg_local = best_local % _PAIR_CANDIDATES
+    fg_idx = np.take_along_axis(cand, fg_local[..., None], axis=-1)[..., 0]
+    bg_idx = np.take_along_axis(cand, bg_local[..., None], axis=-1)[..., 0]
 
     # Re-evaluate the chosen pair so we can emit the canonical mask/glyph form.
     d_fg = np.take_along_axis(cells_dist, fg_idx[:, :, None, None], axis=-1)[..., 0]

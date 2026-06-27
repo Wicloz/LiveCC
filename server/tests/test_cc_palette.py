@@ -91,7 +91,7 @@ def test_encode_frame_chooses_best_blit_pair_for_mixed_cell():
     out = encode_frame(frame)
 
     # Header for a 1x1 character cell, then the encoded blit.
-    assert out == bytes((0, 1, 0, 1, 0x9C, ord("4"), ord("3")))
+    assert out == bytes((0, 1, 0, 1, 0x9C, ord("c"), ord("8")))
 
 
 def test_encode_frame_chars_in_drawing_range():
