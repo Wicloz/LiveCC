@@ -65,7 +65,7 @@ _SHIFT = 8 - _BITS_PER_CHANNEL
 # (black/gray/light_gray/white are all chroma-zero, so lightness still separates
 # them — the grey ramp is unchanged) and preserves the palette round-trip.
 # Higher = more colourful / less white (w≈6 ≈ the old RGB look); 1 = literal ΔE.
-_CHROMA_WEIGHT = 4.0
+_CHROMA_WEIGHT = 6
 
 
 def _srgb_to_lab(rgb: np.ndarray) -> np.ndarray:
