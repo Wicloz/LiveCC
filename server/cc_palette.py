@@ -154,19 +154,27 @@ _PAIR_CANDIDATES = 2
 # background pair and every legal 5-bit mask.  The output state space is tiny,
 # so we can store the canonical glyph byte and the final fg/bg bytes directly.
 _STATE_COUNT = 16 * 16 * 32
+_STATE_INDEX = np.empty((16, 16, 32), dtype=np.uint16)
 _STATE_GLYPH = np.empty(_STATE_COUNT, dtype=np.uint8)
 _STATE_FG = np.empty(_STATE_COUNT, dtype=np.uint8)
 _STATE_BG = np.empty(_STATE_COUNT, dtype=np.uint8)
 _STATE_MASK = np.empty(_STATE_COUNT, dtype=np.uint8)
+_STATE_RENDERED = np.empty((_STATE_COUNT, 6), dtype=np.uint8)
 
 _state = 0
 for fg in range(16):
     for bg in range(16):
         for mask in range(32):
+            _STATE_INDEX[fg, bg, mask] = np.uint16(_state)
             _STATE_GLYPH[_state] = np.uint8(0x80 + mask)
             _STATE_FG[_state] = np.uint8(fg)
             _STATE_BG[_state] = np.uint8(bg)
             _STATE_MASK[_state] = np.uint8(mask)
+            rendered = np.full(6, bg, dtype=np.uint8)
+            for bit, pixel in enumerate((0, 1, 2, 3, 4)):
+                if mask & (1 << bit):
+                    rendered[pixel] = np.uint8(fg)
+            _STATE_RENDERED[_state] = rendered
             _state += 1
 
 _PAIR_CHUNK = 64
@@ -227,7 +235,7 @@ def encode_frame(frame_rgb: np.ndarray) -> bytes:
     final_fg = np.where(invert, bg_idx, fg_idx)
     final_bg = np.where(invert, fg_idx, bg_idx)
     state_mask = np.where(invert, _MASK_INVERT[mask], mask)
-    state_index = ((final_fg.astype(np.uint16) * 16 + final_bg.astype(np.uint16)) << 5) | state_mask.astype(np.uint16)
+    state_index = _STATE_INDEX[final_fg, final_bg, state_mask]
     char = _STATE_GLYPH[state_index]
     final_fg = _STATE_FG[state_index]
     final_bg = _STATE_BG[state_index]
