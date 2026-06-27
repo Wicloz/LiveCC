@@ -8,6 +8,10 @@ def _solid(rgb, ph, pw):
     return np.tile(np.array(rgb, dtype=np.uint8), (ph, pw, 1))
 
 
+def _cell(pixels):
+    return np.array(pixels, dtype=np.uint8).reshape(3, 2, 3)
+
+
 def test_quantize_shape_and_dtype():
     out = quantize(_solid((0, 0, 0), 6, 8))
     assert out.shape == (6, 8)
@@ -74,6 +78,20 @@ def test_encode_frame_solid_cell_is_empty_glyph():
     bg = chr(out[4 + 2 * W])                     # bg hex char for the cell
     assert text == 0x80                          # empty glyph
     assert bg == "e"                             # red -> 'e'
+
+
+def test_encode_frame_chooses_best_blit_pair_for_mixed_cell():
+    # Regression: the encoder must score the full 2x3 blit directly, not first
+    # quantize pixels and then keep the two most common palette entries.
+    frame = _cell([
+        [(95, 130, 194), (217, 207, 235)],
+        [(15, 163, 33), (215, 217, 130)],
+        [(248, 189, 16), (69, 184, 232)],
+    ])
+    out = encode_frame(frame)
+
+    # Header for a 1x1 character cell, then the encoded blit.
+    assert out == bytes((0, 1, 0, 1, 0x9C, ord("4"), ord("3")))
 
 
 def test_encode_frame_chars_in_drawing_range():

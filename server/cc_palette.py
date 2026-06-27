@@ -31,15 +31,15 @@ _CC_RGB = np.array([
     (222, 222, 108),  # 4  yellow
     (127, 204,  25),  # 5  lime
     (242, 178, 204),  # 6  pink
-    ( 76,  76,  76),  # 7  gray
+    (76,  76,  76),  # 7  gray
     (153, 153, 153),  # 8  light_gray
-    ( 76, 153, 178),  # 9  cyan
+    (76, 153, 178),  # 9  cyan
     (178, 102, 229),  # a  purple
-    ( 51, 102, 204),  # b  blue
+    (51, 102, 204),  # b  blue
     (127, 102,  76),  # c  brown
-    ( 87, 166,  78),  # d  green
+    (87, 166,  78),  # d  green
     (204,  76,  76),  # e  red
-    ( 17,  17,  17),  # f  black
+    (17,  17,  17),  # f  black
 ], dtype=np.float32)
 
 # ASCII bytes for blit chars: b'0123456789abcdef'
@@ -121,6 +121,19 @@ def _build_lut() -> np.ndarray:
 
 _LUT: np.ndarray = _build_lut()
 
+_PALETTE_LAB = _srgb_to_lab(_CC_RGB)
+
+# Ordered foreground/background pair tables.  The blit representation is
+# directional because the bottom-right sub-pixel must be background in the
+# emitted wire format, even though swapping FG/BG and inverting the mask is
+# mathematically equivalent.
+_PAIR_FG = np.repeat(np.arange(16, dtype=np.uint8), 16)
+_PAIR_BG = np.tile(np.arange(16, dtype=np.uint8), 16)
+_PAIR_FG_LAB = _PALETTE_LAB[_PAIR_FG]
+_PAIR_BG_LAB = _PALETTE_LAB[_PAIR_BG]
+
+_PAIR_CHUNK = 32
+
 
 def quantize(frame_rgb: np.ndarray) -> np.ndarray:
     """Map an H x W x 3 uint8 RGB array to an H x W uint8 array of palette indices."""
@@ -144,25 +157,44 @@ def encode_frame(frame_rgb: np.ndarray) -> bytes:
     h_cells = ph // 3
     w_cells = pw // 2
 
-    idx = quantize(frame_rgb)                                  # (ph, pw)
-    # Group into cells -> (H, W, 6); sub-pixel order s = sub_row*2 + sub_col.
-    cells = (idx[: h_cells * 3, : w_cells * 2]
-             .reshape(h_cells, 3, w_cells, 2)
-             .transpose(0, 2, 1, 3)
-             .reshape(h_cells, w_cells, 6))
+    # Group into cells -> (H, W, 6, 3); sub-pixel order s = sub_row*2 + sub_col.
+    cells_rgb = (np.asarray(frame_rgb, dtype=np.uint8)[: h_cells * 3, : w_cells * 2]
+                 .reshape(h_cells, 3, w_cells, 2, 3)
+                 .transpose(0, 2, 1, 3, 4)
+                 .reshape(h_cells, w_cells, 6, 3))
+    cells_lab = _srgb_to_lab(cells_rgb)
 
-    # Pick the two dominant palette colours per cell (mode + runner-up).
-    onehot = cells[..., None] == np.arange(16)
-    counts = onehot.sum(axis=2).astype(np.int16)               # (H, W, 16)
-    fg_idx = counts.argmax(axis=2)                             # (H, W)
-    counts2 = counts.copy()
-    np.put_along_axis(counts2, fg_idx[..., None], -1, axis=2)
-    bg_idx = counts2.argmax(axis=2)                            # (H, W)
+    # Evaluate every ordered FG/BG pair directly on the 2x3 cell.
+    best_score = np.full((h_cells, w_cells), np.inf, dtype=np.float32)
+    best_pair = np.zeros((h_cells, w_cells), dtype=np.uint8)
+    for start in range(0, 256, _PAIR_CHUNK):
+        stop = min(start + _PAIR_CHUNK, 256)
+        fg_lab = _PAIR_FG_LAB[start:stop]
+        bg_lab = _PAIR_BG_LAB[start:stop]
 
-    # Assign each sub-pixel to whichever of the two colours is nearer in RGB.
-    cell_rgb = _CC_RGB[cells]                                  # (H, W, 6, 3)
-    d_fg = ((cell_rgb - _CC_RGB[fg_idx][:, :, None, :]) ** 2).sum(-1)
-    d_bg = ((cell_rgb - _CC_RGB[bg_idx][:, :, None, :]) ** 2).sum(-1)
+        diff_fg = cells_lab[:, :, None, :, :] - fg_lab[None, None, :, None, :]
+        diff_bg = cells_lab[:, :, None, :, :] - bg_lab[None, None, :, None, :]
+
+        d_fg = diff_fg[..., 0] ** 2 + _CHROMA_WEIGHT * (diff_fg[..., 1:] ** 2).sum(axis=-1)
+        d_bg = diff_bg[..., 0] ** 2 + _CHROMA_WEIGHT * (diff_bg[..., 1:] ** 2).sum(axis=-1)
+        score = np.minimum(d_fg, d_bg).sum(axis=-1)          # (H, W, chunk)
+
+        local_best = score.argmin(axis=-1)
+        local_score = np.take_along_axis(score, local_best[..., None], axis=-1)[..., 0]
+        update = local_score < best_score
+        best_score[update] = local_score[update]
+        best_pair[update] = (start + local_best)[update].astype(np.uint8)
+
+    fg_idx = _PAIR_FG[best_pair]                               # (H, W)
+    bg_idx = _PAIR_BG[best_pair]                               # (H, W)
+
+    # Re-evaluate the chosen pair so we can emit the canonical mask/glyph form.
+    fg_lab = _PALETTE_LAB[fg_idx]
+    bg_lab = _PALETTE_LAB[bg_idx]
+    diff_fg = cells_lab - fg_lab[:, :, None, :]
+    diff_bg = cells_lab - bg_lab[:, :, None, :]
+    d_fg = diff_fg[..., 0] ** 2 + _CHROMA_WEIGHT * (diff_fg[..., 1:] ** 2).sum(axis=-1)
+    d_bg = diff_bg[..., 0] ** 2 + _CHROMA_WEIGHT * (diff_bg[..., 1:] ** 2).sum(axis=-1)
     is_fg = d_fg <= d_bg                                       # (H, W, 6)
 
     invert = is_fg[..., 5]                                     # bottom-right is fg
