@@ -121,7 +121,24 @@ def _build_lut() -> np.ndarray:
 
 _LUT: np.ndarray = _build_lut()
 
-_PALETTE_LAB = _srgb_to_lab(_CC_RGB)
+
+def _build_dist_lut() -> np.ndarray:
+    """Pre-compute perceptual distance to every palette entry for each RGB bucket."""
+    n = 1 << _BITS_PER_CHANNEL
+    step = 1 << _SHIFT
+    levels = np.arange(n, dtype=np.float32) * step + (step - 1) / 2.0
+    pal_lab = _srgb_to_lab(_CC_RGB)                           # (16, 3)
+    gg, bb = np.meshgrid(levels, levels, indexing="ij")
+    lut = np.empty((n, n, n, 16), dtype=np.float32)
+    for ri in range(n):
+        rr = np.full((n, n), levels[ri], dtype=np.float32)
+        lab = _srgb_to_lab(np.stack([rr, gg, bb], axis=-1))  # (n, n, 3)
+        diff = lab[:, :, None, :] - pal_lab                  # (n, n, 16, 3)
+        lut[ri] = diff[..., 0] ** 2 + _CHROMA_WEIGHT * (diff[..., 1:] ** 2).sum(-1)
+    return lut
+
+
+_DIST_LUT: np.ndarray = _build_dist_lut()
 
 # Ordered foreground/background pair tables.  The blit representation is
 # directional because the bottom-right sub-pixel must be background in the
@@ -129,10 +146,8 @@ _PALETTE_LAB = _srgb_to_lab(_CC_RGB)
 # mathematically equivalent.
 _PAIR_FG = np.repeat(np.arange(16, dtype=np.uint8), 16)
 _PAIR_BG = np.tile(np.arange(16, dtype=np.uint8), 16)
-_PAIR_FG_LAB = _PALETTE_LAB[_PAIR_FG]
-_PAIR_BG_LAB = _PALETTE_LAB[_PAIR_BG]
 
-_PAIR_CHUNK = 32
+_PAIR_CHUNK = 64
 
 
 def quantize(frame_rgb: np.ndarray) -> np.ndarray:
@@ -157,27 +172,28 @@ def encode_frame(frame_rgb: np.ndarray) -> bytes:
     h_cells = ph // 3
     w_cells = pw // 2
 
-    # Group into cells -> (H, W, 6, 3); sub-pixel order s = sub_row*2 + sub_col.
-    cells_rgb = (np.asarray(frame_rgb, dtype=np.uint8)[: h_cells * 3, : w_cells * 2]
-                 .reshape(h_cells, 3, w_cells, 2, 3)
-                 .transpose(0, 2, 1, 3, 4)
-                 .reshape(h_cells, w_cells, 6, 3))
-    cells_lab = _srgb_to_lab(cells_rgb)
+    frame_rgb = np.asarray(frame_rgb, dtype=np.uint8)
+    r = frame_rgb[: h_cells * 3, : w_cells * 2, 0] >> _SHIFT
+    g = frame_rgb[: h_cells * 3, : w_cells * 2, 1] >> _SHIFT
+    b = frame_rgb[: h_cells * 3, : w_cells * 2, 2] >> _SHIFT
+
+    # Group into cells -> (H, W, 6, 16); sub-pixel order s = sub_row*2 + sub_col.
+    cells_dist = (_DIST_LUT[r, g, b]
+                  .reshape(h_cells, 3, w_cells, 2, 16)
+                  .transpose(0, 2, 1, 3, 4)
+                  .reshape(h_cells, w_cells, 6, 16))
 
     # Evaluate every ordered FG/BG pair directly on the 2x3 cell.
     best_score = np.full((h_cells, w_cells), np.inf, dtype=np.float32)
     best_pair = np.zeros((h_cells, w_cells), dtype=np.uint8)
     for start in range(0, 256, _PAIR_CHUNK):
         stop = min(start + _PAIR_CHUNK, 256)
-        fg_lab = _PAIR_FG_LAB[start:stop]
-        bg_lab = _PAIR_BG_LAB[start:stop]
+        fg_idx = _PAIR_FG[start:stop]
+        bg_idx = _PAIR_BG[start:stop]
 
-        diff_fg = cells_lab[:, :, None, :, :] - fg_lab[None, None, :, None, :]
-        diff_bg = cells_lab[:, :, None, :, :] - bg_lab[None, None, :, None, :]
-
-        d_fg = diff_fg[..., 0] ** 2 + _CHROMA_WEIGHT * (diff_fg[..., 1:] ** 2).sum(axis=-1)
-        d_bg = diff_bg[..., 0] ** 2 + _CHROMA_WEIGHT * (diff_bg[..., 1:] ** 2).sum(axis=-1)
-        score = np.minimum(d_fg, d_bg).sum(axis=-1)          # (H, W, chunk)
+        d_fg = cells_dist[..., fg_idx]                        # (H, W, 6, chunk)
+        d_bg = cells_dist[..., bg_idx]                        # (H, W, 6, chunk)
+        score = np.minimum(d_fg, d_bg).sum(axis=2)            # (H, W, chunk)
 
         local_best = score.argmin(axis=-1)
         local_score = np.take_along_axis(score, local_best[..., None], axis=-1)[..., 0]
@@ -189,12 +205,8 @@ def encode_frame(frame_rgb: np.ndarray) -> bytes:
     bg_idx = _PAIR_BG[best_pair]                               # (H, W)
 
     # Re-evaluate the chosen pair so we can emit the canonical mask/glyph form.
-    fg_lab = _PALETTE_LAB[fg_idx]
-    bg_lab = _PALETTE_LAB[bg_idx]
-    diff_fg = cells_lab - fg_lab[:, :, None, :]
-    diff_bg = cells_lab - bg_lab[:, :, None, :]
-    d_fg = diff_fg[..., 0] ** 2 + _CHROMA_WEIGHT * (diff_fg[..., 1:] ** 2).sum(axis=-1)
-    d_bg = diff_bg[..., 0] ** 2 + _CHROMA_WEIGHT * (diff_bg[..., 1:] ** 2).sum(axis=-1)
+    d_fg = np.take_along_axis(cells_dist, fg_idx[:, :, None, None], axis=-1)[..., 0]
+    d_bg = np.take_along_axis(cells_dist, bg_idx[:, :, None, None], axis=-1)[..., 0]
     is_fg = d_fg <= d_bg                                       # (H, W, 6)
 
     invert = is_fg[..., 5]                                     # bottom-right is fg
