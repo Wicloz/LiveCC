@@ -33,6 +33,7 @@ local function print_usage()
     print("  --start TS    Start a VOD at timestamp TS")
     print("  --end TS      Stop a VOD at timestamp TS")
     print("  --loop        Loop the selected section forever")
+    print("  --sync        Sync playback with other --sync clients on this URL")
     print("  --crunchy     Low-bandwidth mode: lower resolution + 1-bit audio")
     print("  --no-audio    Don't stream audio (also implied when no speakers)")
     print("  --no-video    Don't stream video (audio only)")
@@ -48,7 +49,7 @@ end
 
 -- Parse: one positional (url) plus optional flags.
 local positional = {}
-local START_TS, END_TS, LOOP, HELP, CRUNCHY = nil, nil, false, false, false
+local START_TS, END_TS, LOOP, HELP, CRUNCHY, SYNC = nil, nil, false, false, false, false
 local NO_AUDIO, NO_VIDEO = false, false
 local WANTED_FPS = DEFAULT_FPS
 do
@@ -65,6 +66,8 @@ do
             i = i + 1; END_TS = args[i]
         elseif a == "--loop" then
             LOOP = true
+        elseif a == "--sync" then
+            SYNC = true
         elseif a == "--crunchy" then
             CRUNCHY = true
         elseif a == "--no-audio" then
@@ -285,6 +288,7 @@ local url = WS_BASE
     .. (START_TS and ("&start=" .. textutils.urlEncode(START_TS)) or "")
     .. (END_TS   and ("&end="   .. textutils.urlEncode(END_TS))   or "")
     .. (LOOP and "&loop=1" or "")
+    .. (SYNC and "&sync=1" or "")
     .. (CRUNCHY and "&crunchy=1" or "")
 
 local ok, err = http.websocket(url)

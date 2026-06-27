@@ -88,3 +88,64 @@ def test_int_default_clamp_and_bad_value():
     assert main._int({"fps": "100"}, "fps", 24, 1, 30) == 30   # clamp high
     assert main._int({"fps": "0"}, "fps", 24, 1, 30) == 1      # clamp low
     assert main._int({"fps": "x"}, "fps", 24, 1, 30) == 24     # non-numeric
+
+
+def test_session_kwargs_and_signature():
+    qp = {
+        "width": "80",
+        "height": "20",
+        "fps": "30",
+        "audio": "0",
+        "video": "1",
+        "start": "10",
+        "end": "20",
+        "loop": "1",
+        "crunchy": "1",
+    }
+    kwargs = main._session_kwargs(qp, "https://example/video")
+    assert kwargs == {
+        "url": "https://example/video",
+        "w": 80,
+        "h": 20,
+        "fps": 30,
+        "want_audio": False,
+        "want_video": True,
+        "start": "10",
+        "end": "20",
+        "loop": True,
+        "crunchy": True,
+    }
+    assert main._sync_signature(kwargs) == (80, 20, 30, False, True, "10", "20", True, True)
+
+
+def test_sync_group_reuse_and_release():
+    class WS:
+        pass
+
+    async def go():
+        main._sync_groups.clear()
+        kwargs = main._session_kwargs({}, "u")
+        g1 = await main._acquire_sync_group("u", kwargs)
+        g2 = await main._acquire_sync_group("u", kwargs)
+        assert g1 is g2
+
+        ws = WS()
+        await g1.subscribe(ws)
+        await main._release_sync_group("u", ws)
+        assert "u" not in main._sync_groups
+
+    asyncio.run(go())
+
+
+def test_sync_group_rejects_mismatched_settings():
+    async def go():
+        main._sync_groups.clear()
+        kwargs = main._session_kwargs({}, "u")
+        await main._acquire_sync_group("u", kwargs)
+
+        changed = dict(kwargs)
+        changed["fps"] = 12
+        got = await main._acquire_sync_group("u", changed)
+        assert got is None
+
+    asyncio.run(go())
