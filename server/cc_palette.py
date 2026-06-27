@@ -144,10 +144,30 @@ _DIST_LUT: np.ndarray = _build_dist_lut()
 # mathematically equivalent.
 _PAIR_FG = np.repeat(np.arange(16, dtype=np.uint8), 16)
 _PAIR_BG = np.tile(np.arange(16, dtype=np.uint8), 16)
+_MASK_INVERT = np.uint8(31) - np.arange(32, dtype=np.uint8)
 
 # Only compare blit pairs built from the best few palette candidates per cell.
 # This keeps the output format unchanged while cutting the search cost sharply.
 _PAIR_CANDIDATES = 2
+
+# Precompute the full canonical 8192-state blit codebook: every foreground /
+# background pair and every legal 5-bit mask.  The output state space is tiny,
+# so we can store the canonical glyph byte and the final fg/bg bytes directly.
+_STATE_COUNT = 16 * 16 * 32
+_STATE_GLYPH = np.empty(_STATE_COUNT, dtype=np.uint8)
+_STATE_FG = np.empty(_STATE_COUNT, dtype=np.uint8)
+_STATE_BG = np.empty(_STATE_COUNT, dtype=np.uint8)
+_STATE_MASK = np.empty(_STATE_COUNT, dtype=np.uint8)
+
+_state = 0
+for fg in range(16):
+    for bg in range(16):
+        for mask in range(32):
+            _STATE_GLYPH[_state] = np.uint8(0x80 + mask)
+            _STATE_FG[_state] = np.uint8(fg)
+            _STATE_BG[_state] = np.uint8(bg)
+            _STATE_MASK[_state] = np.uint8(mask)
+            _state += 1
 
 _PAIR_CHUNK = 64
 
@@ -203,13 +223,14 @@ def encode_frame(frame_rgb: np.ndarray) -> bytes:
     is_fg = d_fg <= d_bg                                       # (H, W, 6)
 
     invert = is_fg[..., 5]                                     # bottom-right is fg
-    bits = is_fg[..., :5].astype(np.uint8)                     # (H, W, 5)
-    data = (bits * _BITS).sum(axis=2).astype(np.uint8)
-    data_inv = ((1 - bits) * _BITS).sum(axis=2).astype(np.uint8)
-
-    char = (0x80 + np.where(invert, data_inv, data)).astype(np.uint8)
+    mask = np.packbits(is_fg[..., :5], axis=-1, bitorder="little")[..., 0]
     final_fg = np.where(invert, bg_idx, fg_idx)
     final_bg = np.where(invert, fg_idx, bg_idx)
+    state_mask = np.where(invert, _MASK_INVERT[mask], mask)
+    state_index = ((final_fg.astype(np.uint16) * 16 + final_bg.astype(np.uint16)) << 5) | state_mask.astype(np.uint16)
+    char = _STATE_GLYPH[state_index]
+    final_fg = _STATE_FG[state_index]
+    final_bg = _STATE_BG[state_index]
 
     rows = np.empty((h_cells, 3, w_cells), dtype=np.uint8)
     rows[:, 0, :] = char
