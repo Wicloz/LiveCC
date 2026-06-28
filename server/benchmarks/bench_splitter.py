@@ -14,8 +14,8 @@ from __future__ import annotations
 
 import numpy as np
 
-import _bench
-from _bench import GRIDS, fmt, measure, section, table
+import harness
+from harness import GRIDS, fmt, measure, section, table
 
 from transcoder import _FrameSplitter
 

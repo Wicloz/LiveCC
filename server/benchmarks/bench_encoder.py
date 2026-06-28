@@ -19,8 +19,8 @@ import sys
 
 import numpy as np
 
-import _bench
-from _bench import CONTENT, GRIDS, fmt, measure, section, table
+import harness
+from harness import CONTENT, GRIDS, fmt, measure, section, table
 
 import cc_encoder
 from cc_encoder import encode_frame

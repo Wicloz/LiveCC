@@ -11,7 +11,9 @@ source.  Two PSNRs are reported:
                   integrating neighbouring sub-pixels at viewing distance.  This
                   is where dithering pays off, so it should beat raw PSNR.
 
-Also reports the fraction of cells that actually dither (a non-solid glyph).
+Also reports the fraction of cells that actually dither (a non-solid glyph).  If
+the media/ folder has samples, a second table runs the same metrics on real
+decoded frames.
 
 Run:  python benchmarks/bench_quality.py
 """
@@ -20,35 +22,11 @@ from __future__ import annotations
 
 import numpy as np
 
-import _bench
-from _bench import CONTENT, GRIDS, fmt, section, table
+import harness
+from harness import (CONTENT, decode_frame, find_media, fmt, have_ffmpeg,
+                     sample_frames, section, table)
 
-from cc_encoder import _CC_RGB, encode_frame
-
-# ascii hex byte -> palette index 0..15
-_HEX = np.full(256, 0, np.intp)
-for _i, _c in enumerate(b"0123456789abcdef"):
-    _HEX[_c] = _i
-
-
-def decode(buf: bytes) -> np.ndarray:
-    """Reverse encode_frame: blit wire bytes -> (H*3, W*2, 3) uint8 image."""
-    w = buf[0] << 8 | buf[1]
-    h = buf[2] << 8 | buf[3]
-    body = np.frombuffer(buf, np.uint8, offset=4).reshape(h, 3, w)
-    glyph, fg, bg = body[:, 0, :], body[:, 1, :], body[:, 2, :]
-    mask = glyph.astype(np.intp) - 0x80                 # (H,W) 5 active bits
-    fg_idx = _HEX[fg]
-    bg_idx = _HEX[bg]
-
-    idx = np.empty((h, w, 6), np.intp)
-    for s in range(5):                                  # s0..s4 from the mask
-        idx[..., s] = np.where((mask >> s) & 1, fg_idx, bg_idx)
-    idx[..., 5] = bg_idx                                # bottom-right is always bg
-    rgb = _CC_RGB[idx].astype(np.float32)               # (H,W,6,3)
-    return (rgb.reshape(h, w, 3, 2, 3)
-            .transpose(0, 2, 1, 3, 4)
-            .reshape(h * 3, w * 2, 3))
+from cc_encoder import encode_frame
 
 
 def _psnr(a: np.ndarray, b: np.ndarray) -> float:
@@ -75,20 +53,47 @@ def _dither_fraction(buf: bytes) -> float:
     return float(np.mean(mask != 0))
 
 
-def main(w: int = 82, h: int = 41) -> None:
-    print(f"Fidelity  (grid {w}x{h}; higher PSNR = closer to source)")
-    section("Per-content reconstruction error")
+def _row(name: str, frame: np.ndarray) -> list:
+    buf = encode_frame(frame)
+    rec = decode_frame(buf)
+    return [
+        name,
+        fmt(_psnr(frame, rec), 1),
+        fmt(_psnr(_box2(frame), _box2(rec)), 1),
+        fmt(_dither_fraction(buf) * 100, 0) + "%",
+    ]
+
+
+_HEADERS = ["content", "PSNR dB", "PSNR 2x2 dB", "cells dithered"]
+
+
+def synthetic(w: int = 82, h: int = 41) -> None:
+    section(f"Synthetic content  (grid {w}x{h}; higher PSNR = closer to source)")
+    print(table(_HEADERS, [_row(name, gen(w, h)) for name, gen in CONTENT.items()]))
+
+
+def real_samples(w: int = 82, h: int = 41, frames_per: int = 4) -> None:
+    samples = find_media("video")
+    if not (samples and have_ffmpeg()):
+        return
+    section(f"Real media samples  (grid {w}x{h}, mean of up to {frames_per} frames)")
     rows = []
-    for name, gen in CONTENT.items():
-        src = gen(w, h)
-        rec = decode(encode_frame(src))
-        rows.append([
-            name,
-            fmt(_psnr(src, rec), 1),
-            fmt(_psnr(_box2(src), _box2(rec)), 1),
-            fmt(_dither_fraction(encode_frame(src)) * 100, 0) + "%",
-        ])
-    print(table(["content", "PSNR dB", "PSNR 2x2 dB", "cells dithered"], rows))
+    for path in samples:
+        frames = sample_frames(path, w, h, limit=frames_per)
+        if not frames:
+            continue
+        vals = np.array([[_psnr(f, decode_frame(encode_frame(f))),
+                          _psnr(_box2(f), _box2(decode_frame(encode_frame(f)))),
+                          _dither_fraction(encode_frame(f)) * 100] for f in frames])
+        m = vals.mean(0)
+        rows.append([path.name[:28], fmt(m[0], 1), fmt(m[1], 1), fmt(m[2], 0) + "%"])
+    if rows:
+        print(table(_HEADERS, rows))
+
+
+def main() -> None:
+    synthetic()
+    real_samples()
 
 
 if __name__ == "__main__":

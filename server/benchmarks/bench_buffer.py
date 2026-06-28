@@ -14,8 +14,8 @@ from __future__ import annotations
 import asyncio
 import time
 
-import _bench
-from _bench import fmt, section, table
+import harness
+from harness import fmt, section, table
 
 from session import TimedBuffer
 

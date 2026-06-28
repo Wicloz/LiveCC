@@ -1,0 +1,7 @@
+# Sample media is developer-provided — keep the folder tracked, but never commit
+# the samples themselves (they're large/copyrighted) or any render outputs.
+# Each developer drops their own clips here; the tests, benchmarks and renderer
+# pick up whatever is present.
+*
+!.gitignore
+!README.md

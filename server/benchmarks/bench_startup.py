@@ -17,8 +17,8 @@ import subprocess
 import sys
 import time
 
-import _bench
-from _bench import _SERVER_DIR, fmt, measure, section, table
+import harness
+from harness import _SERVER_DIR, fmt, measure, section, table
 
 import cc_encoder
 

@@ -18,17 +18,32 @@ python benchmarks/run_all.py --profile    # add the encoder cProfile dump
 python benchmarks/bench_encoder.py
 ```
 
-Sections: `encoder` (primary), `quality`, `splitter`, `buffer`, `startup`.
+Sections: `encoder` (primary), `quality`, `samples`, `splitter`, `buffer`,
+`startup`. The `samples` section uses developer clips in the repo-root `media/`
+folder and self-skips when it's empty.
+
+> Looking to *see* the output rather than time it? That's the preview renderer,
+> `../tools/render_cc.py` (see `media/README.md`) — it's a dev tool, not a
+> benchmark, so it lives outside this folder.
 
 ## What each measures
 
 | Module | Measures |
 | --- | --- |
-| `bench_encoder.py` | `encode_frame` cost vs **grid size** (pocket→max monitor) and vs **content** (flat/gradient/edges/photo/random), plus a per-primitive breakdown of where the time goes. Reports the fps ceiling and how many concurrent 24 fps streams fit on one core. |
-| `bench_quality.py` | Transcoder **fidelity**: decodes the blit wire format back to pixels and reports PSNR (raw and after a 2×2 box blur, which approximates the eye integrating dithered sub-pixels), plus the fraction of cells that dither. |
+| `bench_encoder.py` | `encode_frame` cost vs **grid size** (pocket→max monitor) and vs **content** (flat/gradient/edges/photo/random), plus a per-primitive breakdown of where the time goes. Reports the fps ceiling, the adaptive pacer's steady fps, and concurrent-streams-per-core. |
+| `bench_quality.py` | Transcoder **fidelity**: decodes the blit wire format back to pixels and reports PSNR (raw and after a 2×2 box blur, which approximates the eye integrating dithered sub-pixels) plus % cells dithered — for synthetic content **and** for any real `media/` samples. |
+| `bench_samples.py` | `encode_frame` on **real decoded frames** from `media/` clips — by grid and by clip. Needs ffmpeg + samples; self-skips otherwise. |
 | `bench_splitter.py` | `_FrameSplitter` throughput (whole-frame and 64 KiB-chunked) — the read path before the encode offload. |
 | `bench_buffer.py` | `TimedBuffer` put / pop_due — the scheduler's per-tick deque work. |
 | `bench_startup.py` | One-time import + OKLab LUT build cost and its resident footprint. |
+
+## Shared helpers
+
+`harness.py` holds the timing/table/synthetic-frame helpers used by the benches.
+Media discovery, real-frame extraction, and the reference blit *decoder* live in
+`../cc_media.py` (shared with the preview renderer and the sample tests);
+`harness` re-exports them, so the benches still `from harness import …`. The
+preview renderer itself is `../tools/render_cc.py` — see `media/README.md`.
 
 ## Reading the numbers
 
