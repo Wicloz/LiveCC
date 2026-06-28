@@ -47,8 +47,8 @@ from cc_encoder import encode_frame  # noqa: E402
 from transcoder import _FrameSplitter, _video_ffmpeg_cmd  # noqa: E402
 
 # Named grid presets (from cc_media.GRIDS) plus free-form WxH parsing.
-_PRESETS = {label.split()[0]: (w, h) for label, w, h in GRIDS}   # pocket/terminal/...
-_DEFAULT_GRIDS = "51x19,82x41"
+_PRESETS = {label.split()[0]: (w, h) for label, w, h in GRIDS}
+_DEFAULT_GRIDS = "pocket,164×81,143x52"
 _TARGET_WIDTH = 480       # upscale each preview to roughly this many pixels wide
 
 

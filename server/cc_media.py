@@ -26,13 +26,26 @@ PREVIEW_DIR = MEDIA_DIR / "cc_preview"                    # renderer output (git
 VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".gif", ".m4v", ".flv", ".ts"}
 AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".opus", ".flac"}
 
-# CC display sizes (character grid W x H): pocket computer up to the largest 8x6
-# monitor at text scale 0.5.
+# Realistic CC display sizes (character grid W x H) for the benchmarks/renderer.
+# Built-in screens are a fixed size; monitors come from the CC:Tweaked formula at
+# text scale 0.5 — termW = round((blocksW*64-20)/3), termH = round((blocksH*64-20)/4.5)
+# — for block layouts close to 16:9 (monitor blocks are square in-world, so the
+# physical aspect is blocksW:blocksH, and ~16:9 is what players build for video).
+#
+#   device        blocks  aspect          cells (WxH)
+#   pocket        builtin                 26x20
+#   terminal      builtin                 51x19
+#   mon 4x2       2.00                    79x24
+#   mon 5x3       1.67                    100x38
+#   mon 7x4       1.75  (closest to 16:9) 143x52
+#   mon 8x5       1.60  (near the 8x6 max) 164x67
 GRIDS = [
     ("pocket   26x20", 26, 20),
     ("terminal 51x19", 51, 19),
-    ("monitor  82x41", 82, 41),
-    ("max     164x81", 164, 81),
+    ("mon4x2   79x24", 79, 24),
+    ("mon5x3  100x38", 100, 38),
+    ("mon7x4  143x52", 143, 52),
+    ("mon8x5  164x67", 164, 67),
 ]
 
 
