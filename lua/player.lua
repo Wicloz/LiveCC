@@ -253,6 +253,8 @@ local function mon_print(msg)
     mon.write(msg)
 end
 
+local errored = false   -- an ERROR was shown; don't overwrite it with "Stream ended"
+
 local function handle_text(msg)
     if msg:sub(1, 4) == "META" then
         console("LiveCC: connected")
@@ -265,6 +267,7 @@ local function handle_text(msg)
         end
         -- else the next video frame paints over the "Buffering..." message
     elseif msg:sub(1, 5) == "ERROR" then
+        errored = true
         local detail = msg:sub(7)
         console("LiveCC error: " .. detail)
         mon_print("Error: " .. detail)
@@ -311,8 +314,12 @@ local tasks = {}
 -- Receiver: render video, enqueue audio, handle status
 tasks[#tasks + 1] = function()
     while true do
-        local msg, is_binary = ws.receive()
-        if msg == nil then break end
+        -- pcall: once the server closes the socket (after an ERROR, or at stream
+        -- end), ws.receive() raises "attempt to use a closed file" instead of
+        -- returning nil — so a bare call would crash the program right after the
+        -- error was shown.  Treat any failure or nil as "stop cleanly".
+        local ok, msg, is_binary = pcall(ws.receive)
+        if not ok or msg == nil then break end
         if is_binary then
             local op = msg:byte(1)
             if op == 1 then
@@ -330,7 +337,7 @@ tasks[#tasks + 1] = function()
             handle_text(msg)
         end
     end
-    mon_print("Stream ended.")
+    if not errored then mon_print("Stream ended.") end   -- keep any error on screen
     console("LiveCC: stream ended.")
 end
 
