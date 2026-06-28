@@ -195,6 +195,14 @@ def test_needs_seekable_source_flags_mp4_family_only():
         assert not transcoder.needs_seekable_source(ext)
 
 
+def test_needs_download_flags_gif():
+    # The server's ffmpeg can't demux a GIF from the pipe -> must download first.
+    assert transcoder.needs_download("gif")
+    assert transcoder.needs_download("GIF")
+    for ext in ("mp4", "webm", "mkv", "mov", ""):
+        assert not transcoder.needs_download(ext)
+
+
 def _box(btype, payload=b""):
     return (8 + len(payload)).to_bytes(4, "big") + btype + payload
 

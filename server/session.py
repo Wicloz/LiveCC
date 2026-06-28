@@ -35,6 +35,7 @@ from transcoder import (
     download_source,
     iter_audio,
     iter_video,
+    needs_download,
     needs_seekable_source,
     parse_timestamp,
     probe_moov_at_end,
@@ -139,7 +140,7 @@ class StreamSession:
         self._end_eff: Optional[int] = None
         self._source_path: Optional[str] = None         # temp file (loop / seekable)
         self._tmpdir: Optional[str] = None
-        self._need_seekable = False                      # MP4-family VOD -> download
+        self._need_download = False                      # decode from a downloaded file
 
         self.video_buf: TimedBuffer | None = None
         self.audio_buf: TimedBuffer | None = None
@@ -273,28 +274,32 @@ class StreamSession:
         self._end_eff = None if self.is_live else self.end
         self._setup_buffers()
 
-        # A VOD whose container *might* hide its index at the end (MP4 family) is
-        # checked for real: only a genuine moov-at-end file (unstreamable from a
-        # pipe) is downloaded; a faststart MP4 streams normally.  Skipped for live
-        # (segmented) and for --loop (which downloads regardless).
-        self._need_seekable = False
-        if not self.is_live and not self.loop and needs_seekable_source(ext):
-            self._need_seekable = await probe_moov_at_end(self.url)
+        # Decide whether to decode from a downloaded file instead of the pipe (live
+        # is segmented; --loop downloads regardless):
+        #   * GIF -> always download (the server's ffmpeg can't demux a GIF from a
+        #     pipe; it plays once from the file, unless --loop was also given);
+        #   * MP4 family -> probe, download only a genuine moov-at-end file.
+        self._need_download = False
+        if not self.is_live and not self.loop:
+            if needs_download(ext):
+                self._need_download = True
+            elif needs_seekable_source(ext):
+                self._need_download = await probe_moov_at_end(self.url)
 
         await ws.send_text(f"META {self.w} {self.h} {self.fps}")
-        log.info("session: %s is_live=%s ext=%s audio=%s start=%ss end=%s loop=%s seekable=%s",
+        log.info("session: %s is_live=%s ext=%s audio=%s start=%ss end=%s loop=%s download=%s",
                  self.url, self.is_live, ext, self.want_audio,
                  self._start_eff, self._end_eff, self.loop and not self.is_live,
-                 self._need_seekable)
+                 self._need_download)
 
         tasks: list[asyncio.Task] = []
         try:
             await ws.send_text("BUFFERING")
 
-            # Download the [start,end] section to a seekable temp file when we
-            # either need to replay it (--loop) or can't pipe-stream the container
-            # (MP4 moov-at-end).  Then ffmpeg decodes the file; --loop also replays.
-            if (self.loop or self._need_seekable) and not self.is_live:
+            # Download the [start,end] section to a temp file when we need to replay
+            # it (--loop) or can't pipe-stream it (GIF / MP4 moov-at-end).  Then
+            # ffmpeg decodes the seekable file; --loop also replays it.
+            if (self.loop or self._need_download) and not self.is_live:
                 self._tmpdir = tempfile.mkdtemp(prefix="livecc_")
                 self._source_path = await download_source(
                     self.url, self._tmpdir, self._start_eff, self._end_eff,

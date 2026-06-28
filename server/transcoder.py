@@ -303,6 +303,19 @@ def needs_seekable_source(ext: str) -> bool:
     return ext.lower() in _SEEKABLE_REQUIRED_EXTS
 
 
+# Formats that can't be decoded from the non-seekable yt-dlp pipe and must be
+# downloaded to a file first — unconditionally (no moov-style probe).  GIF is the
+# known case: the server's ffmpeg (bookworm 5.1) demuxes a GIF fine from a file
+# but produces no frames from a pipe, so a streamed GIF failed with "Failed to
+# load video".  Downloaded, it decodes normally (and plays once unless --loop).
+_DOWNLOAD_REQUIRED_EXTS = {"gif"}
+
+
+def needs_download(ext: str) -> bool:
+    """True if `ext` can't be pipe-streamed and must be downloaded to a file first."""
+    return ext.lower() in _DOWNLOAD_REQUIRED_EXTS
+
+
 # Cap on how much of the file head to scan for the moov/mdat order.  The decisive
 # top-level box header is almost always in the first few KB; this is just a bound.
 _MOOV_PROBE_BYTES = 256 * 1024

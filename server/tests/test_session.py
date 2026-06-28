@@ -233,6 +233,33 @@ def test_moov_at_end_mp4_vod_downloads_for_seekable_decode(monkeypatch):
     assert len([b for b in ws.bins if b[:1] == session.OP_VIDEO]) == 4
 
 
+def test_gif_downloads_and_plays_once_without_loop(monkeypatch):
+    # A GIF can't be pipe-streamed, so the session downloads it and decodes the
+    # file — but it does NOT loop unless --loop was given.  It skips the moov probe.
+    _patch(monkeypatch, n_video=4, n_audio=0, is_live=False, ext="gif")
+    calls = {"download": 0, "moov": 0}
+
+    async def fake_download(url, out_dir, start, end, want_audio):
+        calls["download"] += 1
+        return "/tmp/fake_source.gif"
+
+    async def counting_moov(url):
+        calls["moov"] += 1
+        return False
+
+    monkeypatch.setattr(session, "download_source", fake_download)
+    monkeypatch.setattr(session, "probe_moov_at_end", counting_moov)
+    ws = FakeWS()
+    s = StreamSession("u", w=4, h=2, fps=50, want_audio=False)   # no --loop flag
+    run(s.run(ws))
+
+    assert s.loop is False                           # GIF is not looped by default
+    assert calls["download"] == 1                    # downloaded (can't pipe-stream)
+    assert calls["moov"] == 0                        # GIF isn't an MP4 -> no probe
+    assert s._source_path == "/tmp/fake_source.gif"
+    assert len([b for b in ws.bins if b[:1] == session.OP_VIDEO]) == 4
+
+
 def test_faststart_mp4_vod_streams_without_download(monkeypatch):
     # A faststart MP4 (moov up front) pipe-streams fine — the moov probe says so,
     # so it must NOT be downloaded.
