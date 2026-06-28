@@ -21,6 +21,7 @@ import asyncio
 import collections
 import glob
 import logging
+import math
 import os
 import re
 import subprocess
@@ -446,14 +447,41 @@ async def download_source(url: str, out_dir: str, start: int, end: Optional[int]
 
 
 # --------------------------------------------------------------------------- #
+# Adaptive frame pacing
+# --------------------------------------------------------------------------- #
+# encode_frame() cost scales with the cell grid; on a big monitor a frame can take
+# longer than its slot at the requested fps.  Rather than out-run the encoder
+# (frames pile up, the buffer drains, playback stalls into constant re-buffering),
+# we encode only every Nth source frame so the EFFECTIVE fps falls to a steady
+# rate the CPU sustains — low but smooth beats stuttery.  N tracks a smoothed
+# encode time, so it adapts to the host and to load from other streams sharing the
+# worker pool.  Emitted frames carry their true source PTS, so audio and the
+# playback clock stay in sync regardless of N.
+_PACE_SAFETY = 1.15      # leave ~15% headroom over the measured encode time
+_PACE_EMA = 0.2          # weight of the newest encode-time sample in the average
+
+
+def _encode_stride(enc_seconds: float, fps: int) -> int:
+    """How many source frames each encoded frame should span to keep up.
+
+    Keeping up needs encode_time <= stride/fps, i.e. stride >= encode_time*fps;
+    clamped to [1, fps] (never finer than every frame, never below 1 fps).
+    """
+    return max(1, min(fps, math.ceil(enc_seconds * fps * _PACE_SAFETY)))
+
+
+# --------------------------------------------------------------------------- #
 # Producer iterators
 # --------------------------------------------------------------------------- #
 
 async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
                      start: int = 0, end: Optional[int] = None,
                      source_path: Optional[str] = None,
-                     loop: bool = False) -> AsyncGenerator[bytes, None]:
-    """Yield encoded 2x3 binary frames.
+                     loop: bool = False) -> AsyncGenerator[tuple[float, bytes], None]:
+    """Yield (pts_seconds, encoded 2x3 binary frame) pairs.
+
+    pts is the frame's media time (source_index / fps), so the consumer can pace
+    it against the shared clock even when adaptive pacing skips source frames.
 
     source_path set => decode that local (seekable) file; loop=True replays it
     forever (--loop).  Otherwise stream from the yt-dlp pipe.
@@ -463,6 +491,11 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
     ffmpeg: subprocess.Popen | None = None
     splitter = _FrameSplitter(px_w, px_h)
     ev_loop = asyncio.get_running_loop()
+    # Adaptive pacing state: src_i counts source frames, next_i is the next source
+    # index we'll actually encode, enc_ema smooths the encode wall-time, encoded
+    # counts what we emitted.  Initialised before the try so finally can log them.
+    src_i = next_i = encoded = 0
+    enc_ema = 0.0
     try:
         if source_path:
             ffmpeg = subprocess.Popen(
@@ -484,7 +517,7 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
             _spawn_stderr_drain(ffmpeg, "ffmpeg")
 
         while True:
-            timeout = _FIRST_OUTPUT_TIMEOUT if splitter.count == 0 else _STALL_TIMEOUT
+            timeout = _FIRST_OUTPUT_TIMEOUT if src_i == 0 else _STALL_TIMEOUT
             try:
                 chunk = await _read_with_timeout(ffmpeg, 65536, timeout)
             except TimeoutError:
@@ -493,6 +526,10 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
             if not chunk:
                 break
             for arr in splitter.push(chunk):
+                idx = src_i
+                src_i += 1
+                if idx < next_i:
+                    continue                         # shed load: skip this frame
                 # Encode off the event loop.  encode_frame() is CPU-heavy numpy;
                 # run inline it would block the single-threaded pacing scheduler
                 # (session.run) between frames, so frames go out in bursts and the
@@ -507,14 +544,25 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
                 # (agen.aclose) as things we'd hand-roll across a sync/async queue.
                 # See memory note [[video-encode-offload]].  Not worth it until this
                 # targeted offload proves insufficient.
-                yield await ev_loop.run_in_executor(_executor, encode_frame, arr)
+                t0 = ev_loop.time()
+                frame = await ev_loop.run_in_executor(_executor, encode_frame, arr)
+                enc = ev_loop.time() - t0
+                # Smoothed encode time -> how many source frames to span next, so
+                # the effective fps tracks what the CPU can actually sustain.
+                enc_ema = enc if encoded == 0 else \
+                    (1 - _PACE_EMA) * enc_ema + _PACE_EMA * enc
+                next_i = idx + _encode_stride(enc_ema, fps)
+                encoded += 1
+                yield (idx / fps, frame)
     except asyncio.CancelledError:
         raise
     except Exception:
         log.exception("video: pipeline error")
     finally:
         _kill_wait(ffmpeg, ytdlp)
-        log.info("video: produced %d frame(s)", splitter.count)
+        eff = encoded / splitter.count * fps if splitter.count else fps
+        log.info("video: encoded %d of %d source frame(s) (~%.1f fps effective)",
+                 encoded, splitter.count, eff)
 
 
 async def iter_audio(youtube_url: str, sample_rate: int = 48000,

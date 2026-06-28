@@ -176,14 +176,14 @@ class StreamSession:
         # CancelledError (BaseException) still propagates; only real errors are
         # swallowed-and-logged, degrading to "no frames" -> ERROR downstream.
         agen = None
-        i = 0
         try:
             agen = iter_video(self.url, self.w, self.h, self.fps,
                               start=self._start_eff, end=self._end_eff,
                               source_path=self._source_path, loop=self.loop)
-            async for frame in agen:
-                await self.video_buf.put(i / self.fps, frame)
-                i += 1
+            # iter_video tags each frame with its source PTS and may skip source
+            # frames to keep up (adaptive pacing) — so trust its pts, don't count.
+            async for pts, frame in agen:
+                await self.video_buf.put(pts, frame)
         except Exception:
             log.exception("video producer failed")
         finally:

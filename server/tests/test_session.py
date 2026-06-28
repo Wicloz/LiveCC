@@ -75,8 +75,8 @@ class FakeWS:
 
 def _patch(monkeypatch, n_video, n_audio, is_live, ext="webm", moov_at_end=True):
     async def fake_video(url, w, h, fps, start=0, end=None, source_path=None, loop=False):
-        for _ in range(n_video):
-            yield bytes((0, w, 0, h)) + b"\x00" * (w * h * 3)
+        for i in range(n_video):   # iter_video yields (pts, frame); pts = i/fps
+            yield i / fps, bytes((0, w, 0, h)) + b"\x00" * (w * h * 3)
 
     async def fake_audio(url, rate, codec=None, start=0, end=None,
                          source_path=None, loop=False):
@@ -302,9 +302,11 @@ def test_cancel_finalizes_producer_generator(monkeypatch):
     closed = {"video": False}
 
     async def fake_video(url, w, h, fps, start=0, end=None, source_path=None, loop=False):
+        i = 0
         try:
             while True:
-                yield b"\x00" * 16
+                yield i / fps, b"\x00" * 16   # (pts, frame)
+                i += 1
                 await asyncio.sleep(0.01)
         finally:
             closed["video"] = True

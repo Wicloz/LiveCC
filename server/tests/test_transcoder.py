@@ -55,6 +55,20 @@ def test_splitter_handles_multiple_frames_across_byte_chunks():
 # Command builders
 # --------------------------------------------------------------------------- #
 
+@pytest.mark.parametrize("enc_ms,fps,expected", [
+    (5, 24, 1),       # fast encode (5 ms << 42 ms slot) -> every frame, full fps
+    (40, 24, 2),      # 0.040*24*1.15 = 1.10 -> ceil 2 -> ~12 fps
+    (70, 24, 2),      # 0.070*24*1.15 = 1.93 -> ceil 2 -> ~12 fps
+    (200, 24, 6),     # 0.200*24*1.15 = 5.52 -> ceil 6 -> ~4 fps
+    (5000, 24, 24),   # absurdly slow -> clamped to fps (1 fps floor)
+    (0.1, 30, 1),     # trivial -> 1, never finer than every frame
+])
+def test_encode_stride_tracks_load(enc_ms, fps, expected):
+    s = transcoder._encode_stride(enc_ms / 1000.0, fps)
+    assert s == expected
+    assert 1 <= s <= fps          # never finer than every frame, never below 1 fps
+
+
 def test_ytdlp_cmd_streams_to_stdout():
     cmd = _ytdlp_cmd("https://example.com/v", transcoder._VIDEO_FMT)
     assert cmd[0] == "yt-dlp"
@@ -317,7 +331,7 @@ def _collect_video_from_file(path, limit):
         agen = transcoder.iter_video("ignored", term_w=8, term_h=4, fps=5,
                                      source_path=str(path))
         try:
-            async for f in agen:
+            async for _pts, f in agen:        # iter_video yields (pts, frame)
                 frames.append(f)
                 if len(frames) >= limit:
                     break
@@ -326,6 +340,50 @@ def _collect_video_from_file(path, limit):
 
     asyncio.run(go())
     return frames
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+def test_adaptive_pacing_skips_frames_when_encode_is_slow(tmp_path, monkeypatch):
+    # When encode_frame can't keep up, iter_video must encode only a subset of
+    # source frames (so the stream doesn't out-run the encoder) while the PTS it
+    # emits stay on the true source grid (i/fps) so A/V sync is preserved.
+    import time
+
+    import cc_encoder
+
+    path = tmp_path / "clip.mkv"
+    if _ffmpeg_make(path, "mpeg4").returncode != 0:     # ~10 frames at 10 fps
+        pytest.skip("ffmpeg can't build the clip")
+
+    real = cc_encoder.encode_frame
+
+    def slow(arr):
+        time.sleep(0.15)            # 0.15*10*1.15 = 1.7 -> stride 2 -> ~half the frames
+        return real(arr)
+
+    monkeypatch.setattr(transcoder, "encode_frame", slow)
+
+    pts_list = []
+
+    async def go():
+        agen = transcoder.iter_video("ignored", term_w=8, term_h=4, fps=10,
+                                     source_path=str(path))
+        try:
+            async for pts, _frame in agen:
+                pts_list.append(pts)
+        finally:
+            await agen.aclose()
+
+    asyncio.run(go())
+
+    assert len(pts_list) >= 2, "should still emit some frames"
+    # Frames were skipped: fewer emitted than the ~10 source frames.
+    assert len(pts_list) <= 7
+    # PTS stay on the source grid (multiples of 1/fps) and strictly increase, and
+    # at least one gap is >1 frame (a skip actually happened).
+    steps = [round((b - a) * 10) for a, b in zip(pts_list, pts_list[1:])]
+    assert all(s >= 1 for s in steps) and any(s >= 2 for s in steps)
+    assert all(abs(p * 10 - round(p * 10)) < 1e-6 for p in pts_list)
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
@@ -433,7 +491,7 @@ def test_live_stream_produces_frames(url):
         async def collect():
             agen = transcoder.iter_video(url, term_w=20, term_h=8, fps=5)
             try:
-                async for _frame in agen:
+                async for _pts, _frame in agen:   # iter_video yields (pts, frame)
                     state["frames"] += 1
                     if state["frames"] >= 5:
                         break

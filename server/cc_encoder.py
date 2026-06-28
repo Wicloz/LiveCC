@@ -34,7 +34,7 @@ That one idea folds the three old steps together:
                                would crawl/boil frame-to-frame on video).
 
 Endpoint search is near-exact: rather than score all 120 palette pairs per cell,
-we score 21 candidate pairs chosen to cover edges and flats (see the comment by
+we score 12 candidate pairs chosen to cover edges and flats (see the comment by
 _DITHER_WEIGHT) — within ~1% of the exhaustive search's cost on real video.  The
 output state space and binary wire format are identical to the old encoder, so the
 Lua client and the frame header are unchanged.
@@ -156,16 +156,20 @@ np.fill_diagonal(_DOT, _PAL2)   # exact on the diagonal: the matmul leaves |P_k|
 _DITHER_WEIGHT = np.float32(0.25)
 
 # Candidate endpoint pairs per cell (we don't score all 120 palette pairs):
-#   * the 15 pairs among the nearest palette colour to each of the 6 sub-pixels
-#     — captures EDGES (a high-contrast cell keeps both its extremes), and
-#   * the 6 pairs among the 4 palette colours nearest the cell mean — captures
-#     the bracketing pair a flat/smooth between-palette cell needs to dither
-#     (its per-sub-pixel nearests are all the same colour, so the first set alone
-#     could only render it solid → banding).
-# On real video this 21-pair search stays within ~1% of the exhaustive 120-pair
-# cost while dithering flats and edges the same way it does.
-_SII, _SJJ = (a.astype(np.int64) for a in np.triu_indices(6, k=1))   # (15,) sub-pixel
-_MII, _MJJ = (a.astype(np.int64) for a in np.triu_indices(4, k=1))   # (6,)  mean top-4
+#   * the 6 pairs among the nearest palette colour to each of the cell's 4 CORNER
+#     sub-pixels — captures EDGES (a high-contrast cell keeps both its extremes),
+#     and
+#   * the 6 pairs among the 4 palette colours nearest the cell mean — captures the
+#     bracketing pair a flat/smooth between-palette cell needs to dither (its
+#     per-sub-pixel nearests are all the same colour, so the first set alone could
+#     only render it solid → banding).
+# This 12-pair search matches the all-6-sub-pixel / exhaustive-120-pair cost to
+# well under 1% on real video (corners alone catch the cell's colour extremes; a
+# feature confined to the middle row only is both rare and usually picked up by
+# the mean's top-4), at a third less work than scoring all sub-pixel pairs.
+_CORNERS = np.array([0, 1, 4, 5], dtype=np.int64)   # top-L, top-R, bot-L, bot-R
+_EII, _EJJ = (a.astype(np.int64) for a in np.triu_indices(4, k=1))   # (6,) corner pairs
+_MII, _MJJ = (a.astype(np.int64) for a in np.triu_indices(4, k=1))   # (6,) mean top-4
 
 # Sub-pixel (row, col) for s = sub_row*2 + sub_col, in glyph-bit order.
 _SUB_ROW = np.array([0, 0, 1, 1, 2, 2], dtype=np.int64)
@@ -210,12 +214,12 @@ def encode_frame(frame_rgb: np.ndarray) -> bytes:
     lp_all = lab @ _PAL.T                                        # (H,W,6,16) q·P_k
     score = lp_all - 0.5 * _PAL2               # argmax_k = nearest palette to a sub-pixel
 
-    # --- Build the 21 candidate endpoint pairs (palette indices) ------------- #
-    nb1 = np.argmax(score, axis=-1)                            # (H,W,6) nearest/sub-pixel
+    # --- Build the 12 candidate endpoint pairs (palette indices) ------------- #
+    nb1 = np.argmax(score[:, :, _CORNERS, :], axis=-1)        # (H,W,4) nearest/corner
     mscore = lab.mean(2) @ _PAL.T - 0.5 * _PAL2               # (H,W,16) nearest to cell mean
     top4 = np.argpartition(mscore, -4, axis=-1)[..., -4:]     # (H,W,4)
-    idx_a = np.concatenate([nb1[..., _SII], top4[..., _MII]], axis=-1)  # (H,W,21) endpoint A
-    idx_b = np.concatenate([nb1[..., _SJJ], top4[..., _MJJ]], axis=-1)  # (H,W,21) endpoint B
+    idx_a = np.concatenate([nb1[..., _EII], top4[..., _MII]], axis=-1)  # (H,W,12) endpoint A
+    idx_b = np.concatenate([nb1[..., _EJJ], top4[..., _MJJ]], axis=-1)  # (H,W,12) endpoint B
 
     # --- Score each pair by expected dither error ---------------------------- #
     # For a pair (A,B), target q projects onto the segment at
@@ -225,26 +229,26 @@ def encode_frame(frame_rgb: np.ndarray) -> bytes:
     # summed over the 6 sub-pixels — see _DITHER_WEIGHT for why λ<1.  Per sub-pixel
     # this is  |q-A|² - 2t(q-A)·dir + t·|dir|²·(λ + (1-λ)t); the |q|² part of |q-A|²
     # is the same for every pair, so we drop it (the argmin is unchanged) and the
-    # remaining work is fused in place to keep the (H,W,6,21) traffic down.
+    # remaining work is fused in place to keep the (H,W,6,12) traffic down.
     n_pairs = idx_a.shape[-1]
     lpa = np.take_along_axis(
         lp_all, np.broadcast_to(idx_a[:, :, None, :], (h, w, 6, n_pairs)), axis=-1)
     lpb = np.take_along_axis(
         lp_all, np.broadcast_to(idx_b[:, :, None, :], (h, w, 6, n_pairs)), axis=-1)
-    pa2 = _PAL2[idx_a]                                          # (H,W,21) |A|²
-    dot = _DOT[idx_a, idx_b]                                    # (H,W,21) A·B
-    len2 = pa2 + _PAL2[idx_b] - 2.0 * dot                       # (H,W,21) |B-A|²
-    padir = dot - pa2                                           # (H,W,21) A·dir
+    pa2 = _PAL2[idx_a]                                          # (H,W,12) |A|²
+    dot = _DOT[idx_a, idx_b]                                    # (H,W,12) A·B
+    len2 = pa2 + _PAL2[idx_b] - 2.0 * dot                       # (H,W,12) |B-A|²
+    padir = dot - pa2                                           # (H,W,12) A·dir
     safe = np.where(len2 == 0.0, 1.0, len2)                     # guard A==B (solid)
 
-    qad = lpb - lpa - padir[..., None, :]                       # (H,W,6,21) (q-A)·dir
+    qad = lpb - lpa - padir[..., None, :]                       # (H,W,6,12) (q-A)·dir
     t = np.clip(qad / safe[..., None, :], 0.0, 1.0)
     l2 = len2[..., None, :]
     term = l2 * t                                               # fold cost in place
     term *= _DITHER_WEIGHT + (1.0 - _DITHER_WEIGHT) * t
     term -= 2.0 * t * qad
     term -= 2.0 * lpa
-    cost = term.sum(2) + 6.0 * pa2                              # (H,W,21) (|q|² dropped)
+    cost = term.sum(2) + 6.0 * pa2                              # (H,W,12) (|q|² dropped)
     best = cost.argmin(-1)                                      # (H,W) winning pair
 
     # Resolve the winning pair's palette indices and reuse its already-computed

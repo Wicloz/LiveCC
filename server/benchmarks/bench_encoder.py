@@ -24,28 +24,34 @@ from _bench import CONTENT, GRIDS, fmt, measure, section, table
 
 import cc_encoder
 from cc_encoder import encode_frame
+from transcoder import _encode_stride
+
+_TARGET_FPS = 24
 
 
 def size_sweep() -> None:
-    section("1. Size sweep  (content: photo, single core)")
+    section(f"1. Size sweep  (content: photo, single core, target {_TARGET_FPS} fps)")
     rows = []
     for label, w, h in GRIDS:
         frame = CONTENT["photo"](w, h)
         r = measure(lambda: encode_frame(frame))
         nbytes = len(encode_frame(frame))
         fps_ceiling = 1000.0 / r["mean_ms"]
-        streams_24 = (1000.0 / 24.0) / r["mean_ms"]
+        streams_24 = (1000.0 / _TARGET_FPS) / r["mean_ms"]
+        # What the adaptive pacer (transcoder) would settle on for one stream.
+        eff_fps = _TARGET_FPS / _encode_stride(r["mean_ms"] / 1000.0, _TARGET_FPS)
         rows.append([
             label, f"{w * h}",
             fmt(r["mean_ms"]), fmt(r["min_ms"]),
-            fmt(fps_ceiling, 0), fmt(streams_24, 1),
+            fmt(fps_ceiling, 0), fmt(eff_fps, 0), fmt(streams_24, 1),
             f"{nbytes / 1024:.1f}",
-            f"{nbytes * 24 / 1024:.0f}",
         ])
     print(table(
         ["grid", "cells", "mean ms", "min ms", "fps max",
-         "strm@24", "KB/frm", "KB/s@24"],
+         "eff fps", "strm@24", "KB/frm"],
         rows))
+    print(f"\neff fps = steady rate the adaptive pacer holds at {_TARGET_FPS} fps "
+          f"target (low but stutter-free); strm@24 = concurrent streams per core.")
 
 
 def content_sweep(w: int = 82, h: int = 41) -> None:
@@ -83,7 +89,7 @@ def components(w: int = 82, h: int = 41) -> None:
     score = lp_all - 0.5 * cc._PAL2
 
     def nearest():
-        return np.argmax(score, axis=-1)
+        return np.argmax(score[:, :, cc._CORNERS, :], axis=-1)   # (H,W,4) corners
 
     def mean_top4():
         ms = lab.mean(2) @ cc._PAL.T - 0.5 * cc._PAL2
@@ -91,8 +97,8 @@ def components(w: int = 82, h: int = 41) -> None:
 
     nb1 = nearest()
     top4 = mean_top4()
-    idx_a = np.concatenate([nb1[..., cc._SII], top4[..., cc._MII]], axis=-1)
-    idx_b = np.concatenate([nb1[..., cc._SJJ], top4[..., cc._MJJ]], axis=-1)
+    idx_a = np.concatenate([nb1[..., cc._EII], top4[..., cc._MII]], axis=-1)
+    idx_b = np.concatenate([nb1[..., cc._EJJ], top4[..., cc._MJJ]], axis=-1)
     n_pairs = idx_a.shape[-1]
 
     def gather():
@@ -131,7 +137,7 @@ def components(w: int = 82, h: int = 41) -> None:
         ("nearest / sub-pixel (argmax)", nearest),
         ("mean top-4 (argpartition)", mean_top4),
         ("gather pairs (take_along_axis)", gather),
-        ("score 21 pairs (cost+argmin)", score_pairs),
+        ("score 12 pairs (cost+argmin)", score_pairs),
         ("pack + emit (packbits)", pack_emit),
         ("FULL encode_frame", lambda: encode_frame(frame)),
     ]:

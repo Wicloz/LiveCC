@@ -32,10 +32,12 @@ Sections: `encoder` (primary), `quality`, `splitter`, `buffer`, `startup`.
 
 ## Reading the numbers
 
-- **Headline:** `bench_encoder` size sweep on `photo` content. `strm@24` is the
-  per-core concurrency budget; large monitors fall below 24 fps and lean on the
-  session's frame-dropping (see the `adaptive-quality` design note). Terminals and
-  small/medium monitors have ample headroom.
+- **Headline:** `bench_encoder` size sweep on `photo` content. `eff fps` is the
+  steady rate the transcoder's adaptive pacer (`_encode_stride`) holds at a 24 fps
+  target — when a grid is too big to encode in its frame slot it drops to a lower
+  but stutter-free fps instead of out-running the encoder into re-buffering.
+  `strm@24` is the per-core concurrency budget. Terminals and small/medium
+  monitors hold full fps; only the largest monitors pace down.
 - **`min ms`** is the cleanest signal (least OS scheduling noise); `mean ms` is
   typical cost. Numbers are single-core; `encode_frame` releases the GIL, so the
   worker pool scales across cores for concurrent streams.
