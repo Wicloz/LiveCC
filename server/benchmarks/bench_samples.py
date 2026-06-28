@@ -44,6 +44,7 @@ def by_grid(sample, frames_per: int = 4) -> None:
     for label, w, h in GRIDS:
         frames = sample_frames(sample, w, h, limit=frames_per)
         if not frames:
+            rows.append([label, "!", "DECODE", "FAILED", "-"])
             continue
         r = _measure_over(frames)
         eff = _TARGET_FPS / _encode_stride(r["mean_ms"] / 1000.0, _TARGET_FPS)
@@ -57,7 +58,8 @@ def by_sample(w: int = 82, h: int = 41, frames_per: int = 4) -> None:
     rows = []
     for path in find_media("video"):
         frames = sample_frames(path, w, h, limit=frames_per)
-        if not frames:
+        if not frames:                       # a video file that won't decode = bug
+            rows.append([path.name[:30], "!", "DECODE", "FAILED"])
             continue
         r = _measure_over(frames)
         rows.append([path.name[:30], fmt(r["mean_ms"]), fmt(r["min_ms"]),
@@ -65,16 +67,26 @@ def by_sample(w: int = 82, h: int = 41, frames_per: int = 4) -> None:
     print(table(["sample", "mean ms", "min ms", "fps max"], rows))
 
 
+def _first_decodable(samples):
+    """The sample used for the grid sweep: the first that actually decodes, so a
+    single bad file at the front doesn't blank the whole sweep (by_sample still
+    flags it)."""
+    for s in samples:
+        if sample_frames(s, 16, 8, limit=1):
+            return s
+    return samples[0]
+
+
 def main() -> None:
-    samples = find_media("video")
     if not have_ffmpeg():
         print("bench_samples: ffmpeg not found — skipping.")
         return
+    samples = find_media("video")
     if not samples:
-        print(f"bench_samples: no media samples in {harness.MEDIA_DIR} — "
+        print(f"bench_samples: no video samples in {harness.MEDIA_DIR} — "
               "drop some clips there to benchmark on real video.")
         return
-    by_grid(samples[0])
+    by_grid(_first_decodable(samples))
     by_sample()
 
 

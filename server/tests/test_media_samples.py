@@ -12,45 +12,38 @@ from __future__ import annotations
 
 import asyncio
 import shutil
-import subprocess
 from pathlib import Path
 
 import pytest
 
 import transcoder
 
+from cc_media import find_media, media_streams
+
 _HAS_FFMPEG = shutil.which("ffmpeg") is not None
 _HAS_FFPROBE = shutil.which("ffprobe") is not None
 
-_MEDIA_DIR = Path(__file__).resolve().parents[2] / "media"
-_VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".gif", ".m4v", ".flv", ".ts"}
 _BLIT_RANGE = range(0x80, 0xA0)
 _HEX = set(b"0123456789abcdef")
 
-
-def _video_samples() -> list[Path]:
-    if not _MEDIA_DIR.is_dir():
-        return []
-    return [p for p in sorted(_MEDIA_DIR.iterdir())
-            if p.is_file() and p.suffix.lower() in _VIDEO_EXTS]
-
-
-def _has_audio(path: Path) -> bool:
-    if not _HAS_FFPROBE:
-        return False
-    out = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "a",
-         "-show_entries", "stream=index", "-of", "csv=p=0", str(path)],
-        capture_output=True, text=True)
-    return bool(out.stdout.strip())
+# Every developer-provided clip is expected to work; if one doesn't, the test for
+# it FAILS (not skips) — that's a genuine bug, since the file was put here on
+# purpose.  Each file is routed to the pipeline matching its actual streams (probed,
+# not guessed from the extension), so a video clip is checked by the video tests, an
+# audio clip by the audio test.  Only an empty media/ folder (or missing ffmpeg)
+# skips wholesale.
+_SAMPLES = find_media()
+_VIDEO_SAMPLES = find_media("video")
+_AUDIO_SAMPLES = find_media("audio") if _HAS_FFMPEG else []
 
 
-_SAMPLES = _video_samples()
-_AUDIO_SAMPLES = [p for p in _SAMPLES if _has_audio(p)] if _HAS_FFMPEG else []
+def _ids(samples):
+    return [p.name for p in samples] or ["none"]
 
-_skip_no_samples = pytest.mark.skipif(
-    not (_HAS_FFMPEG and _SAMPLES),
-    reason="no media/ samples or ffmpeg not installed")
+
+_skip_no_video = pytest.mark.skipif(
+    not (_HAS_FFMPEG and _VIDEO_SAMPLES),
+    reason="no media/ video samples or ffmpeg not installed")
 
 
 async def _collect_video(path: Path, w: int, h: int, limit: int) -> list:
@@ -67,9 +60,8 @@ async def _collect_video(path: Path, w: int, h: int, limit: int) -> list:
     return out
 
 
-@_skip_no_samples
-@pytest.mark.parametrize("sample", _SAMPLES or [None],
-                         ids=[p.name for p in _SAMPLES] or ["none"])
+@_skip_no_video
+@pytest.mark.parametrize("sample", _VIDEO_SAMPLES or [None], ids=_ids(_VIDEO_SAMPLES))
 def test_sample_video_encodes_valid_frames(sample):
     # The full front-end must turn a real clip into well-formed blit frames.
     w, h = 20, 8
@@ -93,9 +85,8 @@ def test_sample_video_encodes_valid_frames(sample):
             assert all(b in _HEX for b in fg) and all(b in _HEX for b in bg)
 
 
-@_skip_no_samples
-@pytest.mark.parametrize("sample", _SAMPLES or [None],
-                         ids=[p.name for p in _SAMPLES] or ["none"])
+@_skip_no_video
+@pytest.mark.parametrize("sample", _VIDEO_SAMPLES or [None], ids=_ids(_VIDEO_SAMPLES))
 def test_sample_video_grid_sizes(sample):
     # A couple of representative grids both produce correctly-sized frames.
     for w, h in [(10, 6), (40, 20)]:
@@ -107,10 +98,10 @@ def test_sample_video_grid_sizes(sample):
 @pytest.mark.skipif(
     not (_HAS_FFMPEG and _AUDIO_SAMPLES),
     reason="no media/ samples with audio (or ffmpeg/ffprobe missing)")
-def test_sample_audio_produces_pcm():
-    # Use the first sample known to have audio so we never block on a silent clip.
-    sample = _AUDIO_SAMPLES[0]
-
+@pytest.mark.parametrize("sample", _AUDIO_SAMPLES or [None], ids=_ids(_AUDIO_SAMPLES))
+def test_sample_audio_produces_pcm(sample):
+    # Every clip that carries audio (a music file, or a video's soundtrack) must
+    # resample to PCM through the real audio pipeline.
     async def go():
         agen = transcoder.iter_audio("ignored", sample_rate=48000,
                                      source_path=str(sample))
@@ -121,3 +112,15 @@ def test_sample_audio_produces_pcm():
 
     chunk = asyncio.run(go())
     assert isinstance(chunk, (bytes, bytearray)) and len(chunk) > 0
+
+
+@pytest.mark.skipif(
+    not (_HAS_FFPROBE and _SAMPLES),
+    reason="no media/ samples or ffprobe not installed")
+@pytest.mark.parametrize("sample", _SAMPLES or [None], ids=_ids(_SAMPLES))
+def test_sample_is_usable_media(sample):
+    # A file dropped in media/ that has neither a video nor an audio stream is junk
+    # (corrupt, or not a media file) — surface it instead of silently ignoring it.
+    streams = media_streams(sample)
+    assert "video" in streams or "audio" in streams, \
+        f"{sample.name}: no decodable audio/video stream"

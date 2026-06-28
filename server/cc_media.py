@@ -13,6 +13,7 @@ once the server dir is on sys.path.
 
 from __future__ import annotations
 
+import functools
 import shutil
 import subprocess
 from pathlib import Path
@@ -22,9 +23,6 @@ import numpy as np
 _ROOT_DIR = Path(__file__).resolve().parent.parent       # repo root (server/..)
 MEDIA_DIR = _ROOT_DIR / "media"
 PREVIEW_DIR = MEDIA_DIR / "cc_preview"                    # renderer output (git-ignored)
-
-VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".gif", ".m4v", ".flv", ".ts"}
-AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".aac", ".ogg", ".opus", ".flac"}
 
 # Realistic CC display sizes (character grid W x H) for the benchmarks/renderer.
 # Built-in screens are a fixed size; monitors come from the CC:Tweaked formula at
@@ -53,15 +51,56 @@ def have_ffmpeg() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
-def find_media(kind: str = "video") -> list[Path]:
-    """Sample files present in media/ right now (sorted).  kind: video|audio|any.
-    The render-output subfolder is skipped."""
+@functools.lru_cache(maxsize=None)
+def media_streams(path: Path) -> frozenset[str]:
+    """The stream types present in a media file (e.g. {"video", "audio"}), probed
+    with ffprobe.  A `video` stream flagged `attached_pic` (cover art / thumbnail,
+    as music files carry) does NOT count as video — it's a still image, not a clip.
+    Empty if the file has no usable streams.  If ffprobe isn't installed we can't
+    tell, so we assume both — nothing gets filtered out."""
+    if shutil.which("ffprobe") is None:
+        return frozenset({"video", "audio"})
+    out = subprocess.run(
+        ["ffprobe", "-v", "error",
+         "-show_entries", "stream=codec_type:stream_disposition=attached_pic",
+         "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True)
+    streams = set()
+    for line in out.stdout.splitlines():
+        parts = line.split(",")
+        if len(parts) < 2:
+            continue
+        codec_type, attached_pic = parts[0].strip(), parts[1].strip()
+        if codec_type == "video" and attached_pic == "1":
+            continue                       # cover art, not a real video stream
+        if codec_type in ("video", "audio"):
+            streams.add(codec_type)
+    return frozenset(streams)
+
+
+def find_media(stream: str | None = None) -> list[Path]:
+    """Developer-provided samples in media/ (sorted).
+
+    With no argument: *every* file except internal bookkeeping — dotfiles like
+    .gitignore and README.md — and the render-output subfolder (a directory, so it
+    drops out naturally).  Deliberately no extension allowlist: whatever a
+    developer drops here is a clip they expect to work, so a file a pipeline can't
+    handle is a real bug to surface, not something to silently skip.
+
+    With stream="video" (or "audio"): only files that actually contain such a
+    stream, decided by probing the file — not by guessing from its extension.  This
+    routes each sample to the pipeline that fits it (e.g. an audio-only clip is
+    exercised by the audio path and isn't spuriously failed by the video path).
+    """
     if not MEDIA_DIR.is_dir():
         return []
-    exts = {"video": VIDEO_EXTS, "audio": AUDIO_EXTS,
-            "any": VIDEO_EXTS | AUDIO_EXTS}[kind]
-    return [p for p in sorted(MEDIA_DIR.iterdir())
-            if p.is_file() and p.suffix.lower() in exts]
+    files = [p for p in sorted(MEDIA_DIR.iterdir())
+             if p.is_file()
+             and not p.name.startswith(".")          # .gitignore and other dotfiles
+             and p.name.lower() != "readme.md"]
+    if stream is None:
+        return files
+    return [p for p in files if stream in media_streams(p)]
 
 
 def sample_frames(path, w: int, h: int, fps: int = 24, limit: int = 8) -> list:

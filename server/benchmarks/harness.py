@@ -27,7 +27,7 @@ if str(_SERVER_DIR) not in sys.path:
 # Shared media/decode helpers (also used by tools/render_cc.py).  Re-exported so
 # the bench modules can keep importing them from `harness`.
 from cc_media import (  # noqa: E402  (needs the sys.path insert above)
-    AUDIO_EXTS, GRIDS, MEDIA_DIR, PREVIEW_DIR, VIDEO_EXTS,
+    GRIDS, MEDIA_DIR, PREVIEW_DIR,
     decode_frame, find_media, have_ffmpeg, sample_frames,
 )
 

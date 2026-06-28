@@ -80,7 +80,8 @@ def real_samples(w: int = 82, h: int = 41, frames_per: int = 4) -> None:
     rows = []
     for path in samples:
         frames = sample_frames(path, w, h, limit=frames_per)
-        if not frames:
+        if not frames:                       # every media file is expected to decode
+            rows.append([path.name[:28], "!", "DECODE", "FAILED"])
             continue
         vals = np.array([[_psnr(f, decode_frame(encode_frame(f))),
                           _psnr(_box2(f), _box2(decode_frame(encode_frame(f)))),

@@ -194,20 +194,27 @@ def main(argv=None) -> int:
                 return 1
             samples.append(p)
     else:
-        samples = find_media("video")
+        samples = find_media("video")    # video previews: only files with a video stream
 
     if not samples:
-        print(f"render_cc: no samples in {MEDIA_DIR} (pass a path, or drop clips there).")
+        print(f"render_cc: no video samples in {MEDIA_DIR} (pass a path, or drop clips there).")
         return 1
 
     grids = _parse_grids(args.grids)
     outdir = Path(args.outdir)
     print(f"Rendering {len(samples)} sample(s) x {len(grids)} grid(s) "
           f"-> {outdir}")
+    failures = 0
     for sample in samples:
         print(sample.name)
         for w, h in grids:
-            render(sample, w, h, args.fps, args.seconds, args.crunchy, outdir)
+            if render(sample, w, h, args.fps, args.seconds, args.crunchy, outdir) is None:
+                failures += 1
+    # Every file in media/ is expected to render; a failure means an input the
+    # developer thought was supported isn't — exit non-zero so it's noticed.
+    if failures:
+        print(f"\n{failures} render(s) FAILED.")
+        return 1
     return 0
 
 
