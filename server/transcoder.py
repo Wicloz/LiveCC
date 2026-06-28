@@ -30,7 +30,7 @@ from typing import AsyncGenerator, Deque, Iterator, Optional
 
 import numpy as np
 
-from cc_palette import encode_frame
+from cc_encoder import encode_frame
 
 # --------------------------------------------------------------------------- #
 # Logging
@@ -215,9 +215,13 @@ def _video_ffmpeg_cmd(px_w: int, px_h: int, fps: int,
     # even width / multiple-of-3 height and pad at even-x / multiple-of-3-y
     # offsets.  Otherwise the content edge lands mid-cell, so boundary cells mix
     # content with black bar and the content's corners quantize to black.
+    # Area filter for the content scale: when the source is larger than the cell
+    # grid it box-integrates the pixels each sub-pixel covers (the "partial
+    # overlap" the encoder wants) instead of point-sampling; on upscale it behaves
+    # like bilinear.  The encoder makes its colour decisions in linear OKLab.
     scale = (
-        f"scale={px_w}:{px_h}:force_original_aspect_ratio=decrease,"
-        f"scale=trunc(iw/2)*2:trunc(ih/3)*3,"
+        f"scale={px_w}:{px_h}:force_original_aspect_ratio=decrease:flags=area,"
+        f"scale=trunc(iw/2)*2:trunc(ih/3)*3:flags=area,"
         f"pad={px_w}:{px_h}:trunc((ow-iw)/4)*2:trunc((oh-ih)/6)*3:black,"
         f"fps={fps}"
     )
