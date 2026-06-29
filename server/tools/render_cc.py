@@ -138,7 +138,7 @@ def render(sample: Path, w: int, h: int, fps: int, seconds: float,
             for arr in splitter.push(chunk):
                 if written >= max_frames:
                     break
-                img = decode_frame(encode_frame(arr))      # what the monitor paints
+                img = decode_frame(encode_frame(arr), w, h)   # what the monitor paints
                 up = np.repeat(np.repeat(img, k, axis=0), k, axis=1)
                 enc.stdin.write(up.tobytes())
                 written += 1

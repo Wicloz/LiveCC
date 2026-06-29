@@ -13,9 +13,13 @@ WebSocket endpoint (used by the CC player):
       crunchy   : "1" for low-bandwidth mode — 1-bit DFPWM audio (the client also
                   lowers video resolution by sending a smaller width/height).
             sync      : "1" to share one provider across clients with the same URL.
-      video frame -> binary  b"\\x01" + frame
-      audio chunk -> binary  b"\\x02" + audio  (raw 8-bit PCM, or DFPWM if crunchy)
-      status      -> text    "META ..." / "BUFFERING" / "PLAYING" / "ERROR ..."
+  The binary side of the socket is a sanjuuni 32vid stream: a 12-byte "32VD" file
+  header (W, H, fps, nstreams, flags) followed by self-delimiting chunks, each
+  <size, datalength, type> + data, interleaving video and audio:
+      video chunk -> binary  32vid chunk, type 0 — one uncompressed frame (packed
+                     5-bit screen + per-cell colour byte + 48-byte palette)
+      audio chunk -> binary  32vid chunk, type 1 — raw 8-bit PCM, or DFPWM if crunchy
+      status      -> text    "BUFFERING" / "PLAYING" / "ERROR ..."  (out-of-band)
 
 Both Lua scripts are served with this server's own URL baked in, so the player
 is installed and run as `livecc <url>` (no address argument).

@@ -6,9 +6,10 @@ a media-time PTS derived from its output position (frame i -> i/fps; audio byte
 k -> k/rate) on one shared timeline.  A single scheduler advances a media clock
 and releases items whose PTS is due, sending them over one WebSocket:
 
-    video frame -> binary message  b"\\x01" + frame
-    audio chunk -> binary message  b"\\x02" + pcm
-    status      -> text message    "META ..." / "BUFFERING" / "PLAYING" / "ERROR ..."
+    32vid header -> binary message  "32VD" + W,H,fps,nstreams,flags  (once, up front)
+    video chunk  -> binary message  32vid chunk type 0 (one uncompressed frame)
+    audio chunk  -> binary message  32vid chunk type 1 (PCM, or DFPWM if crunchy)
+    status       -> text  message   "BUFFERING" / "PLAYING" / "ERROR ..."
 
 Because both streams are released against the same clock, they stay in sync.
 
@@ -28,6 +29,14 @@ import shutil
 import tempfile
 from typing import Optional
 
+from cc_encoder import (
+    V32_FLAG_BASE,
+    V32_FLAG_DFPWM_AUDIO,
+    V32_TYPE_AUDIO,
+    V32_TYPE_VIDEO,
+    v32_chunk,
+    v32_stream_header,
+)
 from transcoder import (
     AUDIO_CHUNK_SECONDS,
     DFPWM,
@@ -43,9 +52,6 @@ from transcoder import (
 )
 
 log = logging.getLogger("livecc")
-
-OP_VIDEO = b"\x01"
-OP_AUDIO = b"\x02"
 
 # Buffering parameters (seconds of media).
 VOD_PREBUFFER = 2.0
@@ -248,15 +254,23 @@ class StreamSession:
         while not done.is_set() and buf.seconds() < self.prebuffer:
             await asyncio.sleep(0.05)
 
+    def _v32_header(self) -> bytes:
+        nstreams = (1 if self.want_video else 0) + (1 if self.want_audio else 0)
+        flags = V32_FLAG_BASE | (V32_FLAG_DFPWM_AUDIO if self.codec is DFPWM else 0)
+        return v32_stream_header(self.w, self.h, self.fps, nstreams, flags)
+
     async def _release(self, ws, media_now: float) -> bool:
         sent = False
-        # Audio leads so the speaker stays buffered; video is sent exactly on time.
+        # Each item goes out as a 32vid chunk (self-delimiting, typed) so video and
+        # audio interleave on one stream.  Audio leads so the speaker stays
+        # buffered; video is sent exactly on time.
         for _pts, data in self.audio_buf.pop_due(media_now + AUDIO_LEAD):
-            await ws.send_bytes(OP_AUDIO + data)
+            samples = len(data) * self.codec.samples_per_byte
+            await ws.send_bytes(v32_chunk(V32_TYPE_AUDIO, samples, data))
             self.audio_sent += 1
             sent = True
         for _pts, data in self.video_buf.pop_due(media_now):
-            await ws.send_bytes(OP_VIDEO + data)
+            await ws.send_bytes(v32_chunk(V32_TYPE_VIDEO, 1, data))   # one frame/chunk
             self.video_sent += 1
             sent = True
         return sent
@@ -286,7 +300,6 @@ class StreamSession:
             elif needs_seekable_source(ext):
                 self._need_download = await probe_moov_at_end(self.url)
 
-        await ws.send_text(f"META {self.w} {self.h} {self.fps}")
         log.info("session: %s is_live=%s ext=%s audio=%s start=%ss end=%s loop=%s download=%s",
                  self.url, self.is_live, ext, self.want_audio,
                  self._start_eff, self._end_eff, self.loop and not self.is_live,
@@ -294,6 +307,10 @@ class StreamSession:
 
         tasks: list[asyncio.Task] = []
         try:
+            # The 32vid file header opens the stream (W/H/fps/flags); the client
+            # decodes the chunks that follow against it.  Re-sent only if fps
+            # changes (it doesn't mid-session here).
+            await ws.send_bytes(self._v32_header())
             await ws.send_text("BUFFERING")
 
             # Download the [start,end] section to a temp file when we need to replay

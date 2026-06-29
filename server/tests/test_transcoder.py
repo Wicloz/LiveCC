@@ -17,6 +17,11 @@ def _px_dims(term_w, term_h):
     return term_w * 2, term_h * 3   # 2x3 sub-pixels per cell
 
 
+def _v32_size(w, h):
+    # 32vid uncompressed frame: screen ceil(W*H/8)*5 + colour W*H + palette 48.
+    return ((w * h + 7) // 8) * 5 + w * h + 48
+
+
 def test_splitter_emits_one_complete_frame():
     px_w, px_h = _px_dims(4, 2)
     s = _FrameSplitter(px_w, px_h)
@@ -25,8 +30,8 @@ def test_splitter_emits_one_complete_frame():
     assert s.count == 1
     # push() now yields the raw (H, W, 3) array; encoding is done separately.
     assert frames[0].shape == (px_h, px_w, 3)
-    # encode_frame still produces the right header: W=4, H=2.
-    assert transcoder.encode_frame(frames[0])[0:4] == bytes((0, 4, 0, 2))
+    # encode_frame emits a 32vid uncompressed frame for the 4x2 cell grid.
+    assert len(transcoder.encode_frame(frames[0])) == _v32_size(4, 2)
 
 
 def test_splitter_buffers_partial_frames():
@@ -286,9 +291,8 @@ def test_ffmpeg_rawvideo_feeds_splitter():
     raw_frames = list(s.push(proc.stdout))
     assert len(raw_frames) == fps
     enc = transcoder.encode_frame(raw_frames[0])
-    assert enc[0:4] == bytes((0, term_w, 0, term_h))
-    # each encoded frame is header + term_h rows * 3 strings * term_w bytes
-    assert len(enc) == 4 + term_h * 3 * term_w
+    # a 32vid uncompressed frame: screen + colour + 48-byte palette for the grid.
+    assert len(enc) == _v32_size(term_w, term_h)
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
@@ -402,7 +406,7 @@ def test_decode_video_from_generated_file(tmp_path, fname, vcodec, extra):
                     f"{res.stderr.decode('utf-8', 'replace')[:200]}")
     frames = _collect_video_from_file(path, limit=3)
     assert len(frames) > 0
-    assert frames[0][0:4] == bytes((0, 8, 0, 4))   # requested 8x4 cell grid
+    assert len(frames[0]) == _v32_size(8, 4)       # 32vid frame for the 8x4 grid
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")

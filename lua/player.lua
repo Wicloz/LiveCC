@@ -4,8 +4,9 @@
 -- Run `livecc --help` for usage.
 --
 -- One WebSocket carries everything.  Binary messages are tagged by a leading
--- opcode byte: 0x01 = video frame, 0x02 = audio (raw 8-bit PCM).  Text messages are
--- status: "META w h fps", "BUFFERING", "PLAYING", "ERROR ...".
+-- opcode byte: 0x01 = video frame (a sanjuuni 32vid uncompressed frame), 0x02 =
+-- audio (raw 8-bit PCM).  Text messages are status: "META w h fps", "BUFFERING",
+-- "PLAYING", "ERROR ...".
 
 local DEFAULT_FPS = 24
 
@@ -225,21 +226,112 @@ local function play_on_all(samples)
     end
 end
 
--- ── Video rendering (binary frame) ──────────────────────────────────────────────
--- bytes 1-2 = W (uint16 BE), 3-4 = H, then H rows of (W text, W fg, W bg).
+-- ── 32vid stream (sanjuuni format) ───────────────────────────────────────────────
+-- The binary side of the socket is a 32vid stream: a 12-byte "32VD" header
+-- (W, H, fps, nstreams, flags) then self-delimiting chunks (<size, datalength,
+-- type> + data) interleaving video (type 0) and audio (type 1).
+-- An uncompressed video frame (compression mode 0), W x H cells, is:
+--   screen : ceil(W*H/8)*5 bytes — 8 cells packed into 5 bytes, MSB-first; each
+--            cell is the 5-bit drawing-char index (the blit char is 0x80 + index)
+--   colour : W*H bytes — one per cell, (bg << 4) | fg  (palette indices 0-15)
+--   palette: 48 bytes — 16 * (R,G,B), applied via setPaletteColour (only on change)
+-- Lua 5.1 has no bitwise operators, so the 5-bit codes are unpacked with arithmetic.
 
-local function render_frame(data)
-    local W = data:byte(1) * 256 + data:byte(2)
-    local H = data:byte(3) * 256 + data:byte(4)
-    local row_len = W * 3
-    local pos = 5
+local VID_W, VID_H = TERM_W, TERM_H      -- grid; overwritten by the 32vid header
+local HEXB = {}                          -- palette index 0-15 -> blit hex char byte
+for i = 0, 15 do HEXB[i] = ("0123456789abcdef"):byte(i + 1) end
+local last_palette = nil                 -- last applied palette block (skip no-ops)
+
+local function render_frame(data, W, H)
+    local n = W * H
+    local floor = math.floor
+    local unpack = table.unpack or unpack
+
+    -- 1. screen: unpack 8 five-bit codes from every 5 bytes into char bytes.
+    local text = {}
+    local p, ci = 1, 0
+    while ci < n do
+        local b1, b2, b3, b4, b5 = data:byte(p, p + 4)
+        p = p + 5
+        text[ci + 1] = 128 + floor(b1 / 8)
+        text[ci + 2] = 128 + (b1 % 8) * 4 + floor(b2 / 64)
+        text[ci + 3] = 128 + floor(b2 / 2) % 32
+        text[ci + 4] = 128 + (b2 % 2) * 16 + floor(b3 / 16)
+        text[ci + 5] = 128 + (b3 % 16) * 2 + floor(b4 / 128)
+        text[ci + 6] = 128 + floor(b4 / 4) % 32
+        text[ci + 7] = 128 + (b4 % 4) * 8 + floor(b5 / 32)
+        text[ci + 8] = 128 + b5 % 32
+        ci = ci + 8
+    end
+
+    -- 2. colour: one byte per cell, bg in the high nibble, fg in the low nibble.
+    local fg, bg = {}, {}
+    for i = 1, n do
+        local cb = data:byte(p); p = p + 1
+        fg[i] = HEXB[cb % 16]
+        bg[i] = HEXB[floor(cb / 16)]
+    end
+
+    -- 3. palette: apply only when it differs from the last frame's (cheap no-op for
+    --    a fixed palette; ready for a future adaptive per-frame palette).
+    local palette = data:sub(p, p + 47)
+    if palette ~= last_palette then
+        if mon.setPaletteColour then
+            for i = 0, 15 do
+                local o = p + i * 3
+                mon.setPaletteColour(2 ^ i, data:byte(o) / 255,
+                    data:byte(o + 1) / 255, data:byte(o + 2) / 255)
+            end
+        end
+        last_palette = palette
+    end
+
+    -- 4. blit row by row.
     for y = 1, H do
-        local text = data:sub(pos,         pos + W - 1)
-        local fg   = data:sub(pos + W,     pos + 2 * W - 1)
-        local bg   = data:sub(pos + 2 * W, pos + 3 * W - 1)
+        local base = (y - 1) * W
         mon.setCursorPos(1, y)
-        mon.blit(text, fg, bg)
-        pos = pos + row_len
+        mon.blit(string.char(unpack(text, base + 1, base + W)),
+                 string.char(unpack(fg, base + 1, base + W)),
+                 string.char(unpack(bg, base + 1, base + W)))
+    end
+end
+
+-- Bytes one uncompressed frame occupies in a video chunk.
+local function frame_bytes(W, H)
+    return math.ceil(W * H / 8) * 5 + W * H + 48
+end
+
+-- Parse the 12-byte "32VD" file header; updates the grid the decoder renders to.
+local function read_header(msg)
+    VID_W = msg:byte(5) + msg:byte(6) * 256
+    VID_H = msg:byte(7) + msg:byte(8) * 256
+    -- byte 9 = fps, 10 = nstreams, 11-12 = flags; the client paces off arrival, so
+    -- it only needs the grid (audio codec is already known from --crunchy).
+    console("LiveCC: connected")
+end
+
+-- Dispatch one binary 32vid message: the file header, or a typed chunk.
+local function handle_binary(msg)
+    if msg:sub(1, 4) == "32VD" then
+        read_header(msg)
+        return
+    end
+    -- chunk: <size u32><datalength u32><type u8> + data  (all little-endian)
+    local datalen = msg:byte(5) + msg:byte(6) * 256 + msg:byte(7) * 65536 + msg:byte(8) * 16777216
+    local ctype = msg:byte(9)
+    if ctype == 0 then                       -- video: datalen frames back to back
+        local fsz = frame_bytes(VID_W, VID_H)
+        local pos = 10
+        for _ = 1, datalen do
+            render_frame(msg:sub(pos, pos + fsz - 1), VID_W, VID_H)
+            pos = pos + fsz
+        end
+    elseif ctype == 1 and WANT_AUDIO then    -- audio: PCM, or DFPWM if --crunchy
+        audio_queue[#audio_queue + 1] = decode_audio(msg:sub(10))
+        while #audio_queue > MAX_AUDIO_CHUNKS do
+            table.remove(audio_queue, 1)     -- drop oldest, stay in sync
+        end
+        os.queueEvent("livecc_audio")        -- wake the audio player
     end
 end
 
@@ -256,10 +348,7 @@ end
 local errored = false   -- an ERROR was shown; don't overwrite it with "Stream ended"
 
 local function handle_text(msg)
-    if msg:sub(1, 4) == "META" then
-        console("LiveCC: connected")
-        mon_print("Buffering...")
-    elseif msg == "BUFFERING" then
+    if msg == "BUFFERING" then
         mon_print("Buffering...")
     elseif msg == "PLAYING" then
         if not WANT_VIDEO then
@@ -321,20 +410,9 @@ tasks[#tasks + 1] = function()
         local ok, msg, is_binary = pcall(ws.receive)
         if not ok or msg == nil then break end
         if is_binary then
-            local op = msg:byte(1)
-            if op == 1 then
-                render_frame(msg:sub(2))
-            elseif op == 2 and WANT_AUDIO then
-                -- Decode/unpack audio (codec per --crunchy) and enqueue, in
-                -- arrival order to keep the DFPWM decoder's state in sync.
-                audio_queue[#audio_queue + 1] = decode_audio(msg:sub(2))
-                while #audio_queue > MAX_AUDIO_CHUNKS do
-                    table.remove(audio_queue, 1)   -- drop oldest, stay in sync
-                end
-                os.queueEvent("livecc_audio")      -- wake the audio player
-            end
+            handle_binary(msg)      -- 32vid header or a video/audio chunk
         else
-            handle_text(msg)
+            handle_text(msg)        -- BUFFERING / PLAYING / ERROR
         end
     end
     if not errored then mon_print("Stream ended.") end   -- keep any error on screen

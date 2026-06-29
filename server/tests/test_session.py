@@ -73,6 +73,20 @@ class FakeWS:
         self.bins.append(b)
 
 
+# Binary messages are a 32vid stream: the "32VD" header, then chunks whose type
+# byte is at offset 8 ([size 4][datalength 4][type 1]).
+def _is_header(b):
+    return b[:4] == b"32VD"
+
+
+def _vids(bins):
+    return [b for b in bins if not _is_header(b) and b[8] == session.V32_TYPE_VIDEO]
+
+
+def _auds(bins):
+    return [b for b in bins if not _is_header(b) and b[8] == session.V32_TYPE_AUDIO]
+
+
 def _patch(monkeypatch, n_video, n_audio, is_live, ext="webm", moov_at_end=True):
     async def fake_video(url, w, h, fps, start=0, end=None, source_path=None, loop=False):
         for i in range(n_video):   # iter_video yields (pts, frame); pts = i/fps
@@ -101,11 +115,11 @@ def test_vod_delivers_every_frame_in_order(monkeypatch):
     s = StreamSession("u", w=4, h=2, fps=50, want_audio=True)
     run(s.run(ws))
 
-    vids = [b for b in ws.bins if b[:1] == session.OP_VIDEO]
-    auds = [b for b in ws.bins if b[:1] == session.OP_AUDIO]
+    vids = _vids(ws.bins)
+    auds = _auds(ws.bins)
     assert len(vids) == 8          # VOD never drops
     assert len(auds) == 4
-    assert ws.texts[0].startswith("META")
+    assert _is_header(ws.bins[0])   # 32vid header opens the stream
     assert "PLAYING" in ws.texts
 
 
@@ -145,7 +159,7 @@ def test_failing_audio_producer_degrades_to_silent_video(monkeypatch):
     ws = FakeWS()
     s = StreamSession("u", w=4, h=2, fps=50, want_audio=True)
     run(asyncio.wait_for(s.run(ws), 5))
-    assert len([b for b in ws.bins if b[:1] == session.OP_VIDEO]) == 4
+    assert len(_vids(ws.bins)) == 4
 
 
 def test_unexpected_error_reports_generic_error(monkeypatch):
@@ -168,7 +182,7 @@ def test_audio_disabled_sends_no_audio(monkeypatch):
     ws = FakeWS()
     s = StreamSession("u", w=4, h=2, fps=50, want_audio=False)
     run(s.run(ws))
-    assert all(b[:1] != session.OP_AUDIO for b in ws.bins)
+    assert not _auds(ws.bins)
 
 
 def test_no_video_streams_audio_only(monkeypatch):
@@ -179,8 +193,8 @@ def test_no_video_streams_audio_only(monkeypatch):
     ws = FakeWS()
     s = StreamSession("u", w=4, h=2, fps=50, want_audio=True, want_video=False)
     run(asyncio.wait_for(s.run(ws), 5))
-    assert len([b for b in ws.bins if b[:1] == session.OP_AUDIO]) == 4
-    assert all(b[:1] != session.OP_VIDEO for b in ws.bins)
+    assert len(_auds(ws.bins)) == 4
+    assert not _vids(ws.bins)
     assert "PLAYING" in ws.texts
 
 
@@ -210,7 +224,7 @@ def test_loop_downloads_section_once_then_streams(monkeypatch):
     assert calls["n"] == 1                  # cached exactly once
     assert calls["args"] == (30, 60)        # parsed start=30s, end=60s
     assert s._source_path == "/tmp/fake_source.mkv"
-    assert len([b for b in ws.bins if b[:1] == session.OP_VIDEO]) == 6
+    assert len(_vids(ws.bins)) == 6
 
 
 def test_moov_at_end_mp4_vod_downloads_for_seekable_decode(monkeypatch):
@@ -230,7 +244,7 @@ def test_moov_at_end_mp4_vod_downloads_for_seekable_decode(monkeypatch):
 
     assert calls["n"] == 1                          # downloaded despite no --loop
     assert s._source_path == "/tmp/fake_source.mkv"
-    assert len([b for b in ws.bins if b[:1] == session.OP_VIDEO]) == 4
+    assert len(_vids(ws.bins)) == 4
 
 
 def test_gif_downloads_and_plays_once_without_loop(monkeypatch):
@@ -257,7 +271,7 @@ def test_gif_downloads_and_plays_once_without_loop(monkeypatch):
     assert calls["download"] == 1                    # downloaded (can't pipe-stream)
     assert calls["moov"] == 0                        # GIF isn't an MP4 -> no probe
     assert s._source_path == "/tmp/fake_source.gif"
-    assert len([b for b in ws.bins if b[:1] == session.OP_VIDEO]) == 4
+    assert len(_vids(ws.bins)) == 4
 
 
 def test_faststart_mp4_vod_streams_without_download(monkeypatch):

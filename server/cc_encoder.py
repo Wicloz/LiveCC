@@ -47,6 +47,8 @@ Sub-pixel bit layout within a cell (matches the client's glyph decoding):
 
 from __future__ import annotations
 
+import struct
+
 import numpy as np
 
 # RGB of CC Tweaked's default palette, indexed 0..15 -> blit chars '0'..'f'.
@@ -217,24 +219,88 @@ def _prepare(frame_rgb: np.ndarray):
     return idx, h, w
 
 
+# 16 palette colours as 48 bytes (R,G,B each), the per-frame palette block of a
+# 32vid frame.  Fixed (CC default) for now; an adaptive palette would vary it.
+_PALETTE_BYTES = _CC_RGB.astype(np.uint8).tobytes()
+
+
 def _assemble(glyph, fg, bg, h: int, w: int) -> bytes:
-    """(glyph, fg, bg) per-cell arrays -> the binary blit wire format:
+    """(glyph, fg, bg) per-cell arrays -> one 32vid *uncompressed* video frame
+    (MCJack123/sanjuuni's format, compression mode 0).  No per-frame header — the
+    decoder knows W/H from the 32vid stream header — so the frame is exactly:
 
-        bytes 0-1 : W (uint16 big-endian, character columns)
-        bytes 2-3 : H (uint16 big-endian, character rows)
-        then H rows, each: W text bytes (0x80-0x9F) + W fg + W bg (ASCII hex)
+        screen : ceil(W*H/8)*5 bytes — 8 cells packed into 5 bytes, MSB-first;
+                 each cell is the 5-bit drawing-char index (glyph - 0x80)
+        colour : W*H bytes — one per cell, (bg << 4) | fg
+        palette: 48 bytes — 16 * (R,G,B)
 
-    A row's three strings are exactly what mon.blit(text, fg, bg) expects.
+    Cells are row-major (i = y*W + x).
     """
-    rows = np.empty((h, 3, w), dtype=np.uint8)
-    rows[:, 0, :] = glyph
-    rows[:, 1, :] = _BLIT_LUT[fg]
-    rows[:, 2, :] = _BLIT_LUT[bg]
-    header = bytes((
-        (w >> 8) & 0xFF, w & 0xFF,
-        (h >> 8) & 0xFF, h & 0xFF,
-    ))
-    return header + rows.tobytes()
+    n = h * w
+    # --- screen: 8 five-bit codes -> 5 bytes, code0 in the high bits ---------- #
+    codes = (np.asarray(glyph, np.uint8).ravel() - np.uint8(0x80))   # (n,) 0..31
+    pad = (-n) % 8
+    if pad:
+        codes = np.concatenate([codes, np.zeros(pad, np.uint8)])
+    grp = codes.reshape(-1, 8).astype(np.uint64)
+    val = (grp[:, 0] << 35 | grp[:, 1] << 30 | grp[:, 2] << 25 | grp[:, 3] << 20
+           | grp[:, 4] << 15 | grp[:, 5] << 10 | grp[:, 6] << 5 | grp[:, 7])
+    screen = np.empty((val.shape[0], 5), np.uint8)
+    screen[:, 0] = (val >> 32) & 0xFF
+    screen[:, 1] = (val >> 24) & 0xFF
+    screen[:, 2] = (val >> 16) & 0xFF
+    screen[:, 3] = (val >> 8) & 0xFF
+    screen[:, 4] = val & 0xFF
+    # --- colour: bg in the high nibble, fg in the low nibble ----------------- #
+    colour = (np.asarray(bg, np.uint8).ravel() << 4) | np.asarray(fg, np.uint8).ravel()
+    return screen.tobytes() + colour.tobytes() + _PALETTE_BYTES
+
+
+def decode_32vid(frame: bytes, w: int, h: int):
+    """Reference decoder (inverse of _assemble) -> (glyph, fg, bg, palette).
+
+    glyph/fg/bg are (H, W) uint8 (glyph = 0x80 + 5-bit code); palette is (16, 3)
+    uint8 RGB.  Used by the Python tooling/tests and mirrored by the Lua client.
+    """
+    n = h * w
+    ng = (n + 7) // 8
+    scr = np.frombuffer(frame, np.uint8, count=ng * 5, offset=0).reshape(ng, 5).astype(np.uint64)
+    val = (scr[:, 0] << 32 | scr[:, 1] << 24 | scr[:, 2] << 16 | scr[:, 3] << 8 | scr[:, 4])
+    codes = np.empty((ng, 8), np.uint8)
+    for j in range(8):
+        codes[:, j] = (val >> np.uint64(5 * (7 - j))) & np.uint64(0x1F)
+    glyph = (codes.ravel()[:n].reshape(h, w) + np.uint8(0x80))
+    off = ng * 5
+    colour = np.frombuffer(frame, np.uint8, count=n, offset=off).reshape(h, w)
+    fg = colour & 0x0F
+    bg = colour >> 4
+    palette = np.frombuffer(frame, np.uint8, count=48, offset=off + n).reshape(16, 3)
+    return glyph, fg, bg, palette
+
+
+# --------------------------------------------------------------------------- #
+# 32vid container (chunked stream)
+# --------------------------------------------------------------------------- #
+# A 32vid stream is the 12-byte file header followed by a sequence of chunks, each
+# self-delimiting (its own size) and tagged by type, so video and audio chunks can
+# be interleaved live.  We send one video frame per chunk.
+_V32_MAGIC = b"32VD"
+V32_FLAG_BASE = 0x10       # bit 4 is always set
+V32_FLAG_DFPWM_AUDIO = 0x04  # audio compression bits 2-3: 0=PCM, 1 (bit 2)=DFPWM
+V32_TYPE_VIDEO = 0
+V32_TYPE_AUDIO = 1
+
+
+def v32_stream_header(w: int, h: int, fps: int, nstreams: int, flags: int) -> bytes:
+    """The 12-byte 32vid file header: "32VD" + <width,height,fps,nstreams,flags>.
+    Sent once at the start of the stream (and re-sent if fps changes)."""
+    return _V32_MAGIC + struct.pack("<HHBBH", w, h, fps, nstreams, flags)
+
+
+def v32_chunk(ctype: int, datalength: int, data: bytes) -> bytes:
+    """One 32vid chunk: <size, datalength, type> header + data.  `datalength` is the
+    number of video frames or audio samples carried in `data`."""
+    return struct.pack("<IIB", len(data), datalength, ctype) + bytes(data)
 
 
 def _encode_numpy(idx, h, w):

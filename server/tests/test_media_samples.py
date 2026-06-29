@@ -17,14 +17,16 @@ from pathlib import Path
 import pytest
 
 import transcoder
+from cc_encoder import decode_32vid
 
 from cc_media import find_media, media_streams
 
 _HAS_FFMPEG = shutil.which("ffmpeg") is not None
 _HAS_FFPROBE = shutil.which("ffprobe") is not None
 
-_BLIT_RANGE = range(0x80, 0xA0)
-_HEX = set(b"0123456789abcdef")
+
+def _v32_size(w, h):
+    return ((w * h + 7) // 8) * 5 + w * h + 48   # 32vid uncompressed frame bytes
 
 # Every developer-provided clip is expected to work; if one doesn't, the test for
 # it FAILS (not skips) — that's a genuine bug, since the file was put here on
@@ -73,16 +75,11 @@ def test_sample_video_encodes_valid_frames(sample):
     assert all(p >= 0 for p in pts)
 
     for _, frame in items:
-        assert frame[0:4] == bytes((0, w, 0, h))  # header matches requested grid
-        assert len(frame) == 4 + h * 3 * w        # header + H rows x 3 strings x W
-        body = frame[4:]
-        for row in range(h):
-            base = row * 3 * w
-            text = body[base:base + w]
-            fg = body[base + w:base + 2 * w]
-            bg = body[base + 2 * w:base + 3 * w]
-            assert all(b in _BLIT_RANGE for b in text)   # valid 2x3 glyphs
-            assert all(b in _HEX for b in fg) and all(b in _HEX for b in bg)
+        assert len(frame) == _v32_size(w, h)      # a 32vid uncompressed frame
+        glyph, fg, bg, pal = decode_32vid(frame, w, h)
+        assert ((glyph >= 0x80) & (glyph <= 0x9F)).all()   # valid 2x3 drawing chars
+        assert (fg <= 15).all() and (bg <= 15).all()       # valid palette indices
+        assert pal.shape == (16, 3)
 
 
 @_skip_no_video
@@ -92,7 +89,7 @@ def test_sample_video_grid_sizes(sample):
     for w, h in [(10, 6), (40, 20)]:
         items = asyncio.run(_collect_video(sample, w, h, limit=1))
         assert items, f"{sample.name} produced nothing at {w}x{h}"
-        assert items[0][1][0:4] == bytes((0, w, 0, h))
+        assert len(items[0][1]) == _v32_size(w, h)
 
 
 @pytest.mark.skipif(

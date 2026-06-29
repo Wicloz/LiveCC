@@ -129,30 +129,22 @@ def sample_frames(path, w: int, h: int, fps: int = 24, limit: int = 8) -> list:
     return frames[:limit]
 
 
-# Blit wire bytes -> palette indices -> RGB.  The inverse of encode_frame; used by
-# the fidelity benchmark and the preview renderer to see what a CC monitor shows.
-_HEXMAP = np.zeros(256, np.intp)
-for _i, _c in enumerate(b"0123456789abcdef"):
-    _HEXMAP[_c] = _i
+def decode_frame(buf: bytes, w: int, h: int) -> np.ndarray:
+    """Reverse encode_frame: a 32vid uncompressed frame -> (H*3, W*2, 3) uint8
+    image, exactly what the CC client paints (each cell = its two colours in the
+    glyph pattern, using the frame's own palette).  W/H aren't in the frame (the
+    decoder gets them from the 32vid stream header), so they're passed in."""
+    from cc_encoder import decode_32vid
 
-
-def decode_frame(buf: bytes) -> np.ndarray:
-    """Reverse encode_frame: blit wire bytes -> (H*3, W*2, 3) uint8 image, exactly
-    what the CC client paints (each cell = its two colours in the glyph pattern)."""
-    from cc_encoder import _CC_RGB
-
-    w = buf[0] << 8 | buf[1]
-    h = buf[2] << 8 | buf[3]
-    body = np.frombuffer(buf, np.uint8, offset=4).reshape(h, 3, w)
-    glyph, fg, bg = body[:, 0, :], body[:, 1, :], body[:, 2, :]
+    glyph, fg, bg, palette = decode_32vid(buf, w, h)
     mask = glyph.astype(np.intp) - 0x80
-    fg_idx, bg_idx = _HEXMAP[fg], _HEXMAP[bg]
+    fg_idx, bg_idx = fg.astype(np.intp), bg.astype(np.intp)
 
     idx = np.empty((h, w, 6), np.intp)
     for s in range(5):                                  # s0..s4 from the mask bits
         idx[..., s] = np.where((mask >> s) & 1, fg_idx, bg_idx)
     idx[..., 5] = bg_idx                                # bottom-right is always bg
-    rgb = _CC_RGB[idx].astype(np.uint8)                 # (H,W,6,3)
+    rgb = palette[idx].astype(np.uint8)                 # (H,W,6,3), frame palette
     return (rgb.reshape(h, w, 3, 2, 3)
             .transpose(0, 2, 1, 3, 4)
             .reshape(h * 3, w * 2, 3))

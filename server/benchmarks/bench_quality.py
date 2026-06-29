@@ -44,23 +44,21 @@ def _box2(img: np.ndarray) -> np.ndarray:
     return a.mean((1, 3))
 
 
-def _dither_fraction(buf: bytes) -> float:
-    w = buf[0] << 8 | buf[1]
-    h = buf[2] << 8 | buf[3]
-    glyph = np.frombuffer(buf, np.uint8, offset=4).reshape(h, 3, w)[:, 0, :]
-    mask = glyph.astype(np.intp) - 0x80
+def _dither_fraction(buf: bytes, w: int, h: int) -> float:
+    from cc_encoder import decode_32vid
+    glyph, _fg, _bg, _pal = decode_32vid(buf, w, h)
     # solid cell == empty glyph (mask 0).  Anything else mixes the two colours.
-    return float(np.mean(mask != 0))
+    return float(np.mean((glyph.astype(np.intp) - 0x80) != 0))
 
 
 def _row(name: str, frame: np.ndarray) -> list:
     buf = encode_frame(frame)
-    rec = decode_frame(buf)
+    rec = decode_frame(buf, frame.shape[1] // 2, frame.shape[0] // 3)
     return [
         name,
         fmt(_psnr(frame, rec), 1),
         fmt(_psnr(_box2(frame), _box2(rec)), 1),
-        fmt(_dither_fraction(buf) * 100, 0) + "%",
+        fmt(_dither_fraction(buf, frame.shape[1] // 2, frame.shape[0] // 3) * 100, 0) + "%",
     ]
 
 
@@ -83,9 +81,9 @@ def real_samples(w: int = 82, h: int = 41, frames_per: int = 4) -> None:
         if not frames:                       # every media file is expected to decode
             rows.append([path.name[:28], "!", "DECODE", "FAILED"])
             continue
-        vals = np.array([[_psnr(f, decode_frame(encode_frame(f))),
-                          _psnr(_box2(f), _box2(decode_frame(encode_frame(f)))),
-                          _dither_fraction(encode_frame(f)) * 100] for f in frames])
+        vals = np.array([[_psnr(f, decode_frame(encode_frame(f), w, h)),
+                          _psnr(_box2(f), _box2(decode_frame(encode_frame(f), w, h))),
+                          _dither_fraction(encode_frame(f), w, h) * 100] for f in frames])
         m = vals.mean(0)
         rows.append([path.name[:28], fmt(m[0], 1), fmt(m[1], 1), fmt(m[2], 0) + "%"])
     if rows:
