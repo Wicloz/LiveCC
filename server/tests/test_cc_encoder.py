@@ -72,6 +72,28 @@ def test_between_colors_region_is_dithered():
     assert "0" in used and "8" in used, f"expected dither between white/light_gray, got {used}"
 
 
+def test_numba_and_numpy_cores_agree():
+    # The compiled core is the active path; the numpy core is the reference.  They
+    # implement the same algorithm, so they must reach the same per-cell decision
+    # (the dither realisation can differ by float precision, but the chosen colour
+    # pair must match) — guards against the two drifting apart.
+    import cc_encoder as cc
+    if not cc._HAVE_NUMBA:
+        import pytest
+        pytest.skip("numba not installed")
+    rng = np.random.default_rng(3)
+    frame = rng.integers(0, 256, size=(41 * 3, 82 * 2, 3), dtype=np.uint8)
+    lab, h, w = cc._prepare(frame)
+    _g_np, fg_np, bg_np = cc._encode_numpy(lab, h, w)
+    _g_nb, fg_nb, bg_nb = cc._encode_numba(lab, h, w)
+    # Same unordered colour pair per cell (fg/bg may swap with the invert flag).
+    agree = np.mean([
+        frozenset((int(fg_np[y, x]), int(bg_np[y, x]))) ==
+        frozenset((int(fg_nb[y, x]), int(bg_nb[y, x])))
+        for y in range(h) for x in range(w)])
+    assert agree > 0.99, f"cores disagree on {(1 - agree) * 100:.1f}% of cells"
+
+
 def test_each_palette_color_round_trips_solid():
     # A solid cell of any palette colour must come back as that colour (in the bg
     # slot, with the empty glyph).

@@ -23,10 +23,16 @@ import harness
 from harness import CONTENT, GRIDS, fmt, measure, section, table
 
 import cc_encoder
-from cc_encoder import encode_frame
+from cc_encoder import _assemble, _encode_numpy, _prepare, encode_frame
 from transcoder import _encode_stride
 
 _TARGET_FPS = 24
+
+
+def _encode_numpy_full(frame):
+    lab, h, w = _prepare(frame)
+    glyph, fg, bg = _encode_numpy(lab, h, w)
+    return _assemble(glyph, fg, bg, h, w)
 
 
 def size_sweep() -> None:
@@ -34,24 +40,23 @@ def size_sweep() -> None:
     rows = []
     for label, w, h in GRIDS:
         frame = CONTENT["photo"](w, h)
-        r = measure(lambda: encode_frame(frame))
-        nbytes = len(encode_frame(frame))
-        fps_ceiling = 1000.0 / r["mean_ms"]
-        streams_24 = (1000.0 / _TARGET_FPS) / r["mean_ms"]
+        rk = measure(lambda: encode_frame(frame))          # active core (numba)
+        rn = measure(lambda: _encode_numpy_full(frame))    # numpy reference
+        speedup = rn["mean_ms"] / rk["mean_ms"]
         # What the adaptive pacer (transcoder) would settle on for one stream.
-        eff_fps = _TARGET_FPS / _encode_stride(r["mean_ms"] / 1000.0, _TARGET_FPS)
+        eff_fps = _TARGET_FPS / _encode_stride(rk["mean_ms"] / 1000.0, _TARGET_FPS)
+        streams_24 = (1000.0 / _TARGET_FPS) / rk["mean_ms"]
         rows.append([
             label, f"{w * h}",
-            fmt(r["mean_ms"]), fmt(r["min_ms"]),
-            fmt(fps_ceiling, 0), fmt(eff_fps, 0), fmt(streams_24, 1),
-            f"{nbytes / 1024:.1f}",
+            fmt(rn["mean_ms"]), fmt(rk["mean_ms"]), fmt(speedup, 1) + "x",
+            fmt(1000.0 / rk["mean_ms"], 0), fmt(eff_fps, 0), fmt(streams_24, 1),
         ])
     print(table(
-        ["grid", "cells", "mean ms", "min ms", "fps max",
-         "eff fps", "strm@24", "KB/frm"],
+        ["grid", "cells", "numpy ms", "numba ms", "speedup",
+         "fps max", "eff fps", "strm@24"],
         rows))
-    print(f"\neff fps = steady rate the adaptive pacer holds at {_TARGET_FPS} fps "
-          f"target (low but stutter-free); strm@24 = concurrent streams per core.")
+    print(f"\nnumba = active compiled core; numpy = reference/fallback.  eff fps = "
+          f"steady rate the pacer holds at {_TARGET_FPS} fps; strm@24 = streams/core.")
 
 
 def content_sweep(w: int = 82, h: int = 41) -> None:
@@ -66,9 +71,10 @@ def content_sweep(w: int = 82, h: int = 41) -> None:
 
 
 def components(w: int = 82, h: int = 41) -> None:
-    """Per-primitive cost on one frame — illustrative, not a strict decomposition
-    of encode_frame (it doesn't include every glue op)."""
-    section(f"3. Components  (grid: {w}x{h}, photo)")
+    """Per-primitive cost of the NumPy *reference* core on one frame — shows why it
+    was memory-bound (and worth compiling).  Illustrative, not a strict
+    decomposition (it omits some glue ops); the active core is the numba kernel."""
+    section(f"3. NumPy reference anatomy  (grid: {w}x{h}, photo)")
     cc = cc_encoder
     frame = CONTENT["photo"](w, h)
     fr = frame[: h * 3, : w * 2]
@@ -139,7 +145,8 @@ def components(w: int = 82, h: int = 41) -> None:
         ("gather pairs (take_along_axis)", gather),
         ("score 12 pairs (cost+argmin)", score_pairs),
         ("pack + emit (packbits)", pack_emit),
-        ("FULL encode_frame", lambda: encode_frame(frame)),
+        ("FULL numpy core", lambda: _encode_numpy_full(frame)),
+        ("FULL numba core (active)", lambda: encode_frame(frame)),
     ]:
         res = measure(fn)
         rows.append([name, fmt(res["mean_ms"]), fmt(res["min_ms"])])

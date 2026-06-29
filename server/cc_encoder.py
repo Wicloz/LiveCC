@@ -187,9 +187,25 @@ def _ign(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     return np.modf(52.9829189 * np.modf(v)[0])[0]
 
 
-def encode_frame(frame_rgb: np.ndarray) -> bytes:
-    """
-    Encode a (H*3) x (W*2) x 3 RGB frame into the binary wire format:
+def _prepare(frame_rgb: np.ndarray):
+    """RGB frame -> (lab, h, w): per-sub-pixel weighted-OKLab grouped into cells
+    (H, W, 6, 3).  Cheap LUT lookup; shared by both the numpy and numba cores."""
+    ph, pw, _ = frame_rgb.shape
+    h = ph // 3
+    w = pw // 2
+    fr = np.asarray(frame_rgb, dtype=np.uint8)[: h * 3, : w * 2]
+    r = fr[..., 0] >> _SHIFT
+    g = fr[..., 1] >> _SHIFT
+    b = fr[..., 2] >> _SHIFT
+    lab = (_OKLAB_LUT[r, g, b]
+           .reshape(h, 3, w, 2, 3)
+           .transpose(0, 2, 1, 3, 4)
+           .reshape(h, w, 6, 3))
+    return lab, h, w
+
+
+def _assemble(glyph, fg, bg, h: int, w: int) -> bytes:
+    """(glyph, fg, bg) per-cell arrays -> the binary blit wire format:
 
         bytes 0-1 : W (uint16 big-endian, character columns)
         bytes 2-3 : H (uint16 big-endian, character rows)
@@ -197,95 +213,259 @@ def encode_frame(frame_rgb: np.ndarray) -> bytes:
 
     A row's three strings are exactly what mon.blit(text, fg, bg) expects.
     """
-    ph, pw, _ = frame_rgb.shape
-    h = ph // 3
-    w = pw // 2
+    rows = np.empty((h, 3, w), dtype=np.uint8)
+    rows[:, 0, :] = glyph
+    rows[:, 1, :] = _BLIT_LUT[fg]
+    rows[:, 2, :] = _BLIT_LUT[bg]
+    header = bytes((
+        (w >> 8) & 0xFF, w & 0xFF,
+        (h >> 8) & 0xFF, h & 0xFF,
+    ))
+    return header + rows.tobytes()
 
-    fr = np.asarray(frame_rgb, dtype=np.uint8)[: h * 3, : w * 2]
-    r = fr[..., 0] >> _SHIFT
-    g = fr[..., 1] >> _SHIFT
-    b = fr[..., 2] >> _SHIFT
 
-    # Target OKLab per sub-pixel, grouped into cells: (H, W, 6, 3).
-    lab = (_OKLAB_LUT[r, g, b]
-           .reshape(h, 3, w, 2, 3)
-           .transpose(0, 2, 1, 3, 4)
-           .reshape(h, w, 6, 3))
+def _encode_numpy(lab, h, w):
+    """Reference vectorised core: lab -> (glyph, fg, bg) palette-index arrays.
+
+    Kept as the readable reference and the fallback when numba isn't importable;
+    the numba kernel below is a line-for-line port.  The maths is in the module
+    docstring and by _DITHER_WEIGHT.
+    """
     lp_all = lab @ _PAL.T                                        # (H,W,6,16) q·P_k
     score = lp_all - 0.5 * _PAL2               # argmax_k = nearest palette to a sub-pixel
 
-    # --- Build the 12 candidate endpoint pairs (palette indices) ------------- #
     nb1 = np.argmax(score[:, :, _CORNERS, :], axis=-1)        # (H,W,4) nearest/corner
     mscore = lab.mean(2) @ _PAL.T - 0.5 * _PAL2               # (H,W,16) nearest to cell mean
     top4 = np.argpartition(mscore, -4, axis=-1)[..., -4:]     # (H,W,4)
     idx_a = np.concatenate([nb1[..., _EII], top4[..., _MII]], axis=-1)  # (H,W,12) endpoint A
     idx_b = np.concatenate([nb1[..., _EJJ], top4[..., _MJJ]], axis=-1)  # (H,W,12) endpoint B
 
-    # --- Score each pair by expected dither error ---------------------------- #
-    # For a pair (A,B), target q projects onto the segment at
-    # t = clip((q-A)·dir / |dir|², 0, 1).  The pair's cost is
-    #     bias²      = distance² from q to the segment        (how well it spans q)
-    #   + λ·variance = λ·t(1-t)·|dir|²                         (down-weighted noise)
-    # summed over the 6 sub-pixels — see _DITHER_WEIGHT for why λ<1.  Per sub-pixel
-    # this is  |q-A|² - 2t(q-A)·dir + t·|dir|²·(λ + (1-λ)t); the |q|² part of |q-A|²
-    # is the same for every pair, so we drop it (the argmin is unchanged) and the
-    # remaining work is fused in place to keep the (H,W,6,12) traffic down.
+    # Score each pair by expected dither error  bias² + λ·variance  (see kernel /
+    # _DITHER_WEIGHT); the |q|² part of |q-A|² is constant across pairs so we drop
+    # it (argmin unchanged) and fuse the rest in place to limit (H,W,6,12) traffic.
     n_pairs = idx_a.shape[-1]
     lpa = np.take_along_axis(
         lp_all, np.broadcast_to(idx_a[:, :, None, :], (h, w, 6, n_pairs)), axis=-1)
     lpb = np.take_along_axis(
         lp_all, np.broadcast_to(idx_b[:, :, None, :], (h, w, 6, n_pairs)), axis=-1)
-    pa2 = _PAL2[idx_a]                                          # (H,W,12) |A|²
-    dot = _DOT[idx_a, idx_b]                                    # (H,W,12) A·B
-    len2 = pa2 + _PAL2[idx_b] - 2.0 * dot                       # (H,W,12) |B-A|²
-    padir = dot - pa2                                           # (H,W,12) A·dir
+    pa2 = _PAL2[idx_a]
+    dot = _DOT[idx_a, idx_b]
+    len2 = pa2 + _PAL2[idx_b] - 2.0 * dot
+    padir = dot - pa2
     safe = np.where(len2 == 0.0, 1.0, len2)                     # guard A==B (solid)
 
-    qad = lpb - lpa - padir[..., None, :]                       # (H,W,6,12) (q-A)·dir
+    qad = lpb - lpa - padir[..., None, :]
     t = np.clip(qad / safe[..., None, :], 0.0, 1.0)
     l2 = len2[..., None, :]
-    term = l2 * t                                               # fold cost in place
+    term = l2 * t
     term *= _DITHER_WEIGHT + (1.0 - _DITHER_WEIGHT) * t
     term -= 2.0 * t * qad
     term -= 2.0 * lpa
-    cost = term.sum(2) + 6.0 * pa2                              # (H,W,12) (|q|² dropped)
+    cost = term.sum(2) + 6.0 * pa2
     best = cost.argmin(-1)                                      # (H,W) winning pair
 
-    # Resolve the winning pair's palette indices and reuse its already-computed
-    # per-sub-pixel projection t for the dither.
     sel = best[:, :, None]
-    idx_a = np.take_along_axis(idx_a, sel, axis=-1)[..., 0]     # (H,W)
-    idx_b = np.take_along_axis(idx_b, sel, axis=-1)[..., 0]     # (H,W)
+    idx_a = np.take_along_axis(idx_a, sel, axis=-1)[..., 0]
+    idx_b = np.take_along_axis(idx_b, sel, axis=-1)[..., 0]
     t = np.take_along_axis(
-        t, np.broadcast_to(best[:, :, None, None], (h, w, 6, 1)), axis=-1)[..., 0]  # (H,W,6)
+        t, np.broadcast_to(best[:, :, None, None], (h, w, 6, 1)), axis=-1)[..., 0]
 
-    # --- Blue-noise dither along the segment --------------------------------- #
-    # A sub-pixel shows endpoint B with probability ≈ t (its position along the
-    # segment), decided against the screen-space noise threshold at its absolute
-    # pixel coordinate.  t≈0 -> always A, t≈1 -> always B, t≈0.5 -> mixed; the mix
-    # averages to the true in-between colour over neighbouring cells.
-    ys = (np.arange(h, dtype=np.int64)[:, None, None] * 3 + _SUB_ROW)  # (H,1,6)
-    xs = (np.arange(w, dtype=np.int64)[None, :, None] * 2 + _SUB_COL)  # (1,W,6)
+    # Blue-noise dither along the chosen segment, then canonicalise: B is fg, A is
+    # bg; if the bottom-right sub-pixel would be fg, invert the mask and swap.
+    ys = (np.arange(h, dtype=np.int64)[:, None, None] * 3 + _SUB_ROW)
+    xs = (np.arange(w, dtype=np.int64)[None, :, None] * 2 + _SUB_COL)
     thr = _ign(np.broadcast_to(xs, (h, w, 6)), np.broadcast_to(ys, (h, w, 6)))
-    is_b = t > thr                                             # (H,W,6) bool: show B
+    is_b = t > thr
 
-    # --- Canonicalise into the wire form ------------------------------------- #
-    # Treat B as foreground, A as background, then honour the format rule that the
-    # bottom-right sub-pixel must be background: if it would be foreground, invert
-    # the five mask bits and swap fg/bg (visually identical).
     invert = is_b[..., 5]
     mask = np.packbits(is_b[..., :5], axis=-1, bitorder="little")[..., 0]
     final_fg = np.where(invert, idx_a, idx_b)
     final_bg = np.where(invert, idx_b, idx_a)
     glyph = np.uint8(0x80) + np.where(invert, np.uint8(31) - mask, mask)
+    return glyph, final_fg, final_bg
 
-    rows = np.empty((h, 3, w), dtype=np.uint8)
-    rows[:, 0, :] = glyph
-    rows[:, 1, :] = _BLIT_LUT[final_fg]
-    rows[:, 2, :] = _BLIT_LUT[final_bg]
 
-    header = bytes((
-        (w >> 8) & 0xFF, w & 0xFF,
-        (h >> 8) & 0xFF, h & 0xFF,
-    ))
-    return header + rows.tobytes()
+# --------------------------------------------------------------------------- #
+# Compiled core (numba)
+# --------------------------------------------------------------------------- #
+# The per-cell work — 12 candidate pairs x 6 sub-pixels of small fixed loops — is
+# trivial in FLOPs but the NumPy version pays heavily in temporaries and gathers
+# (it's memory-bound, not compute-bound).  Compiling it to one scalar pass with no
+# temporaries is ~6x the NumPy core single-threaded (see benchmarks/bench_native).
+# Kept single-threaded by request; the loop is per-cell independent so a parallel
+# prange is a drop-in later if needed.  Falls back to _encode_numpy if numba isn't
+# importable (it's a normal pip dependency, so that's only a safety net).
+try:
+    from numba import njit
+    _HAVE_NUMBA = True
+except ImportError:                          # pragma: no cover - numba is a prod dep
+    _HAVE_NUMBA = False
+
+
+if _HAVE_NUMBA:
+    @njit(cache=True, fastmath=True)
+    def _ign_scalar(x, y):                   # scalar Interleaved Gradient Noise
+        v = np.float32(0.06711056) * x + np.float32(0.00583715) * y
+        v = v - np.floor(v)
+        w = np.float32(52.9829189) * v
+        return w - np.floor(w)
+
+    @njit(cache=True, fastmath=True)
+    def _encode_kernel(lab, glyph, fg, bg):
+        """Line-for-line port of _encode_numpy.  Single pass over cells, no
+        temporaries, no gathers.  Reuses per-frame scratch buffers — fine because
+        it is single-threaded."""
+        H = lab.shape[0]
+        W = lab.shape[1]
+        lam = _DITHER_WEIGHT
+        cand = np.empty(12, np.int64)
+        candb = np.empty(12, np.int64)
+        cn = np.empty(4, np.int64)
+        t4 = np.empty(4, np.int64)
+        ms = np.empty(16, np.float32)
+        for y in range(H):
+            for x in range(W):
+                cell = lab[y, x]
+                # nearest palette to each of the 4 corner sub-pixels (edges)
+                for ci in range(4):
+                    s = _CORNERS[ci]
+                    best = -1e30
+                    bk = 0
+                    for k in range(16):
+                        d = (cell[s, 0] * _PAL[k, 0] + cell[s, 1] * _PAL[k, 1]
+                             + cell[s, 2] * _PAL[k, 2]) - 0.5 * _PAL2[k]
+                        if d > best:
+                            best = d
+                            bk = k
+                    cn[ci] = bk
+                # 4 palette colours nearest the cell mean (flat brackets)
+                mx = 0.0
+                my = 0.0
+                mz = 0.0
+                for s in range(6):
+                    mx += cell[s, 0]
+                    my += cell[s, 1]
+                    mz += cell[s, 2]
+                mx /= 6.0
+                my /= 6.0
+                mz /= 6.0
+                for k in range(16):
+                    ms[k] = (mx * _PAL[k, 0] + my * _PAL[k, 1] + mz * _PAL[k, 2]) - 0.5 * _PAL2[k]
+                for j in range(4):
+                    best = -1e30
+                    bk = 0
+                    for k in range(16):
+                        if ms[k] > best:
+                            best = ms[k]
+                            bk = k
+                    t4[j] = bk
+                    ms[bk] = -1e30
+                # 12 candidate pairs: 6 corner-combos + 6 mean-combos
+                p = 0
+                for i in range(4):
+                    for j in range(i + 1, 4):
+                        cand[p] = cn[i]
+                        candb[p] = cn[j]
+                        p += 1
+                for i in range(4):
+                    for j in range(i + 1, 4):
+                        cand[p] = t4[i]
+                        candb[p] = t4[j]
+                        p += 1
+                # lowest expected-dither-error pair
+                bestc = 1e30
+                ba = cand[0]
+                bb = candb[0]
+                for pp in range(12):
+                    a = cand[pp]
+                    b = candb[pp]
+                    dx0 = _PAL[b, 0] - _PAL[a, 0]
+                    dx1 = _PAL[b, 1] - _PAL[a, 1]
+                    dx2 = _PAL[b, 2] - _PAL[a, 2]
+                    len2 = dx0 * dx0 + dx1 * dx1 + dx2 * dx2
+                    c = 0.0
+                    if len2 < 1e-12:                    # degenerate pair A==B (solid)
+                        for s in range(6):
+                            q0 = cell[s, 0] - _PAL[a, 0]
+                            q1 = cell[s, 1] - _PAL[a, 1]
+                            q2 = cell[s, 2] - _PAL[a, 2]
+                            c += q0 * q0 + q1 * q1 + q2 * q2
+                    else:
+                        for s in range(6):
+                            q0 = cell[s, 0] - _PAL[a, 0]
+                            q1 = cell[s, 1] - _PAL[a, 1]
+                            q2 = cell[s, 2] - _PAL[a, 2]
+                            qad = q0 * dx0 + q1 * dx1 + q2 * dx2
+                            qa2 = q0 * q0 + q1 * q1 + q2 * q2
+                            t = qad / len2
+                            if t < 0.0:
+                                t = 0.0
+                            elif t > 1.0:
+                                t = 1.0
+                            c += qa2 - 2.0 * t * qad + len2 * t * (lam + (1.0 - lam) * t)
+                    if c < bestc:
+                        bestc = c
+                        ba = a
+                        bb = b
+                # dither chosen segment + canonicalise glyph
+                dx0 = _PAL[bb, 0] - _PAL[ba, 0]
+                dx1 = _PAL[bb, 1] - _PAL[ba, 1]
+                dx2 = _PAL[bb, 2] - _PAL[ba, 2]
+                len2 = dx0 * dx0 + dx1 * dx1 + dx2 * dx2
+                mask = 0
+                invert = False
+                for s in range(6):
+                    if len2 < 1e-12:
+                        t = 0.0
+                    else:
+                        q0 = cell[s, 0] - _PAL[ba, 0]
+                        q1 = cell[s, 1] - _PAL[ba, 1]
+                        q2 = cell[s, 2] - _PAL[ba, 2]
+                        t = (q0 * dx0 + q1 * dx1 + q2 * dx2) / len2
+                        if t < 0.0:
+                            t = 0.0
+                        elif t > 1.0:
+                            t = 1.0
+                    thr = _ign_scalar(np.float32(x * 2 + _SUB_COL[s]),
+                                      np.float32(y * 3 + _SUB_ROW[s]))
+                    isb = t > thr
+                    if s == 5:
+                        invert = isb
+                    elif isb:
+                        mask |= (1 << s)
+                if invert:
+                    fg[y, x] = ba
+                    bg[y, x] = bb
+                    glyph[y, x] = np.uint8(0x80 + (31 - mask))
+                else:
+                    fg[y, x] = bb
+                    bg[y, x] = ba
+                    glyph[y, x] = np.uint8(0x80 + mask)
+
+    def _encode_numba(lab, h, w):
+        lab = np.ascontiguousarray(lab, dtype=np.float32)
+        glyph = np.empty((h, w), np.uint8)
+        fg = np.empty((h, w), np.int64)
+        bg = np.empty((h, w), np.int64)
+        _encode_kernel(lab, glyph, fg, bg)
+        return glyph, fg, bg
+
+    _encode_core = _encode_numba
+else:                                        # pragma: no cover - numba present in prod
+    _encode_core = _encode_numpy
+
+
+def encode_frame(frame_rgb: np.ndarray) -> bytes:
+    """Encode a (H*3) x (W*2) x 3 RGB frame into the blit wire format (see
+    _assemble).  Uses the compiled numba core, falling back to pure numpy."""
+    lab, h, w = _prepare(frame_rgb)
+    glyph, fg, bg = _encode_core(lab, h, w)
+    return _assemble(glyph, fg, bg, h, w)
+
+
+# Warm the JIT at import (compile now, or load the on-disk cache) so the first
+# real video frame after a server start isn't delayed by a one-off compile.  Costs
+# ~nothing once cached; the server rarely restarts, so paying it at startup beats
+# stalling the first stream.  numpy fallback makes this a cheap no-op.
+if _HAVE_NUMBA:
+    encode_frame(np.zeros((3, 2, 3), dtype=np.uint8))

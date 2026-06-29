@@ -5,3 +5,7 @@ uvicorn[standard]>=0.29.0
 # full (DASH) format list stays available instead of just HLS.
 yt-dlp[default]>=2025.1.1
 numpy>=1.26.0
+# Compiles the per-cell image encoder (cc_encoder) to native code — ~6x the pure
+# numpy core single-threaded.  0.61+ supports NumPy 2.x; pip resolves a mutually
+# compatible pair.  If numba is ever absent the encoder falls back to numpy.
+numba>=0.61.0
