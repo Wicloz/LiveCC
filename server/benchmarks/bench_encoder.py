@@ -40,23 +40,28 @@ def size_sweep() -> None:
     rows = []
     for label, w, h in GRIDS:
         frame = CONTENT["photo"](w, h)
-        rk = measure(lambda: encode_frame(frame))          # active core (numba)
-        rn = measure(lambda: _encode_numpy_full(frame))    # numpy reference
-        speedup = rn["mean_ms"] / rk["mean_ms"]
-        # What the adaptive pacer (transcoder) would settle on for one stream.
-        eff_fps = _TARGET_FPS / _encode_stride(rk["mean_ms"] / 1000.0, _TARGET_FPS)
-        streams_24 = (1000.0 / _TARGET_FPS) / rk["mean_ms"]
+        rn = measure(lambda: _encode_numpy_full(frame))            # numpy reference (fixed)
+        rf = measure(lambda: encode_frame(frame, adaptive=False))  # numba, fixed palette
+        ra = measure(lambda: encode_frame(frame))                  # numba, adaptive (prod)
+        speedup = rn["mean_ms"] / rf["mean_ms"]                     # core: fixed vs fixed
+        # The pacer/headroom reflect the production path, which is adaptive.
+        eff_fps = _TARGET_FPS / _encode_stride(ra["mean_ms"] / 1000.0, _TARGET_FPS)
+        streams_24 = (1000.0 / _TARGET_FPS) / ra["mean_ms"]
         rows.append([
             label, f"{w * h}",
-            fmt(rn["mean_ms"]), fmt(rk["mean_ms"]), fmt(speedup, 1) + "x",
-            fmt(1000.0 / rk["mean_ms"], 0), fmt(eff_fps, 0), fmt(streams_24, 1),
+            fmt(rn["mean_ms"]), fmt(rf["mean_ms"]), fmt(ra["mean_ms"]),
+            fmt(speedup, 1) + "x",
+            fmt(1000.0 / ra["mean_ms"], 0), fmt(eff_fps, 0), fmt(streams_24, 1),
         ])
     print(table(
-        ["grid", "cells", "numpy ms", "numba ms", "speedup",
+        ["grid", "cells", "numpy ms", "fixed ms", "adapt ms", "speedup",
          "fps max", "eff fps", "strm@24"],
         rows))
-    print(f"\nnumba = active compiled core; numpy = reference/fallback.  eff fps = "
-          f"steady rate the pacer holds at {_TARGET_FPS} fps; strm@24 = streams/core.")
+    print(f"\nnumpy = reference/fallback (fixed palette); fixed/adapt ms = numba core "
+          f"with CC's fixed vs the adaptive per-frame palette (adapt = production "
+          f"default, so fps/eff fps/strm@24 use it).  speedup = numba vs numpy on the "
+          f"same fixed-palette work; eff fps = steady rate the pacer holds at "
+          f"{_TARGET_FPS} fps; strm@24 = streams/core.")
 
 
 def content_sweep(w: int = 82, h: int = 41) -> None:
@@ -64,10 +69,13 @@ def content_sweep(w: int = 82, h: int = 41) -> None:
     rows = []
     for name, gen in CONTENT.items():
         frame = gen(w, h)
-        r = measure(lambda: encode_frame(frame))
-        rows.append([name, fmt(r["mean_ms"]), fmt(r["min_ms"]),
-                     fmt(1000.0 / r["mean_ms"], 0)])
-    print(table(["content", "mean ms", "min ms", "fps max"], rows))
+        ra = measure(lambda: encode_frame(frame))                  # adaptive (prod)
+        rf = measure(lambda: encode_frame(frame, adaptive=False))  # fixed palette
+        rows.append([name, fmt(ra["mean_ms"]), fmt(rf["mean_ms"]),
+                     fmt(ra["mean_ms"] - rf["mean_ms"]), fmt(1000.0 / ra["mean_ms"], 0)])
+    print(table(["content", "adapt ms", "fixed ms", "palette ms", "fps max"], rows))
+    print("\npalette ms = adaptive-palette overhead (generate_palette) on top of the "
+          "fixed-palette encode; data-shaped (random colour clouds cost the most).")
 
 
 def components(w: int = 82, h: int = 41) -> None:

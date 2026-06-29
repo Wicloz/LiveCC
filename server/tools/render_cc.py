@@ -8,7 +8,9 @@ different resolutions without a Minecraft world.
 Pipeline per (sample, grid), reusing the *real* server code:
   ffmpeg decode + area-scale + letterbox  (transcoder._video_ffmpeg_cmd)
    -> _FrameSplitter                       (same split as iter_video)
-   -> encode_frame                         (the actual blit encoder)
+   -> encode_frame                         (the actual blit encoder; adaptive
+                                            per-frame palette, or CC's fixed palette
+                                            under --crunchy — see below)
    -> decode_frame                         (blit back to the 16-colour pixels the
                                             client paints: 2 colours/cell in the
                                             glyph pattern, dither and all)
@@ -16,6 +18,10 @@ Pipeline per (sample, grid), reusing the *real* server code:
    -> ffmpeg x264 mux                       (+ audio emulated as the CC speaker hears
                                             it: 8-bit 48 kHz mono PCM, or 1-bit DFPWM
                                             with --crunchy)
+
+--crunchy emulates the lowest-fidelity setup end to end: 1-bit DFPWM audio AND CC's
+fixed default palette (adaptive palette off), so the preview matches what a player
+running the simplest/cheapest client path would see.
 
 Output goes to media/cc_preview/<clip>_<W>x<H>.mp4 (git-ignored).
 
@@ -112,7 +118,7 @@ def _output_cmd(out: Path, ow: int, oh: int, fps: int, sample: Path,
 
 
 def render(sample: Path, w: int, h: int, fps: int, seconds: float,
-           crunchy: bool, outdir: Path) -> Path | None:
+           crunchy: bool, outdir: Path, adaptive: bool = True) -> Path | None:
     px_w, px_h = w * 2, h * 3
     k = _even_factor(w, h)
     ow, oh = px_w * k, px_h * k
@@ -138,7 +144,8 @@ def render(sample: Path, w: int, h: int, fps: int, seconds: float,
             for arr in splitter.push(chunk):
                 if written >= max_frames:
                     break
-                img = decode_frame(encode_frame(arr), w, h)   # what the monitor paints
+                # what the monitor paints (adaptive palette, or fixed under --crunchy)
+                img = decode_frame(encode_frame(arr, adaptive=adaptive), w, h)
                 up = np.repeat(np.repeat(img, k, axis=0), k, axis=1)
                 enc.stdin.write(up.tobytes())
                 written += 1
@@ -175,7 +182,8 @@ def main(argv=None) -> int:
     ap.add_argument("--fps", type=int, default=24)
     ap.add_argument("--seconds", type=float, default=10.0, help="duration cap")
     ap.add_argument("--crunchy", action="store_true",
-                    help="emulate --crunchy audio (1-bit DFPWM round-trip)")
+                    help="lowest-fidelity preview: 1-bit DFPWM audio AND CC's fixed "
+                         "default palette (adaptive per-frame palette off)")
     ap.add_argument("--outdir", default=str(PREVIEW_DIR))
     args = ap.parse_args(argv)
 
@@ -208,7 +216,9 @@ def main(argv=None) -> int:
     for sample in samples:
         print(sample.name)
         for w, h in grids:
-            if render(sample, w, h, args.fps, args.seconds, args.crunchy, outdir) is None:
+            # --crunchy drops the adaptive palette for CC's fixed default palette.
+            if render(sample, w, h, args.fps, args.seconds, args.crunchy, outdir,
+                      adaptive=not args.crunchy) is None:
                 failures += 1
     # Every file in media/ is expected to render; a failure means an input the
     # developer thought was supported isn't — exit non-zero so it's noticed.

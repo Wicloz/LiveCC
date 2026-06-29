@@ -52,17 +52,21 @@ def _dither_fraction(buf: bytes, w: int, h: int) -> float:
 
 
 def _row(name: str, frame: np.ndarray) -> list:
-    buf = encode_frame(frame)
-    rec = decode_frame(buf, frame.shape[1] // 2, frame.shape[0] // 3)
+    w, h = frame.shape[1] // 2, frame.shape[0] // 3
+    buf = encode_frame(frame)                                  # adaptive (default)
+    rec = decode_frame(buf, w, h)
+    # Same metric with the fixed CC palette, to show the adaptive-palette win.
+    fixed = decode_frame(encode_frame(frame, adaptive=False), w, h)
     return [
         name,
         fmt(_psnr(frame, rec), 1),
         fmt(_psnr(_box2(frame), _box2(rec)), 1),
-        fmt(_dither_fraction(buf, frame.shape[1] // 2, frame.shape[0] // 3) * 100, 0) + "%",
+        fmt(_psnr(_box2(frame), _box2(fixed)), 1),
+        fmt(_dither_fraction(buf, w, h) * 100, 0) + "%",
     ]
 
 
-_HEADERS = ["content", "PSNR dB", "PSNR 2x2 dB", "cells dithered"]
+_HEADERS = ["content", "PSNR dB", "PSNR 2x2 dB", "2x2 fixed", "cells dithered"]
 
 
 def synthetic(w: int = 82, h: int = 41) -> None:
@@ -83,9 +87,11 @@ def real_samples(w: int = 82, h: int = 41, frames_per: int = 4) -> None:
             continue
         vals = np.array([[_psnr(f, decode_frame(encode_frame(f), w, h)),
                           _psnr(_box2(f), _box2(decode_frame(encode_frame(f), w, h))),
+                          _psnr(_box2(f), _box2(decode_frame(encode_frame(f, adaptive=False), w, h))),
                           _dither_fraction(encode_frame(f), w, h) * 100] for f in frames])
         m = vals.mean(0)
-        rows.append([path.name[:28], fmt(m[0], 1), fmt(m[1], 1), fmt(m[2], 0) + "%"])
+        rows.append([path.name[:28], fmt(m[0], 1), fmt(m[1], 1), fmt(m[2], 1),
+                     fmt(m[3], 0) + "%"])
     if rows:
         print(table(_HEADERS, rows))
 
