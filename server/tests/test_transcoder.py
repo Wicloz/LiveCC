@@ -361,9 +361,9 @@ def test_adaptive_pacing_skips_frames_when_encode_is_slow(tmp_path, monkeypatch)
 
     real = cc_encoder.encode_frame
 
-    def slow(arr):
+    def slow(arr, adaptive=True):   # iter_video calls encode_frame(arr, adaptive)
         time.sleep(0.15)            # 0.15*10*1.15 = 1.7 -> stride 2 -> ~half the frames
-        return real(arr)
+        return real(arr, adaptive)
 
     monkeypatch.setattr(transcoder, "encode_frame", slow)
 
@@ -388,6 +388,40 @@ def test_adaptive_pacing_skips_frames_when_encode_is_slow(tmp_path, monkeypatch)
     steps = [round((b - a) * 10) for a, b in zip(pts_list, pts_list[1:])]
     assert all(s >= 1 for s in steps) and any(s >= 2 for s in steps)
     assert all(abs(p * 10 - round(p * 10)) < 1e-6 for p in pts_list)
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+@pytest.mark.parametrize("adaptive", [True, False], ids=["adaptive", "fixed"])
+def test_iter_video_forwards_palette_strategy(tmp_path, monkeypatch, adaptive):
+    # iter_video must pass its `adaptive` flag through to encode_frame (so --crunchy,
+    # which sets adaptive=False, actually renders with CC's fixed palette).
+    import cc_encoder
+
+    path = tmp_path / "clip.mkv"
+    if _ffmpeg_make(path, "mpeg4").returncode != 0:
+        pytest.skip("ffmpeg can't build the clip")
+
+    real = cc_encoder.encode_frame
+    seen = []
+
+    def spy(arr, adaptive_arg=True):
+        seen.append(adaptive_arg)
+        return real(arr, adaptive_arg)
+
+    monkeypatch.setattr(transcoder, "encode_frame", spy)
+
+    async def go():
+        agen = transcoder.iter_video("ignored", term_w=8, term_h=4, fps=10,
+                                     source_path=str(path), adaptive=adaptive)
+        try:
+            async for _pts, _frame in agen:
+                pass
+        finally:
+            await agen.aclose()
+
+    asyncio.run(go())
+    assert seen, "no frames were encoded"
+    assert all(a is adaptive for a in seen)
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")

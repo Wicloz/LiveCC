@@ -130,10 +130,13 @@ class StreamSession:
         self.want_audio = want_audio
         self.want_video = want_video
         self.rate = rate
-        # --crunchy trades audio fidelity for bandwidth: 1-bit DFPWM instead of
-        # raw 8-bit PCM.  (It also lowers video resolution, but that's driven by
-        # the smaller w/h the client sends, not here.)
+        # --crunchy is the low-fidelity/low-bandwidth mode.  For audio it picks
+        # 1-bit DFPWM over raw 8-bit PCM; for video it drops the adaptive per-frame
+        # palette back to CC's fixed default palette (the simplest/cheapest client
+        # path).  (It also lowers video resolution, but that's driven by the smaller
+        # w/h the client sends, not here.)
         self.codec = DFPWM if crunchy else PCM
+        self.adaptive_palette = not crunchy
 
         self.start = parse_timestamp(start)             # seconds, 0 if absent
         _end = parse_timestamp(end)
@@ -185,7 +188,8 @@ class StreamSession:
         try:
             agen = iter_video(self.url, self.w, self.h, self.fps,
                               start=self._start_eff, end=self._end_eff,
-                              source_path=self._source_path, loop=self.loop)
+                              source_path=self._source_path, loop=self.loop,
+                              adaptive=self.adaptive_palette)
             # iter_video tags each frame with its source PTS and may skip source
             # frames to keep up (adaptive pacing) — so trust its pts, don't count.
             async for pts, frame in agen:

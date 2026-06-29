@@ -477,7 +477,8 @@ def _encode_stride(enc_seconds: float, fps: int) -> int:
 async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
                      start: int = 0, end: Optional[int] = None,
                      source_path: Optional[str] = None,
-                     loop: bool = False) -> AsyncGenerator[tuple[float, bytes], None]:
+                     loop: bool = False,
+                     adaptive: bool = True) -> AsyncGenerator[tuple[float, bytes], None]:
     """Yield (pts_seconds, encoded 2x3 binary frame) pairs.
 
     pts is the frame's media time (source_index / fps), so the consumer can pace
@@ -485,6 +486,9 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
 
     source_path set => decode that local (seekable) file; loop=True replays it
     forever (--loop).  Otherwise stream from the yt-dlp pipe.
+
+    adaptive => encode with the adaptive per-frame palette (default); False (used by
+    --crunchy) falls back to CC's fixed default palette.
     """
     px_w, px_h = term_w * 2, term_h * 3
     ytdlp: subprocess.Popen | None = None
@@ -545,7 +549,8 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
                 # See memory note [[video-encode-offload]].  Not worth it until this
                 # targeted offload proves insufficient.
                 t0 = ev_loop.time()
-                frame = await ev_loop.run_in_executor(_executor, encode_frame, arr)
+                # run_in_executor passes args positionally: encode_frame(arr, adaptive).
+                frame = await ev_loop.run_in_executor(_executor, encode_frame, arr, adaptive)
                 enc = ev_loop.time() - t0
                 # Smoothed encode time -> how many source frames to span next, so
                 # the effective fps tracks what the CPU can actually sustain.

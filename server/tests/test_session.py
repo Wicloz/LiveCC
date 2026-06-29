@@ -88,7 +88,8 @@ def _auds(bins):
 
 
 def _patch(monkeypatch, n_video, n_audio, is_live, ext="webm", moov_at_end=True):
-    async def fake_video(url, w, h, fps, start=0, end=None, source_path=None, loop=False):
+    async def fake_video(url, w, h, fps, start=0, end=None, source_path=None,
+                          loop=False, adaptive=True):
         for i in range(n_video):   # iter_video yields (pts, frame); pts = i/fps
             yield i / fps, bytes((0, w, 0, h)) + b"\x00" * (w * h * 3)
 
@@ -296,6 +297,14 @@ def test_crunchy_selects_dfpwm_codec():
                          crunchy=True).codec.name == "dfpwm"
 
 
+def test_crunchy_disables_adaptive_palette():
+    # --crunchy also drops the adaptive per-frame palette for video, back to CC's
+    # fixed default palette; the default streams keep the adaptive palette.
+    assert StreamSession("u", w=4, h=2, fps=24, want_audio=True).adaptive_palette is True
+    assert StreamSession("u", w=4, h=2, fps=24, want_audio=True,
+                         crunchy=True).adaptive_palette is False
+
+
 def test_webm_vod_streams_without_download(monkeypatch):
     # WebM streams fine from a pipe — must NOT even probe moov or download.
     _patch(monkeypatch, n_video=3, n_audio=0, is_live=False, ext="webm")
@@ -315,7 +324,8 @@ def test_cancel_finalizes_producer_generator(monkeypatch):
     # finally (which kills yt-dlp/ffmpeg) runs promptly — not left to GC.
     closed = {"video": False}
 
-    async def fake_video(url, w, h, fps, start=0, end=None, source_path=None, loop=False):
+    async def fake_video(url, w, h, fps, start=0, end=None, source_path=None,
+                          loop=False, adaptive=True):
         i = 0
         try:
             while True:

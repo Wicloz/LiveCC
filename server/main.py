@@ -10,8 +10,9 @@ WebSocket endpoint (used by the CC player):
       audio/video : "0" to disable that stream (audio-only / video-only).
       start/end : timestamps ("90", "1m30s", "3h2m"); seek a VOD section.
       loop      : "1" to cache the section once and replay it forever.
-      crunchy   : "1" for low-bandwidth mode — 1-bit DFPWM audio (the client also
-                  lowers video resolution by sending a smaller width/height).
+      crunchy   : "1" for low-bandwidth/low-fidelity mode — 1-bit DFPWM audio and
+                  CC's fixed default palette instead of the adaptive per-frame one
+                  (the client also lowers video resolution via a smaller width/height).
             sync      : "1" to share one provider across clients with the same URL.
   The binary side of the socket is a sanjuuni 32vid stream: a 12-byte "32VD" file
   header (W, H, fps, nstreams, flags) followed by self-delimiting chunks, each
