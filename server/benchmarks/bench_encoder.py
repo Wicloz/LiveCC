@@ -30,8 +30,8 @@ _TARGET_FPS = 24
 
 
 def _encode_numpy_full(frame):
-    lab, h, w = _prepare(frame)
-    glyph, fg, bg = _encode_numpy(lab, h, w)
+    idx, h, w = _prepare(frame)
+    glyph, fg, bg = _encode_numpy(idx, h, w)
     return _assemble(glyph, fg, bg, h, w)
 
 

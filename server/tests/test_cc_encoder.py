@@ -83,9 +83,9 @@ def test_numba_and_numpy_cores_agree():
         pytest.skip("numba not installed")
     rng = np.random.default_rng(3)
     frame = rng.integers(0, 256, size=(41 * 3, 82 * 2, 3), dtype=np.uint8)
-    lab, h, w = cc._prepare(frame)
-    _g_np, fg_np, bg_np = cc._encode_numpy(lab, h, w)
-    _g_nb, fg_nb, bg_nb = cc._encode_numba(lab, h, w)
+    idx, h, w = cc._prepare(frame)
+    _g_np, fg_np, bg_np = cc._encode_numpy(idx, h, w)
+    _g_nb, fg_nb, bg_nb = cc._encode_numba(idx, h, w)
     # Same unordered colour pair per cell (fg/bg may swap with the invert flag).
     agree = np.mean([
         frozenset((int(fg_np[y, x]), int(bg_np[y, x]))) ==

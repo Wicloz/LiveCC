@@ -136,6 +136,18 @@ def _build_oklab_lut() -> np.ndarray:
 _OKLAB_LUT: np.ndarray = _build_oklab_lut()
 
 
+# Linear-light tables for the dither.  The monitor emits light and the eye averages
+# neighbouring sub-pixels in LINEAR RGB, not in OKLab.  So while the colour PAIR is
+# chosen perceptually (OKLab, below), the dither FRACTION — how many sub-pixels show
+# each endpoint — is computed in linear light.  Otherwise mid-tones come out too
+# bright: dithering black/white for a mid-grey at the OKLab midpoint averages to
+# ~0.5 linear, i.e. a bright grey rather than mid-grey.
+_LIN_PAL = _srgb_to_linear(_CC_RGB / 255.0).astype(np.float32)   # (16,3) palette
+_LIN1D = _srgb_to_linear(                                        # (64,) per channel
+    (np.arange(1 << _BITS_PER_CHANNEL, dtype=np.float32) * (1 << _SHIFT)
+     + ((1 << _SHIFT) - 1) / 2.0) / 255.0).astype(np.float32)
+
+
 # --------------------------------------------------------------------------- #
 # Palette helpers for the endpoint search
 # --------------------------------------------------------------------------- #
@@ -187,21 +199,22 @@ def _ign(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     return np.modf(52.9829189 * np.modf(v)[0])[0]
 
 
+def _cells(arr, h, w):
+    """(H*3, W*2, 3) -> (H, W, 6, 3): group sub-pixels into cells (s=row*2+col)."""
+    return arr.reshape(h, 3, w, 2, 3).transpose(0, 2, 1, 3, 4).reshape(h, w, 6, 3)
+
+
 def _prepare(frame_rgb: np.ndarray):
-    """RGB frame -> (lab, h, w): per-sub-pixel weighted-OKLab grouped into cells
-    (H, W, 6, 3).  Cheap LUT lookup; shared by both the numpy and numba cores."""
+    """RGB frame -> (idx, h, w): the 6-bit per-channel colour index of each
+    sub-pixel, grouped into cells (H, W, 6, 3) uint8.  Just a shift + regroup — the
+    OKLab/linear LUT lookups happen in the cores (cheaply, in the compiled kernel).
+    """
     ph, pw, _ = frame_rgb.shape
     h = ph // 3
     w = pw // 2
     fr = np.asarray(frame_rgb, dtype=np.uint8)[: h * 3, : w * 2]
-    r = fr[..., 0] >> _SHIFT
-    g = fr[..., 1] >> _SHIFT
-    b = fr[..., 2] >> _SHIFT
-    lab = (_OKLAB_LUT[r, g, b]
-           .reshape(h, 3, w, 2, 3)
-           .transpose(0, 2, 1, 3, 4)
-           .reshape(h, w, 6, 3))
-    return lab, h, w
+    idx = _cells(fr >> _SHIFT, h, w)
+    return idx, h, w
 
 
 def _assemble(glyph, fg, bg, h: int, w: int) -> bytes:
@@ -224,13 +237,17 @@ def _assemble(glyph, fg, bg, h: int, w: int) -> bytes:
     return header + rows.tobytes()
 
 
-def _encode_numpy(lab, h, w):
-    """Reference vectorised core: lab -> (glyph, fg, bg) palette-index arrays.
+def _encode_numpy(idx, h, w):
+    """Reference vectorised core: 6-bit indices -> (glyph, fg, bg) palette-index
+    arrays.
 
     Kept as the readable reference and the fallback when numba isn't importable;
     the numba kernel below is a line-for-line port.  The maths is in the module
     docstring and by _DITHER_WEIGHT.
     """
+    r, g, b = idx[..., 0], idx[..., 1], idx[..., 2]             # (H,W,6) 6-bit indices
+    lab = _OKLAB_LUT[r, g, b]                                    # (H,W,6,3) OKLab
+    lin = np.stack([_LIN1D[r], _LIN1D[g], _LIN1D[b]], axis=-1)  # (H,W,6,3) linear RGB
     lp_all = lab @ _PAL.T                                        # (H,W,6,16) q·P_k
     score = lp_all - 0.5 * _PAL2               # argmax_k = nearest palette to a sub-pixel
 
@@ -265,10 +282,18 @@ def _encode_numpy(lab, h, w):
     best = cost.argmin(-1)                                      # (H,W) winning pair
 
     sel = best[:, :, None]
-    idx_a = np.take_along_axis(idx_a, sel, axis=-1)[..., 0]
+    idx_a = np.take_along_axis(idx_a, sel, axis=-1)[..., 0]     # (H,W)
     idx_b = np.take_along_axis(idx_b, sel, axis=-1)[..., 0]
-    t = np.take_along_axis(
-        t, np.broadcast_to(best[:, :, None, None], (h, w, 6, 1)), axis=-1)[..., 0]
+
+    # Dither FRACTION in linear light (where the eye mixes the sub-pixels): project
+    # each sub-pixel's linear colour onto the chosen pair's linear segment.  The
+    # pair was chosen in OKLab above; only the per-sub-pixel split is linear.
+    la = _LIN_PAL[idx_a]                                        # (H,W,3)
+    dlin = _LIN_PAL[idx_b] - la
+    llen2 = (dlin * dlin).sum(-1)                               # (H,W)
+    lsafe = np.where(llen2 == 0.0, 1.0, llen2)
+    t = np.clip(((lin - la[:, :, None, :]) * dlin[:, :, None, :]).sum(-1)
+                / lsafe[:, :, None], 0.0, 1.0)                  # (H,W,6)
 
     # Blue-noise dither along the chosen segment, then canonicalise: B is fg, A is
     # bg; if the bottom-right sub-pixel would be fg, invert the mask and swap.
@@ -311,29 +336,39 @@ if _HAVE_NUMBA:
         return w - np.floor(w)
 
     @njit(cache=True, fastmath=True)
-    def _encode_kernel(lab, glyph, fg, bg):
-        """Line-for-line port of _encode_numpy.  Single pass over cells, no
-        temporaries, no gathers.  Reuses per-frame scratch buffers — fine because
-        it is single-threaded."""
-        H = lab.shape[0]
-        W = lab.shape[1]
+    def _encode_kernel(idx, lut, glyph, fg, bg):
+        """Line-for-line port of _encode_numpy.  Single pass over cells; per
+        sub-pixel it looks up OKLab (for the pair search, from `lut`) and linear RGB
+        (for the dither, from _LIN1D) by its 6-bit index — that lookup in compiled
+        code is far cheaper than a NumPy fancy-index gather, so _prepare only hands
+        over the indices.  Reuses per-frame scratch buffers (single-threaded)."""
+        H = idx.shape[0]
+        W = idx.shape[1]
         lam = _DITHER_WEIGHT
         cand = np.empty(12, np.int64)
         candb = np.empty(12, np.int64)
         cn = np.empty(4, np.int64)
         t4 = np.empty(4, np.int64)
         ms = np.empty(16, np.float32)
+        clab = np.empty((6, 3), np.float32)
         for y in range(H):
             for x in range(W):
-                cell = lab[y, x]
+                # OKLab of the 6 sub-pixels (perceptual pair search)
+                for s in range(6):
+                    ir = idx[y, x, s, 0]
+                    ig = idx[y, x, s, 1]
+                    ib = idx[y, x, s, 2]
+                    clab[s, 0] = lut[ir, ig, ib, 0]
+                    clab[s, 1] = lut[ir, ig, ib, 1]
+                    clab[s, 2] = lut[ir, ig, ib, 2]
                 # nearest palette to each of the 4 corner sub-pixels (edges)
                 for ci in range(4):
                     s = _CORNERS[ci]
                     best = -1e30
                     bk = 0
                     for k in range(16):
-                        d = (cell[s, 0] * _PAL[k, 0] + cell[s, 1] * _PAL[k, 1]
-                             + cell[s, 2] * _PAL[k, 2]) - 0.5 * _PAL2[k]
+                        d = (clab[s, 0] * _PAL[k, 0] + clab[s, 1] * _PAL[k, 1]
+                             + clab[s, 2] * _PAL[k, 2]) - 0.5 * _PAL2[k]
                         if d > best:
                             best = d
                             bk = k
@@ -343,9 +378,9 @@ if _HAVE_NUMBA:
                 my = 0.0
                 mz = 0.0
                 for s in range(6):
-                    mx += cell[s, 0]
-                    my += cell[s, 1]
-                    mz += cell[s, 2]
+                    mx += clab[s, 0]
+                    my += clab[s, 1]
+                    mz += clab[s, 2]
                 mx /= 6.0
                 my /= 6.0
                 mz /= 6.0
@@ -386,15 +421,15 @@ if _HAVE_NUMBA:
                     c = 0.0
                     if len2 < 1e-12:                    # degenerate pair A==B (solid)
                         for s in range(6):
-                            q0 = cell[s, 0] - _PAL[a, 0]
-                            q1 = cell[s, 1] - _PAL[a, 1]
-                            q2 = cell[s, 2] - _PAL[a, 2]
+                            q0 = clab[s, 0] - _PAL[a, 0]
+                            q1 = clab[s, 1] - _PAL[a, 1]
+                            q2 = clab[s, 2] - _PAL[a, 2]
                             c += q0 * q0 + q1 * q1 + q2 * q2
                     else:
                         for s in range(6):
-                            q0 = cell[s, 0] - _PAL[a, 0]
-                            q1 = cell[s, 1] - _PAL[a, 1]
-                            q2 = cell[s, 2] - _PAL[a, 2]
+                            q0 = clab[s, 0] - _PAL[a, 0]
+                            q1 = clab[s, 1] - _PAL[a, 1]
+                            q2 = clab[s, 2] - _PAL[a, 2]
                             qad = q0 * dx0 + q1 * dx1 + q2 * dx2
                             qa2 = q0 * q0 + q1 * q1 + q2 * q2
                             t = qad / len2
@@ -407,10 +442,12 @@ if _HAVE_NUMBA:
                         bestc = c
                         ba = a
                         bb = b
-                # dither chosen segment + canonicalise glyph
-                dx0 = _PAL[bb, 0] - _PAL[ba, 0]
-                dx1 = _PAL[bb, 1] - _PAL[ba, 1]
-                dx2 = _PAL[bb, 2] - _PAL[ba, 2]
+                # dither chosen segment in LINEAR light (per-sub-pixel linear value
+                # from _LIN1D) — where the eye averages the sub-pixels — then
+                # canonicalise the glyph.  Pair was chosen in OKLab above.
+                dx0 = _LIN_PAL[bb, 0] - _LIN_PAL[ba, 0]
+                dx1 = _LIN_PAL[bb, 1] - _LIN_PAL[ba, 1]
+                dx2 = _LIN_PAL[bb, 2] - _LIN_PAL[ba, 2]
                 len2 = dx0 * dx0 + dx1 * dx1 + dx2 * dx2
                 mask = 0
                 invert = False
@@ -418,9 +455,9 @@ if _HAVE_NUMBA:
                     if len2 < 1e-12:
                         t = 0.0
                     else:
-                        q0 = cell[s, 0] - _PAL[ba, 0]
-                        q1 = cell[s, 1] - _PAL[ba, 1]
-                        q2 = cell[s, 2] - _PAL[ba, 2]
+                        q0 = _LIN1D[idx[y, x, s, 0]] - _LIN_PAL[ba, 0]
+                        q1 = _LIN1D[idx[y, x, s, 1]] - _LIN_PAL[ba, 1]
+                        q2 = _LIN1D[idx[y, x, s, 2]] - _LIN_PAL[ba, 2]
                         t = (q0 * dx0 + q1 * dx1 + q2 * dx2) / len2
                         if t < 0.0:
                             t = 0.0
@@ -442,12 +479,12 @@ if _HAVE_NUMBA:
                     bg[y, x] = ba
                     glyph[y, x] = np.uint8(0x80 + mask)
 
-    def _encode_numba(lab, h, w):
-        lab = np.ascontiguousarray(lab, dtype=np.float32)
+    def _encode_numba(idx, h, w):
+        idx = np.ascontiguousarray(idx, dtype=np.uint8)
         glyph = np.empty((h, w), np.uint8)
         fg = np.empty((h, w), np.int64)
         bg = np.empty((h, w), np.int64)
-        _encode_kernel(lab, glyph, fg, bg)
+        _encode_kernel(idx, _OKLAB_LUT, glyph, fg, bg)
         return glyph, fg, bg
 
     _encode_core = _encode_numba
@@ -458,8 +495,8 @@ else:                                        # pragma: no cover - numba present 
 def encode_frame(frame_rgb: np.ndarray) -> bytes:
     """Encode a (H*3) x (W*2) x 3 RGB frame into the blit wire format (see
     _assemble).  Uses the compiled numba core, falling back to pure numpy."""
-    lab, h, w = _prepare(frame_rgb)
-    glyph, fg, bg = _encode_core(lab, h, w)
+    idx, h, w = _prepare(frame_rgb)
+    glyph, fg, bg = _encode_core(idx, h, w)
     return _assemble(glyph, fg, bg, h, w)
 
 
