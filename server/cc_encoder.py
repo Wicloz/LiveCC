@@ -54,6 +54,15 @@ import struct
 
 import numpy as np
 
+# numba compiles the per-cell encode kernel AND the Wu palette box loop (both below).
+# It's a normal prod dependency; the pure-numpy paths are kept only as a safety-net
+# fallback when it isn't importable.
+try:
+    from numba import njit
+    _HAVE_NUMBA = True
+except ImportError:                          # pragma: no cover - numba is a prod dep
+    _HAVE_NUMBA = False
+
 # RGB of CC Tweaked's default palette, indexed 0..15 -> blit chars '0'..'f'.
 _CC_RGB = np.array([
     (240, 240, 240),  # 0  white
@@ -128,6 +137,18 @@ _PAL = _srgb_to_oklab(_CC_RGB)                                  # (16, 3)
 # table small (64³·3 floats ≈ 3 MB) while preserving the discrimination the pair
 # search needs.  Buckets are reconstructed at their CENTRE (not floor) so the
 # >>_SHIFT lookup is unbiased.
+#
+# Shrinking this LUT to fit L2 was measured and NOT worth it: in the compiled kernel
+# the per-sub-pixel gather is ~1.5% of the per-cell cost (the cell sweep is compute-
+# bound on the 12-pair scoring, not memory-bound on the LUT — the "memory-bound" note
+# elsewhere is about the NumPy reference's temporaries, which the kernel avoids).
+# 3 MB→48 KB (4-bit) saved only ~0.3 ms/frame, and dropping below 6 bits coarsens the
+# pair search.  float16 can't shrink it: numba's CPU target (0.65.1) raises
+# NotImplementedError even READING a float16 array element (fp16 is CUDA-only, numba
+# #4402).  An int16 fixed-point LUT (1.5 MB, same idea) IS valid numba but measured
+# ~25-40% SLOWER on the gather — the per-read int16->float32 convert costs more than
+# the smaller table saves, since the access is compute- not memory-bound.  So 6-bit
+# float32 stays.
 _BITS_PER_CHANNEL = 6
 _SHIFT = 8 - _BITS_PER_CHANNEL
 
@@ -311,12 +332,12 @@ def _wu_moments(frame_rgb: np.ndarray):
     return tuple(integral(a) for a in raw)
 
 
-def generate_palette(frame_rgb: np.ndarray, ncolors: int = 16) -> np.ndarray:
-    """Pick `ncolors` colours adapted to one RGB frame via Wu's quantiser ->
-    (ncolors,3) uint8 RGB.  Pads by repetition if the frame has fewer than `ncolors`
-    distinct colour clusters."""
-    wt, mr, mg, mb, m2 = _wu_moments(frame_rgb)
-    L = _WU_LEVELS
+def _wu_box_means_numpy(wt, mr, mg, mb, m2, ncolors):
+    """Wu box-split loop (reference / numba fallback): grow to `ncolors` boxes, each
+    split where it most reduces within-box variance, and return their weighted means
+    -> (ncolors,3) float (padded by repetition if fewer clusters than `ncolors`).
+    The numba version `_wu_box_means_numba` is a line-for-line port of this."""
+    L = wt.shape[0] - 1
 
     def vol(t, x):                            # moment of box x = (r0,r1,g0,g1,b0,b1)
         r0, r1, g0, g1, b0, b1 = x
@@ -341,8 +362,6 @@ def generate_palette(frame_rgb: np.ndarray, ncolors: int = 16) -> np.ndarray:
         return t[r1, g1, s] - t[r1, g0, s] - t[r0, g1, s] + t[r0, g0, s]
 
     def maximize(x, d, lo, hi, ww, wr, wg, wb):
-        """Best cut plane for box x along axis d: the one maximising the between-box
-        sum of (Σ‖m‖²/count), i.e. minimising within-box variance.  -> (score, plane)."""
         if lo >= hi:
             return -1.0, -1
         hw = bottom(wt, x, d) + top(wt, x, d, lo, hi)
@@ -403,7 +422,178 @@ def generate_palette(frame_rgb: np.ndarray, ncolors: int = 16) -> np.ndarray:
             pal.append([vol(mr, x) / ww, vol(mg, x) / ww, vol(mb, x) / ww])
     while len(pal) < ncolors:                  # pad if fewer clusters than the palette
         pal.append(pal[-1] if pal else [0.0, 0.0, 0.0])
-    return np.clip(np.round(np.array(pal[:ncolors])), 0, 255).astype(np.uint8)
+    return np.array(pal[:ncolors], dtype=np.float64)
+
+
+if _HAVE_NUMBA:
+    # Compiled port of the box loop above.  The integral build (_wu_moments) stays
+    # numpy (bincount + cumsum), but the box loop is sequential Python over tiny numpy
+    # micro-ops — ~half the palette time on big monitors.  Compiling it to scalar code
+    # (the integral tables passed in, indexed directly) removes that floor.  No
+    # fastmath: the box decisions are exact float64 sums/divides, so this matches the
+    # numpy reference (a parity test asserts it), and the box loop isn't FLOP-bound.
+    @njit(cache=True)
+    def _wu_vol(t, r0, r1, g0, g1, b0, b1):   # moment of a box (8-corner inclusion-excl.)
+        return (t[r1, g1, b1] - t[r1, g1, b0] - t[r1, g0, b1] + t[r1, g0, b0]
+                - t[r0, g1, b1] + t[r0, g1, b0] + t[r0, g0, b1] - t[r0, g0, b0])
+
+    @njit(cache=True)
+    def _wu_var(wt, mr, mg, mb, m2, r0, r1, g0, g1, b0, b1):
+        ww = _wu_vol(wt, r0, r1, g0, g1, b0, b1)
+        if ww <= 1.0:
+            return 0.0
+        dr = _wu_vol(mr, r0, r1, g0, g1, b0, b1)
+        dg = _wu_vol(mg, r0, r1, g0, g1, b0, b1)
+        db = _wu_vol(mb, r0, r1, g0, g1, b0, b1)
+        return _wu_vol(m2, r0, r1, g0, g1, b0, b1) - (dr * dr + dg * dg + db * db) / ww
+
+    @njit(cache=True)
+    def _wu_maximize(wt, mr, mg, mb, r0, r1, g0, g1, b0, b1, d, ww, wr, wg, wb):
+        """Best cut plane for the box along axis d (0=R,1=G,2=B): maximises the
+        between-box Σ(‖m‖²/count), i.e. minimises within-box variance.  -> (score,
+        plane); (-1,-1) if there's no valid split."""
+        if d == 0:
+            lo, hi = r0 + 1, r1
+        elif d == 1:
+            lo, hi = g0 + 1, g1
+        else:
+            lo, hi = b0 + 1, b1
+        if lo >= hi:
+            return -1.0, -1
+        # bottom: the part of each half-box moment fixed by the box's low face
+        if d == 0:
+            bw = -wt[r0, g1, b1] + wt[r0, g1, b0] + wt[r0, g0, b1] - wt[r0, g0, b0]
+            br = -mr[r0, g1, b1] + mr[r0, g1, b0] + mr[r0, g0, b1] - mr[r0, g0, b0]
+            bg = -mg[r0, g1, b1] + mg[r0, g1, b0] + mg[r0, g0, b1] - mg[r0, g0, b0]
+            bb = -mb[r0, g1, b1] + mb[r0, g1, b0] + mb[r0, g0, b1] - mb[r0, g0, b0]
+        elif d == 1:
+            bw = -wt[r1, g0, b1] + wt[r1, g0, b0] + wt[r0, g0, b1] - wt[r0, g0, b0]
+            br = -mr[r1, g0, b1] + mr[r1, g0, b0] + mr[r0, g0, b1] - mr[r0, g0, b0]
+            bg = -mg[r1, g0, b1] + mg[r1, g0, b0] + mg[r0, g0, b1] - mg[r0, g0, b0]
+            bb = -mb[r1, g0, b1] + mb[r1, g0, b0] + mb[r0, g0, b1] - mb[r0, g0, b0]
+        else:
+            bw = -wt[r1, g1, b0] + wt[r1, g0, b0] + wt[r0, g1, b0] - wt[r0, g0, b0]
+            br = -mr[r1, g1, b0] + mr[r1, g0, b0] + mr[r0, g1, b0] - mr[r0, g0, b0]
+            bg = -mg[r1, g1, b0] + mg[r1, g0, b0] + mg[r0, g1, b0] - mg[r0, g0, b0]
+            bb = -mb[r1, g1, b0] + mb[r1, g0, b0] + mb[r0, g1, b0] - mb[r0, g0, b0]
+        best = 0.0
+        cut = -1
+        for i in range(lo, hi):
+            if d == 0:
+                tw = wt[i, g1, b1] - wt[i, g1, b0] - wt[i, g0, b1] + wt[i, g0, b0]
+                tr = mr[i, g1, b1] - mr[i, g1, b0] - mr[i, g0, b1] + mr[i, g0, b0]
+                tg = mg[i, g1, b1] - mg[i, g1, b0] - mg[i, g0, b1] + mg[i, g0, b0]
+                tb = mb[i, g1, b1] - mb[i, g1, b0] - mb[i, g0, b1] + mb[i, g0, b0]
+            elif d == 1:
+                tw = wt[r1, i, b1] - wt[r1, i, b0] - wt[r0, i, b1] + wt[r0, i, b0]
+                tr = mr[r1, i, b1] - mr[r1, i, b0] - mr[r0, i, b1] + mr[r0, i, b0]
+                tg = mg[r1, i, b1] - mg[r1, i, b0] - mg[r0, i, b1] + mg[r0, i, b0]
+                tb = mb[r1, i, b1] - mb[r1, i, b0] - mb[r0, i, b1] + mb[r0, i, b0]
+            else:
+                tw = wt[r1, g1, i] - wt[r1, g0, i] - wt[r0, g1, i] + wt[r0, g0, i]
+                tr = mr[r1, g1, i] - mr[r1, g0, i] - mr[r0, g1, i] + mr[r0, g0, i]
+                tg = mg[r1, g1, i] - mg[r1, g0, i] - mg[r0, g1, i] + mg[r0, g0, i]
+                tb = mb[r1, g1, i] - mb[r1, g0, i] - mb[r0, g1, i] + mb[r0, g0, i]
+            hw = bw + tw
+            if hw <= 0.0:
+                continue
+            ow = ww - hw
+            if ow <= 0.0:
+                continue
+            hr = br + tr
+            hg = bg + tg
+            hb = bb + tb
+            orr = wr - hr
+            og = wg - hg
+            ob = wb - hb
+            temp = (hr * hr + hg * hg + hb * hb) / hw + (orr * orr + og * og + ob * ob) / ow
+            if temp > best:
+                best = temp
+                cut = i
+        if cut < 0:
+            return -1.0, -1
+        return best, cut
+
+    @njit(cache=True)
+    def _wu_box_means_numba(wt, mr, mg, mb, m2, ncolors):
+        L = wt.shape[0] - 1
+        boxes = np.zeros((ncolors, 6), np.int64)
+        vv = np.empty(ncolors, np.float64)
+        boxes[0, 1] = L
+        boxes[0, 3] = L
+        boxes[0, 5] = L                       # box 0 = [0,L, 0,L, 0,L]
+        vv[0] = _wu_var(wt, mr, mg, mb, m2, 0, L, 0, L, 0, L)
+        nbox = 1
+        nxt = 0
+        while nbox < ncolors:
+            r0 = boxes[nxt, 0]; r1 = boxes[nxt, 1]
+            g0 = boxes[nxt, 2]; g1 = boxes[nxt, 3]
+            b0 = boxes[nxt, 4]; b1 = boxes[nxt, 5]
+            ww = _wu_vol(wt, r0, r1, g0, g1, b0, b1)
+            wr = _wu_vol(mr, r0, r1, g0, g1, b0, b1)
+            wg = _wu_vol(mg, r0, r1, g0, g1, b0, b1)
+            wb = _wu_vol(mb, r0, r1, g0, g1, b0, b1)
+            sr, cr = _wu_maximize(wt, mr, mg, mb, r0, r1, g0, g1, b0, b1, 0, ww, wr, wg, wb)
+            sg, cg = _wu_maximize(wt, mr, mg, mb, r0, r1, g0, g1, b0, b1, 1, ww, wr, wg, wb)
+            sb, cb = _wu_maximize(wt, mr, mg, mb, r0, r1, g0, g1, b0, b1, 2, ww, wr, wg, wb)
+            if sr >= sg and sr >= sb:
+                d, c = 0, cr
+            elif sg >= sb:
+                d, c = 1, cg
+            else:
+                d, c = 2, cb
+            if c < 0:
+                vv[nxt] = -1.0                 # unsplittable: never pick it again
+            else:
+                for k in range(6):
+                    boxes[nbox, k] = boxes[nxt, k]
+                boxes[nxt, 2 * d + 1] = c      # nxt -> [lo, c]
+                boxes[nbox, 2 * d] = c         # new -> [c, hi]
+                vv[nxt] = _wu_var(wt, mr, mg, mb, m2, boxes[nxt, 0], boxes[nxt, 1],
+                                  boxes[nxt, 2], boxes[nxt, 3], boxes[nxt, 4], boxes[nxt, 5])
+                vv[nbox] = _wu_var(wt, mr, mg, mb, m2, boxes[nbox, 0], boxes[nbox, 1],
+                                   boxes[nbox, 2], boxes[nbox, 3], boxes[nbox, 4], boxes[nbox, 5])
+                nbox += 1
+            nxt = 0
+            best = vv[0]
+            for i in range(1, nbox):
+                if vv[i] > best:
+                    best = vv[i]
+                    nxt = i
+            if best <= 0.0:                    # no box left worth splitting
+                break
+
+        out = np.zeros((ncolors, 3), np.float64)
+        c0 = 0.0
+        c1 = 0.0
+        c2 = 0.0
+        for i in range(ncolors):
+            if i < nbox:
+                r0 = boxes[i, 0]; r1 = boxes[i, 1]
+                g0 = boxes[i, 2]; g1 = boxes[i, 3]
+                b0 = boxes[i, 4]; b1 = boxes[i, 5]
+                ww = _wu_vol(wt, r0, r1, g0, g1, b0, b1)
+                if ww > 0.0:
+                    c0 = _wu_vol(mr, r0, r1, g0, g1, b0, b1) / ww
+                    c1 = _wu_vol(mg, r0, r1, g0, g1, b0, b1) / ww
+                    c2 = _wu_vol(mb, r0, r1, g0, g1, b0, b1) / ww
+            out[i, 0] = c0                     # pad slots (i >= nbox) repeat the last
+            out[i, 1] = c1
+            out[i, 2] = c2
+        return out
+
+    _wu_box_means = _wu_box_means_numba
+else:                                        # pragma: no cover - numba present in prod
+    _wu_box_means = _wu_box_means_numpy
+
+
+def generate_palette(frame_rgb: np.ndarray, ncolors: int = 16) -> np.ndarray:
+    """Pick `ncolors` colours adapted to one RGB frame via Wu's quantiser ->
+    (ncolors,3) uint8 RGB.  Pads by repetition if the frame has fewer than `ncolors`
+    distinct colour clusters."""
+    wt, mr, mg, mb, m2 = _wu_moments(frame_rgb)
+    means = _wu_box_means(wt, mr, mg, mb, m2, ncolors)
+    return np.clip(np.round(means), 0, 255).astype(np.uint8)
 
 
 def _palette_tables(pal_rgb: np.ndarray):
@@ -582,14 +772,7 @@ def _encode_numpy(idx, h, w, pal=_PAL, pal2=_PAL2, lin_pal=_LIN_PAL, dot=_DOT):
 # temporaries is ~6x the NumPy core single-threaded (see benchmarks/bench_native).
 # Kept single-threaded by request; the loop is per-cell independent so a parallel
 # prange is a drop-in later if needed.  Falls back to _encode_numpy if numba isn't
-# importable (it's a normal pip dependency, so that's only a safety net).
-try:
-    from numba import njit
-    _HAVE_NUMBA = True
-except ImportError:                          # pragma: no cover - numba is a prod dep
-    _HAVE_NUMBA = False
-
-
+# importable (numba/_HAVE_NUMBA are set up at the top of the module).
 if _HAVE_NUMBA:
     @njit(cache=True, fastmath=True)
     def _ign_scalar(x, y):                   # scalar Interleaved Gradient Noise
