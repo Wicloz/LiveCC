@@ -186,6 +186,11 @@ _DITHER_WEIGHT = np.float32(0.25)
 # well under 1% on real video (corners alone catch the cell's colour extremes; a
 # feature confined to the middle row only is both rare and usually picked up by
 # the mean's top-4), at a third less work than scoring all sub-pixel pairs.
+#
+# (A PCA "range-fit" edge pair — the cell's principal colour axis, à la DXT/BC1 —
+# was tried as a leaner replacement for the 6 corner combos, but this near-exhaustive
+# search already beats it: a single axis pair gave up ~0.1-0.7 ΔE on real media for
+# no measurable speed win, so corners stay.)
 _CORNERS = np.array([0, 1, 4, 5], dtype=np.int64)   # top-L, top-R, bot-L, bot-R
 _EII, _EJJ = (a.astype(np.int64) for a in np.triu_indices(4, k=1))   # (6,) corner pairs
 _MII, _MJJ = (a.astype(np.int64) for a in np.triu_indices(4, k=1))   # (6,) mean top-4
@@ -230,92 +235,154 @@ _PALETTE_BYTES = _CC_RGB.astype(np.uint8).tobytes()
 
 
 # --------------------------------------------------------------------------- #
-# Adaptive per-frame palette (sanjuuni's signature feature)
+# Adaptive per-frame palette — Wu's variance-minimising quantiser
 # --------------------------------------------------------------------------- #
 # Instead of CC's fixed 16 colours we pick 16 colours *per frame* from the frame's
 # own content, and the client applies them via setPaletteColour (the 32vid frame
 # already carries a 48-byte palette block, so this costs no extra bandwidth on the
-# uncompressed stream).  Median cut is sanjuuni's default and what we mirror here:
-# recursively split the colour cloud along its widest axis at the (population-
-# weighted) median, then take each leaf box's mean as a palette entry.
+# uncompressed stream).  The encoder's perceptual OKLab matching then maps each cell
+# onto whatever 16 colours come out.
 #
-# Done in sRGB (gamma) space like sanjuuni — simple, robust, and the encoder's
-# perceptual OKLab matching then maps each cell onto whatever 16 colours come out.
-# Colours are first collapsed to the 6-bit-per-channel buckets the encoder already
-# works in (a bincount histogram), so the median cut runs over a small set of
-# weighted unique colours rather than every pixel — cheap and frame-to-frame stable
-# (no subsampling jitter).
+# Algorithm: Xiaolin Wu's greedy orthogonal bipartition (1992) — the variance-
+# minimising quantiser.  It builds one 3D colour histogram, accumulates the moments
+# (count, ΣR ΣG ΣB, Σ(R²+G²+B²)) into 3D cumulative ("integral") tables, then
+# repeatedly splits the box whose split most reduces total within-box variance,
+# choosing the cut plane by inclusion-exclusion over the integral tables — NO per-
+# split sort over pixels.  This beats median cut on distortion AND is cheaper on big
+# frames (the cost is the one histogram pass; the box loop is ~2·ncolors tiny steps),
+# which is what we need now that monitors go up to 16x9 blocks (≈250k sub-pixels).
+# Each leaf's representative colour is its mean of the *full-resolution* pixel values
+# (the moments accumulate true R/G/B, not bin centres), so the 5-bit histogram only
+# limits where cut planes land, not the palette's colour precision.
 #
-# Temporal stability: this is per-frame with no smoothing.  Median cut over the
-# whole-frame histogram is stable on similar consecutive frames; if a clip ever
-# shows palette flicker, the fix is to EMA-smooth the palette across frames (needs
-# per-stream state, so it'd move encode_frame behind a small stateful encoder) or
-# recompute only per scene.  Started simple per the plan; revisit via render_cc.
+# Temporal stability: per-frame, no smoothing.  Wu over the whole-frame histogram is
+# stable on similar consecutive frames; if a clip ever flickers, the fix is to EMA-
+# smooth the palette across frames (needs per-stream state) or recompute per scene.
 
-def _box(levels: np.ndarray, weights: np.ndarray):
-    """A median-cut box: (levels, weights, split-axis, score).  `levels` is (3, M)
-    integer per-channel bucket indices — CHANNELS-FIRST so the per-channel min/max
-    reductions run along the contiguous axis (axis 0 of an (M,3) layout is strided
-    and far slower on a large colour cloud).  The widest channel and the population-
-    weighted spread along it are computed ONCE here — the split loop then just picks
-    the max-score box without rescanning.  score < 0 marks an unsplittable colour."""
-    if levels.shape[1] < 2:
-        return (levels, weights, 0, -1.0)
-    rng = levels.max(1) - levels.min(1)
-    ax = int(rng.argmax())
-    return (levels, weights, ax, float(rng[ax]) * float(weights.sum()))
+_WU_BITS = 5                                  # histogram resolution (Wu's classic)
+_WU_LEVELS = 1 << _WU_BITS                    # 32 bins / channel
+_WU_SIDE = _WU_LEVELS + 1                     # 33: index 0 is the integral-table base
 
 
-def _median_cut(levels: np.ndarray, weights: np.ndarray, ncolors: int) -> np.ndarray:
-    """Median-cut `levels` (3, M int bucket indices) weighted by `weights` (M,) into
-    `ncolors` representative colours -> (ncolors,3) float bucket-index means.  Splits
-    the box with the largest population-weighted spread along its widest channel at
-    the weighted-median level; each leaf's weighted mean is its colour.  Pads by
-    repetition if there are fewer distinct colours than `ncolors`.
+def _wu_moments(frame_rgb: np.ndarray):
+    """Frame -> the five 3D cumulative moment tables (count, ΣR, ΣG, ΣB, Σ‖rgb‖²),
+    each (33,33,33).  `tbl[r,g,b]` is the moment summed over all histogram bins with
+    red≤r, green≤g, blue≤b (bins are 1-indexed; plane 0 is zero), so the moment over
+    any box is 8 corner lookups (inclusion-exclusion)."""
+    # int32 throughout (idx<=32767, R²+G²+B²<=195075 both fit) — no float copies of
+    # the whole frame; bincount casts the integer weights to float internally.
+    px = np.asarray(frame_rgb, dtype=np.int32).reshape(-1, 3)
+    r, g, b = px[:, 0], px[:, 1], px[:, 2]
+    sh = 8 - _WU_BITS
+    idx = ((r >> sh) * _WU_LEVELS + (g >> sh)) * _WU_LEVELS + (b >> sh)
+    n = _WU_LEVELS ** 3
+    raw = (np.bincount(idx, minlength=n),
+           np.bincount(idx, weights=r, minlength=n),
+           np.bincount(idx, weights=g, minlength=n),
+           np.bincount(idx, weights=b, minlength=n),
+           np.bincount(idx, weights=r * r + g * g + b * b, minlength=n))
 
-    The split is a weighted histogram over the (≤64) levels on the chosen axis, not a
-    sort — O(box size) per split, so it stays cheap even on near-random frames where
-    the colour cloud is large."""
-    boxes = [_box(levels, weights)]
-    while len(boxes) < ncolors:
-        bi = max(range(len(boxes)), key=lambda i: boxes[i][3])
-        if boxes[bi][3] < 0.0:                 # nothing left to split
-            break
-        c, w, ax, _ = boxes.pop(bi)
-        vals = c[ax]
-        cum = np.cumsum(np.bincount(vals, weights=w))   # weight up to each level
-        m = int(np.searchsorted(cum, cum[-1] * 0.5))    # weighted-median level
-        m = min(max(m, int(vals.min())), int(vals.max()) - 1)   # keep both halves
-        mask = vals <= m
-        boxes.append(_box(c[:, mask], w[mask]))
-        boxes.append(_box(c[:, ~mask], w[~mask]))
-    pal = np.empty((ncolors, 3), np.float64)
-    for i in range(ncolors):
-        if i < len(boxes):
-            c, w, _, _ = boxes[i]
-            pal[i] = (c * w).sum(1) / w.sum()
-        else:
-            pal[i] = pal[i - 1]                # fewer colours than the palette holds
-    return pal
+    def integral(a):
+        t = np.zeros((_WU_SIDE, _WU_SIDE, _WU_SIDE), np.float64)
+        t[1:, 1:, 1:] = a.astype(np.float64).reshape(_WU_LEVELS, _WU_LEVELS, _WU_LEVELS)
+        return t.cumsum(0).cumsum(1).cumsum(2)
+
+    return tuple(integral(a) for a in raw)
 
 
 def generate_palette(frame_rgb: np.ndarray, ncolors: int = 16) -> np.ndarray:
-    """Pick `ncolors` colours adapted to one RGB frame via median cut -> (ncolors,3)
-    uint8 RGB.  Histograms the frame into 6-bit-per-channel buckets first (the same
-    precision the encoder quantises to), so the cut runs over weighted unique
-    colours."""
-    px = np.asarray(frame_rgb, dtype=np.uint8).reshape(-1, 3)
-    nlev = 1 << _BITS_PER_CHANNEL
-    q = (px >> _SHIFT).astype(np.int64)                       # 6-bit channels, 0..63
-    keys = (q[:, 0] * nlev + q[:, 1]) * nlev + q[:, 2]
-    counts = np.bincount(keys, minlength=nlev ** 3)
-    nz = np.nonzero(counts)[0]
-    w = counts[nz].astype(np.float64)
-    levels = np.stack([nz // (nlev * nlev), (nz // nlev) % nlev, nz % nlev], axis=0)
-    means = _median_cut(levels.astype(np.int64), w, ncolors)  # (16,3) mean bucket idx
-    step = 1 << _SHIFT
-    rgb = means * step + (step - 1) / 2.0                     # bucket index -> 0..255
-    return np.clip(np.round(rgb), 0, 255).astype(np.uint8)
+    """Pick `ncolors` colours adapted to one RGB frame via Wu's quantiser ->
+    (ncolors,3) uint8 RGB.  Pads by repetition if the frame has fewer than `ncolors`
+    distinct colour clusters."""
+    wt, mr, mg, mb, m2 = _wu_moments(frame_rgb)
+    L = _WU_LEVELS
+
+    def vol(t, x):                            # moment of box x = (r0,r1,g0,g1,b0,b1)
+        r0, r1, g0, g1, b0, b1 = x
+        return (t[r1, g1, b1] - t[r1, g1, b0] - t[r1, g0, b1] + t[r1, g0, b0]
+                - t[r0, g1, b1] + t[r0, g1, b0] + t[r0, g0, b1] - t[r0, g0, b0])
+
+    def bottom(t, x, d):                      # part of vol fixed by the box's low face
+        r0, r1, g0, g1, b0, b1 = x
+        if d == 0:
+            return -t[r0, g1, b1] + t[r0, g1, b0] + t[r0, g0, b1] - t[r0, g0, b0]
+        if d == 1:
+            return -t[r1, g0, b1] + t[r1, g0, b0] + t[r0, g0, b1] - t[r0, g0, b0]
+        return -t[r1, g1, b0] + t[r1, g0, b0] + t[r0, g1, b0] - t[r0, g0, b0]
+
+    def top(t, x, d, lo, hi):                 # vector of vol up to each plane in [lo,hi)
+        r0, r1, g0, g1, b0, b1 = x
+        s = slice(lo, hi)
+        if d == 0:
+            return t[s, g1, b1] - t[s, g1, b0] - t[s, g0, b1] + t[s, g0, b0]
+        if d == 1:
+            return t[r1, s, b1] - t[r1, s, b0] - t[r0, s, b1] + t[r0, s, b0]
+        return t[r1, g1, s] - t[r1, g0, s] - t[r0, g1, s] + t[r0, g0, s]
+
+    def maximize(x, d, lo, hi, ww, wr, wg, wb):
+        """Best cut plane for box x along axis d: the one maximising the between-box
+        sum of (Σ‖m‖²/count), i.e. minimising within-box variance.  -> (score, plane)."""
+        if lo >= hi:
+            return -1.0, -1
+        hw = bottom(wt, x, d) + top(wt, x, d, lo, hi)
+        hr = bottom(mr, x, d) + top(mr, x, d, lo, hi)
+        hg = bottom(mg, x, d) + top(mg, x, d, lo, hi)
+        hb = bottom(mb, x, d) + top(mb, x, d, lo, hi)
+        ow, orr, og, ob = ww - hw, wr - hr, wg - hg, wb - hb
+        valid = (hw > 0) & (ow > 0)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            obj = (hr * hr + hg * hg + hb * hb) / hw + (orr * orr + og * og + ob * ob) / ow
+        obj = np.where(valid, obj, -1.0)
+        j = int(np.argmax(obj))
+        return (float(obj[j]), lo + j) if obj[j] > 0.0 else (-1.0, -1)
+
+    def cut(x):                               # split box x in place; return the new box
+        ww, wr, wg, wb = (vol(t, x) for t in (wt, mr, mg, mb))
+        sr, cr = maximize(x, 0, x[0] + 1, x[1], ww, wr, wg, wb)
+        sg, cg = maximize(x, 1, x[2] + 1, x[3], ww, wr, wg, wb)
+        sb, cb = maximize(x, 2, x[4] + 1, x[5], ww, wr, wg, wb)
+        if sr >= sg and sr >= sb:
+            d, c = 0, cr
+        elif sg >= sb:
+            d, c = 1, cg
+        else:
+            d, c = 2, cb
+        if c < 0:
+            return None
+        new = list(x)
+        x[2 * d + 1], new[2 * d] = c, c       # x -> [lo, c], new -> [c, hi]
+        return new
+
+    def variance(x):
+        ww = vol(wt, x)
+        if ww <= 1:
+            return 0.0
+        dr, dg, db = vol(mr, x), vol(mg, x), vol(mb, x)
+        return float(vol(m2, x) - (dr * dr + dg * dg + db * db) / ww)
+
+    boxes = [[0, L, 0, L, 0, L]]              # one box over the whole colour cube
+    vv = [variance(boxes[0])]
+    nxt = 0
+    while len(boxes) < ncolors:
+        new = cut(boxes[nxt])
+        if new is not None:
+            boxes.append(new)
+            vv[nxt] = variance(boxes[nxt])
+            vv.append(variance(new))
+        else:
+            vv[nxt] = -1.0                     # unsplittable: never pick it again
+        nxt = int(np.argmax(vv))
+        if vv[nxt] <= 0.0:                     # no box left worth splitting
+            break
+
+    pal = []
+    for x in boxes:
+        ww = vol(wt, x)
+        if ww > 0:
+            pal.append([vol(mr, x) / ww, vol(mg, x) / ww, vol(mb, x) / ww])
+    while len(pal) < ncolors:                  # pad if fewer clusters than the palette
+        pal.append(pal[-1] if pal else [0.0, 0.0, 0.0])
+    return np.clip(np.round(np.array(pal[:ncolors])), 0, 255).astype(np.uint8)
 
 
 def _palette_tables(pal_rgb: np.ndarray):
