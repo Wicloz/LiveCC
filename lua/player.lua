@@ -123,6 +123,16 @@ if mon.setTextScale then mon.setTextScale(CRUNCHY and 1.0 or 0.5) end
 mon.setCursorBlink(false)            -- no blinking cursor in the corner
 local TERM_W, TERM_H = mon.getSize()
 
+-- Draw everything through a buffered window so each frame's palette change AND its
+-- cell blits reach the monitor in ONE redraw (setVisible(false) -> draw ->
+-- setVisible(true) flushes the window's palette and contents together).  The
+-- adaptive per-frame palette calls setPaletteColour for all 16 entries every frame;
+-- applied straight to the monitor that instantly recolours the PREVIOUS frame still
+-- on screen, so if a monitor refresh lands between the palette change and the
+-- row-by-row blit a ghost of the old frame flashes in the new frame's palette (often
+-- near-monochrome or inverted) — the flicker/tearing.  Buffering makes it atomic.
+local screen = window.create(mon, 1, 1, TERM_W, TERM_H, true)
+
 -- One physical speaker can be reachable under two names (e.g. adjacent AND via
 -- a wired modem).  Driving it twice plays every audio segment twice.  Two wraps
 -- of the same speaker share one audio buffer, so we detect duplicates: fill one
@@ -272,14 +282,18 @@ local function render_frame(data, W, H)
         bg[i] = HEXB[floor(cb / 16)]
     end
 
-    -- 3. palette: apply only when it differs from the last frame's (cheap no-op for
-    --    a fixed palette; ready for a future adaptive per-frame palette).
+    -- Buffer the palette change and the blits, then flush them in one redraw so the
+    -- monitor never shows the old frame recoloured by the new palette (see `screen`).
+    screen.setVisible(false)
+
+    -- 3. palette: apply only when it differs from the last frame's (a no-op for a
+    --    fixed palette; changes every frame for the adaptive per-frame palette).
     local palette = data:sub(p, p + 47)
     if palette ~= last_palette then
-        if mon.setPaletteColour then
+        if screen.setPaletteColour then
             for i = 0, 15 do
                 local o = p + i * 3
-                mon.setPaletteColour(2 ^ i, data:byte(o) / 255,
+                screen.setPaletteColour(2 ^ i, data:byte(o) / 255,
                     data:byte(o + 1) / 255, data:byte(o + 2) / 255)
             end
         end
@@ -289,11 +303,13 @@ local function render_frame(data, W, H)
     -- 4. blit row by row.
     for y = 1, H do
         local base = (y - 1) * W
-        mon.setCursorPos(1, y)
-        mon.blit(string.char(unpack(text, base + 1, base + W)),
-                 string.char(unpack(fg, base + 1, base + W)),
-                 string.char(unpack(bg, base + 1, base + W)))
+        screen.setCursorPos(1, y)
+        screen.blit(string.char(unpack(text, base + 1, base + W)),
+                    string.char(unpack(fg, base + 1, base + W)),
+                    string.char(unpack(bg, base + 1, base + W)))
     end
+
+    screen.setVisible(true)          -- flush: palette + all cells land together
 end
 
 -- Bytes one uncompressed frame occupies in a video chunk.
@@ -338,11 +354,13 @@ end
 -- ── UI ──────────────────────────────────────────────────────────────────────────
 
 local function mon_print(msg)
-    mon.setBackgroundColor(colors.black)
-    mon.setTextColor(colors.white)
-    mon.clear()
-    mon.setCursorPos(1, 1)
-    mon.write(msg)
+    -- Status text shares the buffered `screen` (the visible window covers the whole
+    -- monitor, so writing straight to `mon` would sit behind it and be overwritten).
+    screen.setBackgroundColor(colors.black)
+    screen.setTextColor(colors.white)
+    screen.clear()
+    screen.setCursorPos(1, 1)
+    screen.write(msg)
 end
 
 local errored = false   -- an ERROR was shown; don't overwrite it with "Stream ended"
