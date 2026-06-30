@@ -208,10 +208,16 @@ _DITHER_WEIGHT = np.float32(0.25)
 # feature confined to the middle row only is both rare and usually picked up by
 # the mean's top-4), at a third less work than scoring all sub-pixel pairs.
 #
-# (A PCA "range-fit" edge pair — the cell's principal colour axis, à la DXT/BC1 —
-# was tried as a leaner replacement for the 6 corner combos, but this near-exhaustive
-# search already beats it: a single axis pair gave up ~0.1-0.7 ΔE on real media for
-# no measurable speed win, so corners stay.)
+# PCA "range-fit" edge pairs (BC1/DXT idea) were tried TWICE and rejected both times
+# — see memory note pca-endpoint-rejected:
+#   1. One pair from the raw colours of the two extreme sub-pixels: lost on QUALITY
+#      (gave up diversity for no speed gain).
+#   2. A refined least-squares version (BC1/Castaño-style: mean OKLab of each side at
+#      3 axis splits, not a raw extreme colour) DID win on quality — every real-media
+#      sample improved — but cost 25-46% MORE kernel time (covariance + power
+#      iteration + sort + 6 nearest-palette lookups instead of 4), which loses on this
+#      project's stated priority (a shared, CPU-weak production box).  Reverted again;
+#      see the memory note for the full numbers if revisiting on faster hardware.
 _CORNERS = np.array([0, 1, 4, 5], dtype=np.int64)   # top-L, top-R, bot-L, bot-R
 _EII, _EJJ = (a.astype(np.int64) for a in np.triu_indices(4, k=1))   # (6,) corner pairs
 _MII, _MJJ = (a.astype(np.int64) for a in np.triu_indices(4, k=1))   # (6,) mean top-4
