@@ -30,20 +30,32 @@ PREVIEW_DIR = MEDIA_DIR / "cc_preview"                    # renderer output (git
 # — for block layouts close to 16:9 (monitor blocks are square in-world, so the
 # physical aspect is blocksW:blocksH, and ~16:9 is what players build for video).
 #
+# The monitor block cap is uncapped in our config up to 16x9 blocks, so the larger
+# tiers below are the closest-to-16:9 layout at each block height 6..9 (width =
+# round(h*16/9)), culminating in an exact 16:9 at 16x9 — the new max.
+#
 #   device        blocks  aspect          cells (WxH)
 #   pocket        builtin                 26x20
 #   terminal      builtin                 51x19
 #   mon 4x2       2.00                    79x24
 #   mon 5x3       1.67                    100x38
 #   mon 7x4       1.75  (closest to 16:9) 143x52
-#   mon 8x5       1.60  (near the 8x6 max) 164x67
+#   mon 8x5       1.60                    164x67
+#   mon 11x6      1.83                    228x81
+#   mon 12x7      1.71                    249x95
+#   mon 14x8      1.75                    292x109
+#   mon 16x9      1.78  (exact 16:9, max) 335x124
 GRIDS = [
-    ("pocket   26x20", 26, 20),
-    ("terminal 51x19", 51, 19),
-    ("mon4x2   79x24", 79, 24),
-    ("mon5x3  100x38", 100, 38),
-    ("mon7x4  143x52", 143, 52),
-    ("mon8x5  164x67", 164, 67),
+    ("pocket", 26, 20),
+    ("terminal", 51, 19),
+    ("mon4x2", 79, 24),
+    ("mon5x3", 100, 38),
+    ("mon7x4", 143, 52),
+    ("mon8x5", 164, 67),
+    ("mon11x6", 228, 81),
+    ("mon12x7", 249, 95),
+    ("mon14x8", 292, 109),
+    ("mon16x9", 335, 124),
 ]
 
 
