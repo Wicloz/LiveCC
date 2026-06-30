@@ -252,26 +252,47 @@ _PALETTE_BYTES = _CC_RGB.astype(np.uint8).tobytes()
 # frames (the cost is the one histogram pass; the box loop is ~2·ncolors tiny steps),
 # which is what we need now that monitors go up to 16x9 blocks (≈250k sub-pixels).
 # Each leaf's representative colour is its mean of the *full-resolution* pixel values
-# (the moments accumulate true R/G/B, not bin centres), so the 5-bit histogram only
-# limits where cut planes land, not the palette's colour precision.
+# (the moments accumulate true R/G/B, not bin centres), so the histogram resolution
+# only limits where cut planes land, not the palette's colour precision.
 #
 # Temporal stability: per-frame, no smoothing.  Wu over the whole-frame histogram is
 # stable on similar consecutive frames; if a clip ever flickers, the fix is to EMA-
 # smooth the palette across frames (needs per-stream state) or recompute per scene.
 
-_WU_BITS = 5                                  # histogram resolution (Wu's classic)
-_WU_LEVELS = 1 << _WU_BITS                    # 32 bins / channel
-_WU_SIDE = _WU_LEVELS + 1                     # 33: index 0 is the integral-table base
+# 4-bit (16³) histogram, not Wu's classic 5-bit.  The integral tables and the per-cut
+# plane scan both scale with this, so 4-bit shrinks the integral ~7x and halves the
+# box-loop scan — the floor that dominates palette time once the bincounts are
+# subsampled (below).  It only coarsens CUT-PLANE placement (palette colours stay
+# exact means), so it merely merges colours within 16 RGB of each other — which are
+# near-identical and would share a palette entry anyway.  Measured quality-neutral vs
+# 5-bit (mixed ±, net flat on real media) for a ~4 ms/frame win.
+_WU_BITS = 4
+_WU_LEVELS = 1 << _WU_BITS                    # 16 bins / channel
+_WU_SIDE = _WU_LEVELS + 1                     # 17: index 0 is the integral-table base
+# Cap how many sub-pixels feed the histogram.  The five bincounts scan every sample,
+# so they dominate palette cost on big monitors — but a 16-colour palette is a coarse
+# summary of the colour distribution and doesn't need full sub-pixel resolution.  A
+# regular (strided) subsample to ~this many samples estimates the same distribution
+# (and is temporally stable — the grid is deterministic, unlike random sampling),
+# cutting palette time several-fold on large frames at negligible quality cost.  Any
+# colour feature smaller than the stride is sub-cell and can't render distinctly
+# anyway.  Frames already at/under this are used whole.
+_WU_MAX_SAMPLES = 1 << 14                     # ~16k samples is ample for 16 colours
 
 
 def _wu_moments(frame_rgb: np.ndarray):
     """Frame -> the five 3D cumulative moment tables (count, ΣR, ΣG, ΣB, Σ‖rgb‖²),
-    each (33,33,33).  `tbl[r,g,b]` is the moment summed over all histogram bins with
+    each (_WU_SIDE,)*3.  `tbl[r,g,b]` is the moment summed over all histogram bins with
     red≤r, green≤g, blue≤b (bins are 1-indexed; plane 0 is zero), so the moment over
     any box is 8 corner lookups (inclusion-exclusion)."""
+    arr = np.asarray(frame_rgb)
+    ph, pw = arr.shape[:2]
+    step = int(round((ph * pw / _WU_MAX_SAMPLES) ** 0.5))   # strided subsample if large
+    if step > 1:
+        arr = arr[::step, ::step]
     # int32 throughout (idx<=32767, R²+G²+B²<=195075 both fit) — no float copies of
     # the whole frame; bincount casts the integer weights to float internally.
-    px = np.asarray(frame_rgb, dtype=np.int32).reshape(-1, 3)
+    px = arr.astype(np.int32).reshape(-1, 3)
     r, g, b = px[:, 0], px[:, 1], px[:, 2]
     sh = 8 - _WU_BITS
     idx = ((r >> sh) * _WU_LEVELS + (g >> sh)) * _WU_LEVELS + (b >> sh)
