@@ -2,18 +2,19 @@
 Transcoder fidelity benchmark.
 
 Encodes a frame, decodes the blit wire format back to pixels, and compares to the
-source.  Two PSNRs are reported:
+source.  The headline metric is perceptual:
 
-  * PSNR        — raw per-pixel error.  Dithering deliberately injects
-                  high-frequency noise, which *lowers* this number even though it
-                  removes banding, so read it as a floor, not the whole story.
-  * PSNR 2x2    — after a 2x2 box blur of both images, approximating the eye
-                  integrating neighbouring sub-pixels at viewing distance.  This
-                  is where dithering pays off, so it should beat raw PSNR.
+  * ΔE (S-CIELAB) — mean S-CIELAB colour difference (cc_metrics): CIELAB ΔE after a
+                    human contrast-sensitivity spatial filter, so it scores the
+                    *dithered* output the way the eye integrates neighbouring
+                    sub-pixels.  LOWER is better.  Reported for the adaptive palette
+                    (production default) and the fixed CC palette, to show the win.
+  * PSNR          — raw per-pixel error.  Dithering injects high-frequency noise that
+                    *lowers* this even though it removes banding, so it's a floor, not
+                    the whole story — ΔE is the number to trust.
 
-Also reports the fraction of cells that actually dither (a non-solid glyph).  If
-the media/ folder has samples, a second table runs the same metrics on real
-decoded frames.
+Also reports the fraction of cells that actually dither (a non-solid glyph).  If the
+media/ folder has samples, a second table runs the same metrics on real frames.
 
 Run:  python benchmarks/bench_quality.py
 """
@@ -27,21 +28,12 @@ from harness import (CONTENT, decode_frame, find_media, fmt, have_ffmpeg,
                      sample_frames, section, table)
 
 from cc_encoder import encode_frame
+from cc_metrics import mean_scielab
 
 
 def _psnr(a: np.ndarray, b: np.ndarray) -> float:
     mse = np.mean((a.astype(np.float32) - b.astype(np.float32)) ** 2)
     return float("inf") if mse <= 1e-9 else 10.0 * np.log10(255.0 ** 2 / mse)
-
-
-def _box2(img: np.ndarray) -> np.ndarray:
-    """2x2 box average (crop to even dims) — a cheap stand-in for the eye blending
-    adjacent sub-pixels."""
-    ph, pw, _ = img.shape
-    ph -= ph % 2
-    pw -= pw % 2
-    a = img[:ph, :pw].astype(np.float32).reshape(ph // 2, 2, pw // 2, 2, 3)
-    return a.mean((1, 3))
 
 
 def _dither_fraction(buf: bytes, w: int, h: int) -> float:
@@ -55,22 +47,21 @@ def _row(name: str, frame: np.ndarray) -> list:
     w, h = frame.shape[1] // 2, frame.shape[0] // 3
     buf = encode_frame(frame)                                  # adaptive (default)
     rec = decode_frame(buf, w, h)
-    # Same metric with the fixed CC palette, to show the adaptive-palette win.
-    fixed = decode_frame(encode_frame(frame, adaptive=False), w, h)
+    fixed = decode_frame(encode_frame(frame, adaptive=False), w, h)   # fixed palette
     return [
         name,
+        fmt(mean_scielab(frame, rec), 2),                      # ΔE adaptive (lower=better)
+        fmt(mean_scielab(frame, fixed), 2),                    # ΔE fixed palette
         fmt(_psnr(frame, rec), 1),
-        fmt(_psnr(_box2(frame), _box2(rec)), 1),
-        fmt(_psnr(_box2(frame), _box2(fixed)), 1),
         fmt(_dither_fraction(buf, w, h) * 100, 0) + "%",
     ]
 
 
-_HEADERS = ["content", "PSNR dB", "PSNR 2x2 dB", "2x2 fixed", "cells dithered"]
+_HEADERS = ["content", "dE adapt", "dE fixed", "PSNR dB", "cells dithered"]
 
 
 def synthetic(w: int = 82, h: int = 41) -> None:
-    section(f"Synthetic content  (grid {w}x{h}; higher PSNR = closer to source)")
+    section(f"Synthetic content  (grid {w}x{h}; lower dE = closer to source)")
     print(table(_HEADERS, [_row(name, gen(w, h)) for name, gen in CONTENT.items()]))
 
 
@@ -83,14 +74,14 @@ def real_samples(w: int = 82, h: int = 41, frames_per: int = 4) -> None:
     for path in samples:
         frames = sample_frames(path, w, h, limit=frames_per)
         if not frames:                       # every media file is expected to decode
-            rows.append([path.name[:28], "!", "DECODE", "FAILED"])
+            rows.append([path.name[:28], "!", "DECODE", "FAILED", ""])
             continue
-        vals = np.array([[_psnr(f, decode_frame(encode_frame(f), w, h)),
-                          _psnr(_box2(f), _box2(decode_frame(encode_frame(f), w, h))),
-                          _psnr(_box2(f), _box2(decode_frame(encode_frame(f, adaptive=False), w, h))),
+        vals = np.array([[mean_scielab(f, decode_frame(encode_frame(f), w, h)),
+                          mean_scielab(f, decode_frame(encode_frame(f, adaptive=False), w, h)),
+                          _psnr(f, decode_frame(encode_frame(f), w, h)),
                           _dither_fraction(encode_frame(f), w, h) * 100] for f in frames])
         m = vals.mean(0)
-        rows.append([path.name[:28], fmt(m[0], 1), fmt(m[1], 1), fmt(m[2], 1),
+        rows.append([path.name[:28], fmt(m[0], 2), fmt(m[1], 2), fmt(m[2], 1),
                      fmt(m[3], 0) + "%"])
     if rows:
         print(table(_HEADERS, rows))

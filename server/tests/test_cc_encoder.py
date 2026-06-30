@@ -103,9 +103,10 @@ def test_generate_palette_adapts_to_two_colours():
 
 def test_adaptive_beats_fixed_on_out_of_gamut_frame():
     # On content far from CC's fixed palette, the adaptive palette reconstructs the
-    # frame more faithfully (2x2-blur PSNR, the eye-averaged metric the encoder
-    # optimises for) than the fixed palette does.
+    # frame more faithfully — measured with S-CIELAB (the perceptual metric the
+    # encoder optimises for; lower ΔE = closer) — than the fixed palette does.
     from cc_media import decode_frame
+    from cc_metrics import mean_scielab
 
     w, h = 24, 16
     yy, xx = np.mgrid[0:h * 3, 0:w * 2].astype(np.float32)
@@ -115,17 +116,9 @@ def test_adaptive_beats_fixed_on_out_of_gamut_frame():
     frame[..., 1] = (130 - t * 20 + yy / (h * 3) * 10).astype(np.uint8)
     frame[..., 2] = ((1 - t) * 130).astype(np.uint8)
 
-    def _box2(img):
-        a = img[: (img.shape[0] // 2) * 2, : (img.shape[1] // 2) * 2].astype(np.float32)
-        return a.reshape(a.shape[0] // 2, 2, a.shape[1] // 2, 2, 3).mean((1, 3))
-
-    def _psnr(a, b):
-        mse = np.mean((_box2(a) - _box2(b)) ** 2)
-        return float("inf") if mse <= 1e-9 else 10 * np.log10(255.0 ** 2 / mse)
-
-    adaptive = _psnr(frame, decode_frame(encode_frame(frame, adaptive=True), w, h))
-    fixed = _psnr(frame, decode_frame(encode_frame(frame, adaptive=False), w, h))
-    assert adaptive > fixed + 1.0, f"adaptive {adaptive:.1f} not > fixed {fixed:.1f}"
+    adaptive = mean_scielab(frame, decode_frame(encode_frame(frame, adaptive=True), w, h))
+    fixed = mean_scielab(frame, decode_frame(encode_frame(frame, adaptive=False), w, h))
+    assert adaptive < fixed - 1.0, f"adaptive ΔE {adaptive:.1f} not < fixed {fixed:.1f}"
 
 
 def test_each_palette_color_round_trips_solid():

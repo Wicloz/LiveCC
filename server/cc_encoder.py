@@ -81,17 +81,18 @@ _BLIT_LUT = np.frombuffer(b"0123456789abcdef", dtype=np.uint8)
 # --------------------------------------------------------------------------- #
 # Perceptual colour space (OKLab)
 # --------------------------------------------------------------------------- #
-# OKLab is close to perceptually uniform and cheaper/cleaner than CIELAB.  We
-# work with a CHROMA-WEIGHTED OKLab: distance = ΔL² + w·(Δa²+Δb²), folded into
-# the coordinates by scaling a,b by sqrt(w) so a plain squared-Euclidean metric
-# already carries the weight.  CC's palette has exactly one light colour (white)
-# with a big lightness gap below it, so unweighted ΔE collapses every light,
-# low-chroma pixel onto white (light blues / pale tints wash out).  Up-weighting
-# chroma pulls those back toward their hue.  It is safe for neutrals (black, the
-# greys and white are all chroma≈0, so lightness still separates them).  Higher w
-# = more colourful / less white; w=1 = literal ΔE.
-
-_CHROMA_WEIGHT = np.float32(6.0)
+# OKLab is close to perceptually uniform and cheaper/cleaner than CIELAB.  Distance
+# is plain squared-Euclidean ΔE in OKLab.  A CHROMA-WEIGHT knob is kept for
+# experimentation — it scales a,b by sqrt(w) so the metric carries ΔL² + w·(Δa²+Δb²)
+# — but defaults to w=1 (literal ΔE).
+#
+# History: w used to be 6.  That was a bandaid for the FIXED CC palette, whose only
+# light colour is white sitting above a big lightness gap — unweighted ΔE collapsed
+# every light, low-chroma pixel onto white (pale tints washed out), so chroma was
+# up-weighted to drag them back toward their hue.  The adaptive per-frame palette
+# (the default now) puts colours where each frame needs them, so that gap is gone and
+# the bandaid with it: w=1 is the honest perceptual metric.
+_CHROMA_WEIGHT = np.float32(1.0)
 _CHROMA_SCALE = np.sqrt(_CHROMA_WEIGHT)
 
 
@@ -101,7 +102,8 @@ def _srgb_to_linear(c: np.ndarray) -> np.ndarray:
 
 
 def _srgb_to_oklab(rgb: np.ndarray) -> np.ndarray:
-    """sRGB (last axis = R,G,B in 0..255) -> chroma-weighted OKLab."""
+    """sRGB (last axis = R,G,B in 0..255) -> OKLab (chroma scaled by _CHROMA_SCALE;
+    a no-op at the default _CHROMA_WEIGHT=1)."""
     c = _srgb_to_linear(np.asarray(rgb, dtype=np.float32) / 255.0)
     r, g, b = c[..., 0], c[..., 1], c[..., 2]
     l = 0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b
