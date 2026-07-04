@@ -1,0 +1,22 @@
+-- Example channel map for LiveCC's optional per-speaker routing.
+--
+-- To use: copy this file next to the installed `livecc` program on your CC
+-- computer, rename it to `livecc.speakers`, and edit the names below to match
+-- your own speakers (run `peripheral.getNames()` from the Lua prompt, or just
+-- `livecc <url>` once with no map -- it lists whatever it finds).
+--
+-- Any attached speaker NOT listed here stays silent once a map is in use --
+-- there's no automatic mono fallback, so list every speaker you want to hear.
+--
+-- Available roles: mono, front_left, front_right, center, lfe,
+--                   surround_left, surround_right, rear_left, rear_right
+-- (docs/cc-media-format.md section 4.6 has the full channel-role reference.)
+--
+-- This example wires up a stereo pair. Positional roles only produce sound
+-- once the source audio actually has that many channels and the server
+-- negotiates them -- otherwise the server falls back to mono.
+
+{
+    left = "front_left",
+    right = "front_right",
+}

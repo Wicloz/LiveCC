@@ -50,6 +50,7 @@ local function print_usage()
     print("  { left = \"front_left\", right = \"front_right\" }")
     print("Unlisted speakers stay silent. Roles: mono, front_left, front_right,")
     print("center, lfe, surround_left, surround_right, rear_left, rear_right.")
+    print("See lua/livecc.speakers.example in the repo for a starter file.")
     print("")
     print("Examples:")
     print("  livecc https://youtu.be/dQw4w9WgXcQ")
@@ -156,6 +157,7 @@ local screen = window.create(mon, 1, 1, TERM_W, TERM_H, true)
 -- Optional per-speaker channel map: a file (SPEAKER_MAP_FILE) containing a Lua
 -- table literal { [peripheralName] = "roleName", ... }, e.g.
 --   { left = "front_left", right = "front_right", sub = "lfe" }
+-- (see livecc.speakers.example in this directory for a starter file).
 -- Role names match the CCMF spec's channel roles (docs/cc-media-format.md §4.6).
 -- Absent, empty, or malformed -> nil, meaning the original/default strategy:
 -- every speaker plays the mono mix.  With a map active, a speaker with no
