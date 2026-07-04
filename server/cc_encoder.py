@@ -915,6 +915,15 @@ class GopEncoder:
     pacing may skip source frames, so gaps vary); the last frame of a GOP gets
     its gap from the frame that opens the next GOP, or `nominal_duration` at
     end of stream.  Not thread-safe; one instance per video stream.
+
+    A GOP is bounded by DURATION *and* by BYTES: a chunk travels as one
+    WebSocket message, and CC:Tweaked drops the connection outright when a
+    message exceeds `http.max_websocket_message` (128 KiB by default) — so a
+    busy 1-second GOP on a big monitor would kill the whole stream.  When the
+    next frame would push the chunk past `max_chunk_bytes`, the GOP is flushed
+    early and the frame opens a new one (spec-conforming: GOP length is an
+    encoder knob).  Worst case (max monitor, every frame a keyframe) degrades
+    to one-frame GOPs, which is the honest cost of that content.
     """
 
     # Mean |RGB diff| (subsampled) above which a frame counts as a scene cut.
@@ -923,11 +932,14 @@ class GopEncoder:
     _SCENE_CUT_DIFF = 24.0
 
     def __init__(self, gop_samples: int = ccmf.SAMPLE_RATE,
-                 nominal_duration: int = 2000) -> None:
+                 nominal_duration: int = 2000,
+                 max_chunk_bytes: int = 96 * 1024) -> None:
         self.gop_samples = gop_samples          # target GOP span (default 1 s)
         self.nominal_duration = min(nominal_duration, ccmf.MAX_DURATION)
+        self.max_chunk_bytes = max_chunk_bytes  # stay under CC's 128 KiB ws cap
         self._entries: list[tuple] = []         # ("pal", bytes) | (enc, pts, body)
         self._gop_pts = 0
+        self._bytes = 0                         # wire size of the open chunk
         self._w = self._h = 0
         self._tables = None                     # palette tables for delta frames
         self._prev = None                       # (glyph, fg, bg) of the last frame
@@ -946,6 +958,12 @@ class GopEncoder:
         glyph, fg, bg = _encode_core(idx, h, w, *tables)
         return glyph, fg.astype(np.uint8), bg.astype(np.uint8)
 
+    # Wire size of a frame entry: unit flags + duration, plus the body.  A
+    # keyframe re-key also carries a 49-byte palette unit.
+    _FRAME_OVERHEAD = 3
+    _PALETTE_UNIT_BYTES = 49
+    _CHUNK_OVERHEAD = 11 + 5                     # chunk header + video payload head
+
     def _open_gop(self, pts: int, frame_rgb: np.ndarray) -> None:
         pal_rgb = generate_palette(frame_rgb)
         self._tables = _palette_tables(pal_rgb)
@@ -953,6 +971,9 @@ class GopEncoder:
         self._gop_pts = pts
         self._entries = [("pal", pal_rgb.tobytes()),
                          (ccmf.ENC_RAW, pts, self._prev)]   # planes packed at flush
+        self._bytes = (self._CHUNK_OVERHEAD + self._PALETTE_UNIT_BYTES
+                       + self._FRAME_OVERHEAD
+                       + ccmf.raw_planes_size(self._w, self._h))
 
     def add(self, pts: int, frame_rgb: np.ndarray) -> Optional[tuple[int, bytes]]:
         """Feed the next frame (absolute `pts` in 48 kHz samples).  Returns the
@@ -970,15 +991,27 @@ class GopEncoder:
         cut = (self._prev_rgb is None or rgb_sub.shape != self._prev_rgb.shape
                or np.abs(rgb_sub - self._prev_rgb).mean() > self._SCENE_CUT_DIFF)
         self._prev_rgb = rgb_sub
+        grids = body = None
         if not cut:
             grids = self._encode(frame_rgb, self._tables)
             body = ccmf.delta_spans(self._prev, grids)
-            if body is None:
-                self._entries.append((ccmf.ENC_REPEAT, pts, b""))
-            elif len(body) < ccmf.raw_planes_size(self._w, self._h):
-                self._entries.append((ccmf.ENC_DELTA, pts, body))
-            else:
+            if body is not None and \
+                    len(body) >= ccmf.raw_planes_size(self._w, self._h):
                 cut = True                       # busier than a keyframe: re-key
+
+        if cut:
+            size = (self._PALETTE_UNIT_BYTES + self._FRAME_OVERHEAD
+                    + ccmf.raw_planes_size(self._w, self._h))
+        else:
+            size = self._FRAME_OVERHEAD + (len(body) if body is not None else 0)
+        if self._bytes + size > self.max_chunk_bytes:
+            # Size-bounded flush: this frame would overflow the WebSocket
+            # message cap, so it opens a new GOP instead (done is still None
+            # here — a duration flush above would have emptied the entries).
+            done = self._flush(next_pts=pts)
+            self._open_gop(pts, frame_rgb)
+            return done
+
         if cut:
             # Scene cut: the old palette no longer fits, so re-quantise and drop
             # in a fresh keyframe mid-GOP (may cost a second encode; cuts are rare).
@@ -987,7 +1020,12 @@ class GopEncoder:
             grids = self._encode(frame_rgb, self._tables)
             self._entries.append(("pal", pal_rgb.tobytes()))
             self._entries.append((ccmf.ENC_RAW, pts, grids))
-        self._prev = grids
+        elif body is None:
+            self._entries.append((ccmf.ENC_REPEAT, pts, b""))
+        else:
+            self._entries.append((ccmf.ENC_DELTA, pts, body))
+        self._bytes += size
+        self._prev = grids if grids is not None else self._prev
         return done
 
     def flush(self, next_pts: Optional[int] = None) -> Optional[tuple[int, bytes]]:

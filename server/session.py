@@ -357,8 +357,16 @@ class StreamSession:
                     head = self._oldest_pts()
                     if head is None:
                         await asyncio.sleep(0.02)          # gap: wait for data
-                    elif head - media_now > self.prebuffer:
-                        origin, t0 = head, loop.time()      # behind -> skip to head
+                    elif head - media_now > self.prebuffer + GOP_SECONDS:
+                        # Behind the live edge -> skip to head.  The GOP_SECONDS
+                        # margin matters: a video chunk's PTS runs up to one GOP
+                        # ahead of the moment it is produced (it flushes when
+                        # the NEXT GOP's first frame arrives), so head sits
+                        # ~GOP_SECONDS ahead of the clock at normal cadence —
+                        # without the margin this fired on every jitter, and
+                        # the constant origin jumps made release timing (and
+                        # the client's pacing) erratic.
+                        origin, t0 = head, loop.time()
                     elif not sent:
                         await asyncio.sleep(0.005)
                 else:  # VOD

@@ -330,14 +330,23 @@ end
 -- renders whatever is due against a media clock (os.epoch is real time, ms).
 --
 -- The clock anchors on the first chunk (plus a little startup slack so the queue
--- never starts empty) and re-anchors whenever a chunk lands >1 s off schedule —
--- a server re-buffer (chunks late) or a live-edge skip (PTS jump) both just
--- shift the mapping instead of freezing or fast-forwarding playback.
+-- never starts empty).  Chunks arriving LATE re-anchor after 1 s (server
+-- re-buffer: resume smoothly); chunks arriving EARLY are simply queued — only a
+-- big PTS jump (live-edge skip) re-anchors, dropping the stale queue.
 
 local vqueue = {}
 local anchor_pts, anchor_ms = nil, nil
 local START_SLACK_MS = 200
-local RESYNC_MS = 1000
+-- Re-anchor thresholds are asymmetric.  LATE (chunk arrives after its due
+-- time): the server stalled/re-buffered — resume promptly, so 1 s.  EARLY
+-- (chunk PTS is far ahead of the clock): normal operation is ALWAYS somewhat
+-- early — the server releases video ahead of the clock and live-edge skips
+-- add more — so small earliness must just queue (re-anchoring on it burst-
+-- rendered the whole queue and then froze until the next chunk).  Only a big
+-- jump (a genuine live-edge skip) re-anchors, and then the stale queue is
+-- DROPPED, not burst-rendered.
+local RESYNC_LATE_MS = 1000
+local RESYNC_EARLY_MS = 3000
 
 local function due_ms(pts)
     return anchor_ms + (pts - anchor_pts) / 48   -- 48 samples per ms
@@ -478,7 +487,20 @@ end
 -- Anchor (or re-anchor) the media clock from an arriving chunk's PTS.
 local function sync_clock(pts)
     local now = os.epoch("utc")
-    if anchor_pts == nil or math.abs(now - due_ms(pts)) > RESYNC_MS then
+    if anchor_pts == nil then
+        anchor_pts, anchor_ms = pts, now + START_SLACK_MS
+        return
+    end
+    local lateness = now - due_ms(pts)
+    if lateness > RESYNC_LATE_MS then
+        -- Server stalled/re-buffered: shift the clock so playback resumes
+        -- smoothly (the queue is empty or overdue anyway).
+        anchor_pts, anchor_ms = pts, now + START_SLACK_MS
+    elseif lateness < -RESYNC_EARLY_MS then
+        -- Live-edge skip: the stream jumped ahead.  Jump with it — drop
+        -- whatever is still queued (it is stale content behind the edge)
+        -- rather than fast-forwarding through it on screen.
+        vqueue = {}
         anchor_pts, anchor_ms = pts, now + START_SLACK_MS
     end
 end

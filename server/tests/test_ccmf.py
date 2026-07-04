@@ -295,3 +295,33 @@ def test_gop_scene_cut_rekeys_mid_gop():
 
 def test_gop_flush_empty_returns_none():
     assert GopEncoder().flush() is None
+
+
+def test_gop_respects_byte_budget():
+    # A chunk travels as ONE WebSocket message and CC:Tweaked drops the
+    # connection when a message exceeds http.max_websocket_message (128 KiB
+    # default) — so a GOP must flush early on SIZE, not just duration.  Random
+    # frames force worst-case units (every frame re-keys to palette + raw).
+    w, h = 20, 10
+    rng = np.random.default_rng(6)
+    frame_bytes = ccmf.raw_planes_size(w, h) + 49 + 3          # raw + palette + head
+    budget = 16 + 3 * frame_bytes + 10                          # fits 3 keyframes
+    enc = GopEncoder(gop_samples=100 * 48000, max_chunk_bytes=budget)
+
+    chunks = []
+    for i in range(8):
+        done = enc.add(i * 2000,
+                       rng.integers(0, 256, (h * 3, w * 2, 3), dtype=np.uint8))
+        if done is not None:
+            chunks.append(done[1])
+    done = enc.flush()
+    if done is not None:
+        chunks.append(done[1])
+
+    assert len(chunks) >= 2                       # the budget forced early flushes
+    for chunk in chunks:
+        assert len(chunk) <= budget
+        # every size-bounded chunk is still a spec-legal RAP
+        _pts, _t, payload, _ = ccmf.parse_chunk(chunk)
+        _w, _h, frames = ccmf.parse_video_payload(payload)
+        assert frames[0].encoding == ccmf.ENC_RAW
