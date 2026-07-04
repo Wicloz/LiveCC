@@ -108,10 +108,10 @@ def _patch(monkeypatch, n_video, n_audio, is_live, ext="webm", moov_at_end=True)
             pts = round(i * ccmf.SAMPLE_RATE / fps)
             yield pts, ccmf.chunk(pts, ccmf.TYPE_VIDEO, b"\x00" * 16)
 
-    async def fake_audio(url, rate, codec=None, start=0, end=None,
-                         source_path=None, loop=False, source_channel=None):
+    async def fake_audio(url, rate, codec, roles, start=0, end=None,
+                         source_path=None, loop=False):
         for _ in range(n_audio):
-            yield b"\x00" * 4096
+            yield {role: b"\x00" * 4096 for role in roles}
 
     async def fake_probe(url):
         return is_live, ext
@@ -120,7 +120,7 @@ def _patch(monkeypatch, n_video, n_audio, is_live, ext="webm", moov_at_end=True)
         return moov_at_end
 
     monkeypatch.setattr(session, "iter_video", fake_video)
-    monkeypatch.setattr(session, "iter_audio", fake_audio)
+    monkeypatch.setattr(session, "iter_audio_channels", fake_audio)
     monkeypatch.setattr(session, "probe_source_info", fake_probe)
     monkeypatch.setattr(session, "probe_moov_at_end", fake_moov)
 
@@ -234,7 +234,7 @@ def test_failing_audio_producer_degrades_to_silent_video(monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("audio kaboom")
 
-    monkeypatch.setattr(session, "iter_audio", boom)
+    monkeypatch.setattr(session, "iter_audio_channels", boom)
     ws = FakeWS()
     s = StreamSession("u", w=4, h=2, fps=50, want_audio=True)
     run(asyncio.wait_for(s.run(ws), 5))
@@ -424,16 +424,16 @@ def test_cancel_finalizes_producer_generator(monkeypatch):
         finally:
             closed["video"] = True
 
-    async def fake_audio(url, rate, codec=None, start=0, end=None,
-                         source_path=None, loop=False, source_channel=None):
+    async def fake_audio(url, rate, codec, roles, start=0, end=None,
+                         source_path=None, loop=False):
         if False:
-            yield b""
+            yield {}
 
     async def fake_probe(url):
         return False, "webm"
 
     monkeypatch.setattr(session, "iter_video", fake_video)
-    monkeypatch.setattr(session, "iter_audio", fake_audio)
+    monkeypatch.setattr(session, "iter_audio_channels", fake_audio)
     monkeypatch.setattr(session, "probe_source_info", fake_probe)
 
     async def go():

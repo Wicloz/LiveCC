@@ -509,6 +509,71 @@ def test_decode_audio_from_generated_file(tmp_path):
     assert sum(len(c) for c in chunks) > 0         # produced raw PCM bytes
 
 
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+def test_iter_audio_channels_deinterleaves_stereo_without_crosstalk(tmp_path):
+    # Regression for the stereo-drift bug: two independent per-role pipelines
+    # each decode the source separately, which is fine for a seekable file but
+    # drifts on a live source (two fetches of "now" don't land on the same
+    # sample). iter_audio_channels instead decodes once and splits the
+    # interleaved PCM in Python. Verify the split actually lands each channel
+    # on the right role, using a synthetic source with a distinct constant
+    # level per channel (front_left ~0.25, front_right ~0.75) -- any channel
+    # swap or off-by-one in the de-interleave would show up as a wrong level.
+    path = tmp_path / "stereo.wav"
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+           "-f", "lavfi", "-i", "aevalsrc=0.25|0.75:c=stereo:s=48000:d=0.5", str(path)]
+    if subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE).returncode != 0:
+        pytest.skip("ffmpeg can't build a synthetic stereo source")
+
+    left_chunks, right_chunks = [], []
+
+    async def go():
+        agen = transcoder.iter_audio_channels(
+            "ignored", sample_rate=48000, codec=transcoder.PCM,
+            roles=[ccmf.CHANNEL_FRONT_LEFT, ccmf.CHANNEL_FRONT_RIGHT],
+            source_path=str(path))
+        try:
+            async for chunks in agen:
+                left_chunks.append(chunks[ccmf.CHANNEL_FRONT_LEFT])
+                right_chunks.append(chunks[ccmf.CHANNEL_FRONT_RIGHT])
+        finally:
+            await agen.aclose()
+
+    asyncio.run(go())
+    left, right = b"".join(left_chunks), b"".join(right_chunks)
+    assert left and right
+    assert len(left) == len(right)          # sample-aligned: same length per role
+    avg_left = sum(left) / len(left)
+    avg_right = sum(right) / len(right)
+    assert avg_left < 180 < avg_right        # 0.25 -> ~160, 0.75 -> ~224: not swapped/mixed
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+def test_iter_audio_channels_mono_delegates_to_iter_audio(tmp_path):
+    # len(roles) == 1 needs no split -- it's just the plain single-pipeline path.
+    path = tmp_path / "with_audio.mp4"
+    if _ffmpeg_make(path, "mpeg4", acodec="aac").returncode != 0:
+        pytest.skip("ffmpeg can't build mp4+aac")
+
+    chunks = []
+
+    async def go():
+        agen = transcoder.iter_audio_channels(
+            "ignored", sample_rate=48000, codec=transcoder.PCM,
+            roles=[ccmf.CHANNEL_MONO], source_path=str(path))
+        try:
+            async for chunk in agen:
+                chunks.append(chunk)
+                if chunks:
+                    break
+        finally:
+            await agen.aclose()
+
+    asyncio.run(go())
+    assert chunks and set(chunks[0]) == {ccmf.CHANNEL_MONO}
+    assert len(chunks[0][ccmf.CHANNEL_MONO]) > 0
+
+
 # --------------------------------------------------------------------------- #
 # Integration: real live streams (regression guard)
 # --------------------------------------------------------------------------- #

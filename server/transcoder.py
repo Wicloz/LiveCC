@@ -641,12 +641,12 @@ async def iter_audio(youtube_url: str, sample_rate: int = 48000,
 
     source_channel=None yields the mono downmix (role 0); an int extracts that
     one discrete source channel for a positional role instead (spec §4.6, see
-    ROLE_SOURCE_CHANNEL) -- StreamSession runs one of these per negotiated
-    channel role (negotiate_channel_roles), each its own yt-dlp+ffmpeg pair.
-    That re-decodes the source once per channel rather than splitting a single
-    decode in Python; simpler and codec-uniform (DFPWM has no separate
-    encode-per-channel primitive to fan out from), at the cost of N-way
-    bandwidth/CPU for a live/piped source when more than one role is sent.
+    ROLE_SOURCE_CHANNEL). This is its own independent yt-dlp+ffmpeg pipeline --
+    fine for mono, but do NOT run one of these per role for a multi-role
+    (stereo/5.1/7.1) production: two independent fetches of a *live* source
+    don't land on the same live-edge sample, so the roles drift apart over
+    time. iter_audio_channels shares one decode pass across roles instead;
+    StreamSession uses that whenever more than one role is negotiated.
 
     source_path set => decode that local (seekable) file; loop=True replays it
     forever (--loop).  Otherwise stream from the yt-dlp pipe.
@@ -693,3 +693,128 @@ async def iter_audio(youtube_url: str, sample_rate: int = 48000,
     finally:
         _kill_wait(ffmpeg, ytdlp)
         log.info("audio: streamed %d bytes", sent)
+
+
+def _multichannel_pcm_cmd(sample_rate: int, n_channels: int,
+                          source: Optional[str] = None, loop: bool = False) -> list[str]:
+    """Raw interleaved PCM8 at n_channels, undownmixed -- ffmpeg passes discrete
+    source channels through unchanged when -ac equals the source's channel
+    count, which negotiate_channel_roles guarantees (it never asks for more
+    channels than the source actually has)."""
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "info", "-nostats"]
+    if source:
+        if loop:
+            cmd += ["-stream_loop", "-1"]
+        cmd += ["-i", source, "-map", "0:a:0?"]
+    else:
+        cmd += ["-i", "pipe:0"]
+    cmd += ["-vn", "-ar", str(sample_rate), "-ac", str(n_channels),
+            "-c:a", "pcm_u8", "-f", "u8", "pipe:1"]
+    return cmd
+
+
+async def iter_audio_channels(youtube_url: str, sample_rate: int, codec: AudioCodec,
+                              roles: list[int], start: float = 0,
+                              end: Optional[float] = None,
+                              source_path: Optional[str] = None,
+                              loop: bool = False) -> AsyncGenerator[dict[int, bytes], None]:
+    """Yield {role: chunk_bytes} dicts covering every role in `roles`, all cut
+    from the SAME decode pass so they stay sample-aligned.
+
+    This matters specifically for a *live* source: running one independent
+    iter_audio pipeline per role (fine for a single mono stream) means two
+    separate fetches of "the live stream, right now" -- they don't start at
+    the same live-edge sample, so left/right drift apart by however much their
+    startup timing happened to differ. Decoding once and splitting the
+    interleaved PCM in Python guarantees every role's sample 0 is the exact
+    same source sample, live or VOD.
+
+    len(roles) == 1 (mono) needs no alignment against anything else, so it
+    just delegates to the plain single-pipeline iter_audio.
+
+    PCM8 is the common case (this project's own client always prefers it) and
+    is nearly free to split: the raw bytes already are the wire format, just
+    de-interleaved. DFPWM has no incremental per-channel encode primitive to
+    split into, so that combination still runs one independent pipeline per
+    role (like iter_audio) -- unreachable via this project's own client, but
+    kept working for a hypothetical DFPWM-only client at the cost of the same
+    live-drift risk described above.
+    """
+    if len(roles) == 1:
+        role = roles[0]
+        agen = iter_audio(youtube_url, sample_rate, codec, start, end,
+                          source_path, loop, source_channel=ROLE_SOURCE_CHANNEL.get(role))
+        try:
+            async for data in agen:
+                yield {role: data}
+        finally:
+            await agen.aclose()
+        return
+
+    if codec.name != "pcm":
+        log.warning("multichannel %s: roles are not sample-aligned (independent "
+                   "per-role pipelines); may drift apart on a live source", codec.name)
+        gens = [iter_audio(youtube_url, sample_rate, codec, start, end, source_path, loop,
+                           source_channel=ROLE_SOURCE_CHANNEL[role]) for role in roles]
+        try:
+            while True:
+                chunks = {}
+                for role, gen in zip(roles, gens):
+                    try:
+                        chunks[role] = await gen.__anext__()
+                    except StopAsyncIteration:
+                        return
+                yield chunks
+        finally:
+            for gen in gens:
+                await gen.aclose()
+        return
+
+    # PCM8: one decode pass, interleaved raw PCM, de-interleaved below -- every
+    # role's PTS=0 is the exact same source sample regardless of live/VOD.
+    n_channels = len(roles)   # _ROLE_GROUPS are contiguous prefixes 1..n
+    frame_bytes = PCM.read_bytes * n_channels
+    ytdlp: subprocess.Popen | None = None
+    ffmpeg: subprocess.Popen | None = None
+    sent = 0
+    try:
+        if source_path:
+            ffmpeg = subprocess.Popen(
+                _multichannel_pcm_cmd(sample_rate, n_channels, source=source_path, loop=loop),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            _spawn_stderr_drain(ffmpeg, "ffmpeg/audio")
+        else:
+            ytdlp = subprocess.Popen(
+                _ytdlp_cmd(youtube_url, _AUDIO_FMT, start, end),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            ffmpeg = subprocess.Popen(
+                _multichannel_pcm_cmd(sample_rate, n_channels),
+                stdin=ytdlp.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            ytdlp.stdout.close()
+            _spawn_stderr_drain(ytdlp, "yt-dlp/audio")
+            _spawn_stderr_drain(ffmpeg, "ffmpeg/audio")
+
+        while True:
+            timeout = _FIRST_OUTPUT_TIMEOUT if sent == 0 else _STALL_TIMEOUT
+            try:
+                raw = await _read_with_timeout(ffmpeg, frame_bytes, timeout)
+            except TimeoutError:
+                log.warning("audio: no output for %ss — stopping", timeout)
+                break
+            if not raw:
+                break
+            sent += len(raw)
+            usable = len(raw) - (len(raw) % n_channels)   # drop a torn trailing frame
+            if usable == 0:
+                continue
+            yield {role: raw[idx:usable:n_channels] for idx, role in enumerate(roles)}
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("audio: pipeline error")
+    finally:
+        _kill_wait(ffmpeg, ytdlp)
+        log.info("audio: streamed %d bytes (%d channels)", sent, n_channels)

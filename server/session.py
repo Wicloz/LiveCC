@@ -37,9 +37,8 @@ from transcoder import (
     AUDIO_CHUNK_SECONDS,
     GOP_SECONDS,
     PCM,
-    ROLE_SOURCE_CHANNEL,
     download_source,
-    iter_audio,
+    iter_audio_channels,
     iter_video,
     needs_download,
     needs_seekable_source,
@@ -216,36 +215,39 @@ class StreamSession:
             self.video_buf.close()
             self.video_done.set()
 
-    async def _produce_audio(self, role: int) -> None:
-        # One of these runs per negotiated channel role (self.channel_roles),
-        # each its own yt-dlp+ffmpeg pair extracting just that role's discrete
-        # source channel (see iter_audio's source_channel).  Same guarantee as
-        # video: this role's audio_done is always set so a failed producer
-        # degrades that role to silent rather than hanging the scheduler.
+    async def _produce_audio(self) -> None:
+        # One shared decode pass covers every negotiated role (self.channel_roles)
+        # -- iter_audio_channels handles both mono (one pipeline) and positional
+        # roles (one pipeline, split in Python) so every role's sample 0 is the
+        # same source sample; see its docstring for why per-role pipelines would
+        # let stereo drift apart on a live source.  Same guarantee as video: every
+        # role's audio_done is always set so a failed producer degrades to
+        # silent rather than hanging the scheduler.
         agen = None
         samples = 0
-        buf = self.audio_bufs[role]
-        done = self.audio_done[role]
-        source_channel = ROLE_SOURCE_CHANNEL.get(role)   # None for mono (role 0)
         try:
-            agen = iter_audio(self.url, self.rate, self.codec,
-                              start=self._start_eff, end=self._end_eff,
-                              source_path=self._source_path, loop=self.loop,
-                              source_channel=source_channel)
-            async for data in agen:
+            agen = iter_audio_channels(self.url, self.rate, self.codec, self.channel_roles,
+                                       start=self._start_eff, end=self._end_eff,
+                                       source_path=self._source_path, loop=self.loop)
+            async for chunks in agen:
                 # Wrap here, where the running sample counter (= the chunk's PTS,
-                # spec §4.6) is known; the buffer then holds wire-ready bytes.
-                chunk = ccmf.chunk(samples, ccmf.TYPE_AUDIO,
-                                   ccmf.audio_payload(self._codec_id, data, channel=role))
-                await buf.put(samples / self.rate, chunk)
-                samples += len(data) * self.codec.samples_per_byte
+                # spec §4.6) is known; the buffers then hold wire-ready bytes.
+                # All roles share this one counter -- they come from the same
+                # decode pass, so they're frame-aligned by construction.
+                pts = samples / self.rate
+                for role, data in chunks.items():
+                    chunk = ccmf.chunk(samples, ccmf.TYPE_AUDIO,
+                                       ccmf.audio_payload(self._codec_id, data, channel=role))
+                    await self.audio_bufs[role].put(pts, chunk)
+                samples += len(next(iter(chunks.values()))) * self.codec.samples_per_byte
         except Exception:
-            log.exception("audio producer failed (role=%d)", role)
+            log.exception("audio producer failed (roles=%s)", self.channel_roles)
         finally:
             if agen is not None:
                 await agen.aclose()
-            buf.close()
-            done.set()
+            for role in self.channel_roles:
+                self.audio_bufs[role].close()
+                self.audio_done[role].set()
 
     # ----- scheduler helpers ----------------------------------------------
 
@@ -259,8 +261,8 @@ class StreamSession:
     # else audio (audio-only / --no-video).  Both streams are still released by PTS
     # against the shared clock — this only picks what startup/underrun keys off.
     # With multiple audio roles, the first negotiated role stands in for all of
-    # them (they're independent pipelines off the same source, so their timing
-    # tracks closely enough for this purpose).
+    # them -- they all come from the one shared decode/producer (_produce_audio),
+    # so their buffers fill in lockstep anyway.
     def _primary_buf(self) -> TimedBuffer:
         return self.video_buf if self.want_video else self.audio_bufs[self.channel_roles[0]]
 
@@ -384,8 +386,7 @@ class StreamSession:
             if self.want_video:
                 tasks.append(asyncio.create_task(self._produce_video()))
             if self.want_audio:
-                for role in self.channel_roles:
-                    tasks.append(asyncio.create_task(self._produce_audio(role)))
+                tasks.append(asyncio.create_task(self._produce_audio()))
 
             await self._prebuffer()
             await self._send_status(ws, ccmf.STATUS_PLAYING)
