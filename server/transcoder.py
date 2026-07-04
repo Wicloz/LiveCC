@@ -95,6 +95,40 @@ AUDIO_CODECS = {c.name: c for c in (PCM, DFPWM)}
 # No server-side audio filtering.  Earlier encode-side processing (highpass /
 # lowpass / volume, and before that dynaudnorm / loudnorm / limiter) was reported
 # to make audio worse, so we resample the source straight to PCM with no filters.
+# (Positional extraction below uses `pan` purely to pick a channel, not to filter.)
+
+# Discrete source-channel index (0-based) ffmpeg exposes for each positional
+# role, following the standard multichannel decode order FL FR FC LFE BL BR
+# [SL SR] -- the same order the CCMF role IDs are numbered in (spec §4.6).
+# Role 0 (mono) has no entry: it's always the full downmix of every source
+# channel (see _audio_ffmpeg_cmd's source_channel=None case), not one discrete
+# channel.
+ROLE_SOURCE_CHANNEL = {1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6, 8: 7}
+
+# Role groups a client can be offered, largest first -- each a strict superset
+# of the next tier down (spec §4.6: mono / stereo / 5.1 / 7.1 roles).  A group
+# is only used when the client's CAPS asked for EVERY role in it *and* the
+# source has at least that many discrete channels, so positional audio is
+# never invented for a mono/stereo source; otherwise we fall through to a
+# smaller group, down to plain mono (the universal fallback, spec §5.4).
+_ROLE_GROUPS = (
+    (1, 2, 3, 4, 5, 6, 7, 8),   # 7.1
+    (1, 2, 3, 4, 5, 6),         # 5.1
+    (1, 2),                     # stereo
+)
+
+
+def negotiate_channel_roles(caps_channels: int, source_channels: int) -> list[int]:
+    """Pick which CCMF channel roles (spec §4.6) to actually produce.
+
+    caps_channels is the client's CAPS `channels` bitmask; source_channels is
+    the source's discrete channel count (see probe_audio_channels).  Returns
+    [0] (mono) when no positional group is fully satisfied by both.
+    """
+    for group in _ROLE_GROUPS:
+        if source_channels >= len(group) and all(caps_channels & (1 << r) for r in group):
+            return list(group)
+    return [0]
 
 
 # --------------------------------------------------------------------------- #
@@ -226,9 +260,15 @@ def _video_ffmpeg_cmd(px_w: int, px_h: int, fps: int,
 
 
 def _audio_ffmpeg_cmd(sample_rate: int, codec: AudioCodec = PCM,
+                      source_channel: Optional[int] = None,
                       source: Optional[str] = None, loop: bool = False) -> list[str]:
-    # Mono at the speaker rate, encoded as `codec` (raw PCM preferred, DFPWM when
+    # At the speaker rate, encoded as `codec` (raw PCM preferred, DFPWM when
     # that's all the client advertised).  The client decodes/unpacks per its CAPS.
+    # source_channel=None: downmix every source channel to mono (role 0, the
+    # default/only mode until a client asks for positional roles).
+    # source_channel=N: extract discrete source channel N with `pan` -- no
+    # mixing -- so a positional role (e.g. front_left) doesn't bleed into its
+    # neighbour (see ROLE_SOURCE_CHANNEL).
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "info", "-nostats"]
     if source:
         if loop:
@@ -236,8 +276,12 @@ def _audio_ffmpeg_cmd(sample_rate: int, codec: AudioCodec = PCM,
         cmd += ["-i", source, "-map", "0:a:0?"]
     else:
         cmd += ["-i", "pipe:0"]
-    cmd += ["-vn", "-ar", str(sample_rate), "-ac", "1",
-            "-c:a", codec.ffmpeg_codec, "-f", codec.ffmpeg_fmt, "pipe:1"]
+    cmd += ["-vn", "-ar", str(sample_rate)]
+    if source_channel is None:
+        cmd += ["-ac", "1"]
+    else:
+        cmd += ["-af", f"pan=mono|c0=c{source_channel}"]
+    cmd += ["-c:a", codec.ffmpeg_codec, "-f", codec.ffmpeg_fmt, "pipe:1"]
     return cmd
 
 
@@ -381,6 +425,31 @@ async def probe_moov_at_end(url: str) -> bool:
 async def probe_is_live(url: str) -> bool:
     is_live, _ext = await probe_source_info(url)
     return is_live
+
+
+def _probe_audio_channels_blocking(url: str) -> int:
+    """Discrete channel count of the selected audio format (best-effort).
+
+    Defaults to 1 (mono) on any uncertainty -- the previously-only behaviour --
+    so a probe failure just means no positional audio, not a broken stream.
+    """
+    try:
+        out = subprocess.run(
+            ["yt-dlp", "--no-warnings", "--quiet", "--no-playlist",
+             "-f", _AUDIO_FMT, "--print", "%(audio_channels)s", url],
+            capture_output=True, text=True, timeout=40,
+        )
+        line = out.stdout.strip().splitlines()[0] if out.stdout.strip() else ""
+        return int(line) if line.isdigit() else 1
+    except Exception:
+        log.exception("audio channel probe failed; assuming mono")
+        return 1
+
+
+async def probe_audio_channels(url: str) -> int:
+    """Async wrapper for _probe_audio_channels_blocking."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_executor, _probe_audio_channels_blocking, url)
 
 
 # --------------------------------------------------------------------------- #
@@ -566,8 +635,18 @@ async def iter_audio(youtube_url: str, sample_rate: int = 48000,
                      codec: AudioCodec = PCM,
                      start: float = 0, end: Optional[float] = None,
                      source_path: Optional[str] = None,
-                     loop: bool = False) -> AsyncGenerator[bytes, None]:
-    """Yield audio chunks (mono) encoded as `codec` (raw PCM, or negotiated DFPWM).
+                     loop: bool = False,
+                     source_channel: Optional[int] = None) -> AsyncGenerator[bytes, None]:
+    """Yield audio chunks encoded as `codec` (raw PCM, or negotiated DFPWM).
+
+    source_channel=None yields the mono downmix (role 0); an int extracts that
+    one discrete source channel for a positional role instead (spec §4.6, see
+    ROLE_SOURCE_CHANNEL) -- StreamSession runs one of these per negotiated
+    channel role (negotiate_channel_roles), each its own yt-dlp+ffmpeg pair.
+    That re-decodes the source once per channel rather than splitting a single
+    decode in Python; simpler and codec-uniform (DFPWM has no separate
+    encode-per-channel primitive to fan out from), at the cost of N-way
+    bandwidth/CPU for a live/piped source when more than one role is sent.
 
     source_path set => decode that local (seekable) file; loop=True replays it
     forever (--loop).  Otherwise stream from the yt-dlp pipe.
@@ -578,7 +657,8 @@ async def iter_audio(youtube_url: str, sample_rate: int = 48000,
     try:
         if source_path:
             ffmpeg = subprocess.Popen(
-                _audio_ffmpeg_cmd(sample_rate, codec, source=source_path, loop=loop),
+                _audio_ffmpeg_cmd(sample_rate, codec, source_channel=source_channel,
+                                  source=source_path, loop=loop),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             _spawn_stderr_drain(ffmpeg, "ffmpeg/audio")
@@ -588,7 +668,7 @@ async def iter_audio(youtube_url: str, sample_rate: int = 48000,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             ffmpeg = subprocess.Popen(
-                _audio_ffmpeg_cmd(sample_rate, codec),
+                _audio_ffmpeg_cmd(sample_rate, codec, source_channel=source_channel),
                 stdin=ytdlp.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             ytdlp.stdout.close()

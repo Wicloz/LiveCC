@@ -168,6 +168,26 @@ def test_audio_payload_roundtrip():
     assert data == b"\x55" * 600
 
 
+def test_audio_payload_roundtrip_positional_channel():
+    p = ccmf.audio_payload(ccmf.CODEC_PCM8, b"\x80" * 100, channel=ccmf.CHANNEL_FRONT_RIGHT)
+    codec, channel, data = ccmf.parse_audio_payload(p)
+    assert (codec, channel) == (ccmf.CODEC_PCM8, ccmf.CHANNEL_FRONT_RIGHT)
+    assert data == b"\x80" * 100
+
+
+def test_channel_roles_are_distinct_one_hot_bits():
+    # Spec §4.6/§5.4: bit N of CAPS `channels` accepts channel role N.
+    roles = (ccmf.CHANNEL_MONO, ccmf.CHANNEL_FRONT_LEFT, ccmf.CHANNEL_FRONT_RIGHT,
+             ccmf.CHANNEL_CENTER, ccmf.CHANNEL_LFE, ccmf.CHANNEL_SURROUND_LEFT,
+             ccmf.CHANNEL_SURROUND_RIGHT, ccmf.CHANNEL_REAR_LEFT, ccmf.CHANNEL_REAR_RIGHT)
+    assert roles == tuple(range(9))
+    caps = (ccmf.CAP_CHANNEL_MONO, ccmf.CAP_CHANNEL_FRONT_LEFT, ccmf.CAP_CHANNEL_FRONT_RIGHT,
+            ccmf.CAP_CHANNEL_CENTER, ccmf.CAP_CHANNEL_LFE, ccmf.CAP_CHANNEL_SURROUND_LEFT,
+            ccmf.CAP_CHANNEL_SURROUND_RIGHT, ccmf.CAP_CHANNEL_REAR_LEFT, ccmf.CAP_CHANNEL_REAR_RIGHT)
+    for role, cap in zip(roles, caps):
+        assert cap == 1 << role
+
+
 # --------------------------------------------------------------------------- #
 # Stream format: control frames + HELLO bodies
 # --------------------------------------------------------------------------- #

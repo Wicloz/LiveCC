@@ -37,11 +37,14 @@ from transcoder import (
     AUDIO_CHUNK_SECONDS,
     GOP_SECONDS,
     PCM,
+    ROLE_SOURCE_CHANNEL,
     download_source,
     iter_audio,
     iter_video,
     needs_download,
     needs_seekable_source,
+    negotiate_channel_roles,
+    probe_audio_channels,
     probe_moov_at_end,
     probe_source_info,
 )
@@ -125,19 +128,25 @@ class StreamSession:
 
     `start`/`end` are seconds into the source (the ROOM message carries ms; the
     caller converts).  `audio_codec` is the transcoder.AudioCodec negotiated
-    from the client's CAPS (PCM preferred, DFPWM fallback).
+    from the client's CAPS (PCM preferred, DFPWM fallback).  `caps_channels` is
+    the client's raw CAPS `channels` bitmask; the actual channel roles to
+    produce (self.channel_roles) are decided in run(), once the source's real
+    channel count is known (negotiate_channel_roles) -- mono unless the client
+    asked for more AND the source actually has it (spec §4.6/§5.4).
     """
 
     def __init__(self, url: str, w: int, h: int, fps: int, want_audio: bool,
                  want_video: bool = True, start: float = 0,
                  end: Optional[float] = None, loop: bool = False,
-                 rate: int = 48000, audio_codec=PCM) -> None:
+                 rate: int = 48000, audio_codec=PCM,
+                 caps_channels: int = ccmf.CAP_CHANNEL_MONO) -> None:
         self.url = url
         self.w, self.h, self.fps = w, h, fps
         self.want_audio = want_audio
         self.want_video = want_video
         self.rate = rate
         self.codec = audio_codec
+        self.caps_channels = caps_channels
         self._codec_id = ccmf.CODEC_PCM8 if audio_codec.name == "pcm" \
             else ccmf.CODEC_DFPWM
 
@@ -154,10 +163,11 @@ class StreamSession:
         self._need_download = False                      # decode from a downloaded file
 
         self.video_buf: TimedBuffer | None = None
-        self.audio_buf: TimedBuffer | None = None
+        self.channel_roles: list[int] = [0]              # refined in run()
+        self.audio_bufs: dict[int, TimedBuffer] = {}     # role -> buffer
 
         self.video_done = asyncio.Event()
-        self.audio_done = asyncio.Event()
+        self.audio_done: dict[int, asyncio.Event] = {}   # role -> done
         self.video_sent = 0
         self.audio_sent = 0
 
@@ -172,7 +182,8 @@ class StreamSession:
             max_s, drop = VOD_MAX_BUFFER, False
         # Video items are whole GOPs (~GOP_SECONDS each), audio items ~0.1 s.
         self.video_buf = TimedBuffer(int(max_s / GOP_SECONDS) + 1, drop)
-        self.audio_buf = TimedBuffer(int(max_s / _AUDIO_CHUNK_SECONDS), drop)
+        self.audio_bufs = {role: TimedBuffer(int(max_s / _AUDIO_CHUNK_SECONDS), drop)
+                           for role in self.channel_roles}
 
     # ----- producers -------------------------------------------------------
 
@@ -205,29 +216,36 @@ class StreamSession:
             self.video_buf.close()
             self.video_done.set()
 
-    async def _produce_audio(self) -> None:
-        # Same guarantee as video: audio_done is always set so a failed audio
-        # producer degrades to a silent stream rather than hanging the scheduler.
+    async def _produce_audio(self, role: int) -> None:
+        # One of these runs per negotiated channel role (self.channel_roles),
+        # each its own yt-dlp+ffmpeg pair extracting just that role's discrete
+        # source channel (see iter_audio's source_channel).  Same guarantee as
+        # video: this role's audio_done is always set so a failed producer
+        # degrades that role to silent rather than hanging the scheduler.
         agen = None
         samples = 0
+        buf = self.audio_bufs[role]
+        done = self.audio_done[role]
+        source_channel = ROLE_SOURCE_CHANNEL.get(role)   # None for mono (role 0)
         try:
             agen = iter_audio(self.url, self.rate, self.codec,
                               start=self._start_eff, end=self._end_eff,
-                              source_path=self._source_path, loop=self.loop)
+                              source_path=self._source_path, loop=self.loop,
+                              source_channel=source_channel)
             async for data in agen:
                 # Wrap here, where the running sample counter (= the chunk's PTS,
                 # spec §4.6) is known; the buffer then holds wire-ready bytes.
                 chunk = ccmf.chunk(samples, ccmf.TYPE_AUDIO,
-                                   ccmf.audio_payload(self._codec_id, data))
-                await self.audio_buf.put(samples / self.rate, chunk)
+                                   ccmf.audio_payload(self._codec_id, data, channel=role))
+                await buf.put(samples / self.rate, chunk)
                 samples += len(data) * self.codec.samples_per_byte
         except Exception:
-            log.exception("audio producer failed")
+            log.exception("audio producer failed (role=%d)", role)
         finally:
             if agen is not None:
                 await agen.aclose()
-            self.audio_buf.close()
-            self.audio_done.set()
+            buf.close()
+            done.set()
 
     # ----- scheduler helpers ----------------------------------------------
 
@@ -235,29 +253,41 @@ class StreamSession:
         return self.want_video and not self.video_done.is_set()
 
     def _producing_audio(self) -> bool:
-        return self.want_audio and not self.audio_done.is_set()
+        return self.want_audio and not all(e.is_set() for e in self.audio_done.values())
 
     # The "primary" stream drives prebuffer/underrun gating: video when present,
     # else audio (audio-only / --no-video).  Both streams are still released by PTS
     # against the shared clock — this only picks what startup/underrun keys off.
+    # With multiple audio roles, the first negotiated role stands in for all of
+    # them (they're independent pipelines off the same source, so their timing
+    # tracks closely enough for this purpose).
     def _primary_buf(self) -> TimedBuffer:
-        return self.video_buf if self.want_video else self.audio_buf
+        return self.video_buf if self.want_video else self.audio_bufs[self.channel_roles[0]]
 
     def _primary_done(self) -> asyncio.Event:
-        return self.video_done if self.want_video else self.audio_done
+        return self.video_done if self.want_video else self.audio_done[self.channel_roles[0]]
 
     def _primary_producing(self) -> bool:
         return self._producing_video() if self.want_video else self._producing_audio()
 
     def _oldest_pts(self) -> Optional[float]:
-        cands = [p for p in (self.video_buf.head_pts() if self.want_video else None,
-                             self.audio_buf.head_pts() if self.want_audio else None)
-                 if p is not None]
+        cands = []
+        if self.want_video:
+            p = self.video_buf.head_pts()
+            if p is not None:
+                cands.append(p)
+        if self.want_audio:
+            for buf in self.audio_bufs.values():
+                p = buf.head_pts()
+                if p is not None:
+                    cands.append(p)
         return min(cands) if cands else None
 
     def _all_done_and_empty(self) -> bool:
         v = (not self.want_video) or (self.video_done.is_set() and self.video_buf.empty())
-        a = (not self.want_audio) or (self.audio_done.is_set() and self.audio_buf.empty())
+        a = (not self.want_audio) or all(
+            self.audio_done[r].is_set() and self.audio_bufs[r].empty()
+            for r in self.channel_roles)
         return v and a
 
     async def _prebuffer(self) -> None:
@@ -275,13 +305,16 @@ class StreamSession:
 
     async def _release(self, ws, media_now: float) -> bool:
         sent = False
-        # Both buffers hold wire-ready CCMF chunks; audio leads so the speaker
+        # All buffers hold wire-ready CCMF chunks; audio leads so the speaker
         # stays buffered, video leads a little so the client-side PTS pacing
-        # never starves at a GOP boundary.
-        for _pts, data in self.audio_buf.pop_due(media_now + AUDIO_LEAD):
-            await ws.send_bytes(data)
-            self.audio_sent += 1
-            sent = True
+        # never starves at a GOP boundary.  Each audio role is an independent
+        # buffer/pipeline, so they're drained in whatever order dict iteration
+        # gives -- release order across roles doesn't matter, only PTS does.
+        for buf in self.audio_bufs.values():
+            for _pts, data in buf.pop_due(media_now + AUDIO_LEAD):
+                await ws.send_bytes(data)
+                self.audio_sent += 1
+                sent = True
         for _pts, data in self.video_buf.pop_due(media_now + VIDEO_LEAD):
             await ws.send_bytes(data)
             self.video_sent += 1
@@ -299,6 +332,18 @@ class StreamSession:
         # start/end only make sense for VOD; ignore them for live streams.
         self._start_eff = 0.0 if self.is_live else self.start
         self._end_eff = None if self.is_live else self.end
+
+        # Channel roles to actually produce (spec §4.6): mono unless the client
+        # asked for more than that.  The extra channel-count probe only runs in
+        # that case -- the common mono-only client (no CAPS channels beyond the
+        # mandatory bit) never pays for it.
+        if self.want_audio and self.caps_channels != ccmf.CAP_CHANNEL_MONO:
+            source_channels = await probe_audio_channels(self.url)
+            self.channel_roles = negotiate_channel_roles(self.caps_channels, source_channels)
+        else:
+            self.channel_roles = [0]
+        self.audio_done = {role: asyncio.Event() for role in self.channel_roles}
+
         self._setup_buffers()
 
         # Decide whether to decode from a downloaded file instead of the pipe (live
@@ -313,8 +358,9 @@ class StreamSession:
             elif needs_seekable_source(ext):
                 self._need_download = await probe_moov_at_end(self.url)
 
-        log.info("session: %s is_live=%s ext=%s audio=%s start=%ss end=%s loop=%s download=%s",
-                 self.url, self.is_live, ext, self.want_audio,
+        log.info("session: %s is_live=%s ext=%s audio=%s channels=%s "
+                 "start=%ss end=%s loop=%s download=%s",
+                 self.url, self.is_live, ext, self.want_audio, self.channel_roles,
                  self._start_eff, self._end_eff, self.loop and not self.is_live,
                  self._need_download)
 
@@ -338,7 +384,8 @@ class StreamSession:
             if self.want_video:
                 tasks.append(asyncio.create_task(self._produce_video()))
             if self.want_audio:
-                tasks.append(asyncio.create_task(self._produce_audio()))
+                for role in self.channel_roles:
+                    tasks.append(asyncio.create_task(self._produce_audio(role)))
 
             await self._prebuffer()
             await self._send_status(ws, ccmf.STATUS_PLAYING)

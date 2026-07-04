@@ -1,6 +1,7 @@
 -- LiveCC player  —  watches YouTube videos / live streams on a CC monitor (or the
 --                   computer's own terminal when none is attached, e.g. a tablet)
---                   plays audio on ALL attached speakers simultaneously
+--                   plays audio on ALL attached speakers simultaneously, unless
+--                   a livecc.speakers channel map says otherwise (see below)
 -- Run `livecc --help` for usage.
 --
 -- One WebSocket carries everything, speaking CCMF (the ComputerCraft Media
@@ -42,6 +43,13 @@ local function print_usage()
     print("  -h, --help    Show this help and exit")
     print("")
     print("Timestamps (TS): 90, 90s, 1m30s, 3h2m  (default unit: seconds)")
+    print("")
+    print("Speakers: every speaker plays the same mono audio by default. To assign")
+    print("speakers to channels instead, put a livecc.speakers file next to this")
+    print("script: a Lua table { [peripheralName] = \"roleName\" }, e.g.")
+    print("  { left = \"front_left\", right = \"front_right\" }")
+    print("Unlisted speakers stay silent. Roles: mono, front_left, front_right,")
+    print("center, lfe, surround_left, surround_right, rear_left, rear_right.")
     print("")
     print("Examples:")
     print("  livecc https://youtu.be/dQw4w9WgXcQ")
@@ -145,10 +153,55 @@ local TERM_W, TERM_H = mon.getSize()
 -- refresh lands between the palette call and the blits.  Buffering makes it atomic.
 local screen = window.create(mon, 1, 1, TERM_W, TERM_H, true)
 
+-- Optional per-speaker channel map: a file (SPEAKER_MAP_FILE) containing a Lua
+-- table literal { [peripheralName] = "roleName", ... }, e.g.
+--   { left = "front_left", right = "front_right", sub = "lfe" }
+-- Role names match the CCMF spec's channel roles (docs/cc-media-format.md §4.6).
+-- Absent, empty, or malformed -> nil, meaning the original/default strategy:
+-- every speaker plays the mono mix.  With a map active, a speaker with no
+-- entry in it is left out of every role entirely -- it stays silent, rather
+-- than guessing it should get the mono mix too.
+local SPEAKER_MAP_FILE = "livecc.speakers"
+local ROLE_IDS = {
+    mono = 0, front_left = 1, front_right = 2, center = 3, lfe = 4,
+    surround_left = 5, surround_right = 6, rear_left = 7, rear_right = 8,
+}
+
+local function load_speaker_map()
+    if not fs.exists(SPEAKER_MAP_FILE) then return nil end
+    local f = fs.open(SPEAKER_MAP_FILE, "r")
+    local content = f.readAll()
+    f.close()
+    local ok, map = pcall(textutils.unserialize, content)
+    if not ok or type(map) ~= "table" then
+        console("LiveCC: " .. SPEAKER_MAP_FILE .. " is malformed - ignoring (mono on all speakers)")
+        return nil
+    end
+    local resolved = {}
+    for name, role in pairs(map) do
+        local id = ROLE_IDS[role]
+        if id then
+            resolved[name] = id
+        else
+            console("LiveCC: " .. SPEAKER_MAP_FILE .. ": unknown role '" .. tostring(role)
+                .. "' for '" .. tostring(name) .. "' - ignoring that entry")
+        end
+    end
+    return next(resolved) and resolved or nil
+end
+
+local speaker_map = load_speaker_map()
+
 -- One physical speaker can be reachable under two names (e.g. adjacent AND via
 -- a wired modem).  Driving it twice plays every audio segment twice.  Two wraps
 -- of the same speaker share one audio buffer, so we detect duplicates: fill one
 -- buffer with silence and check whether the other then reports full.
+--
+-- Skipped entirely when a speaker map is active: the map names peripherals
+-- explicitly, so we trust it outright rather than second-guess it -- e.g. an
+-- operator who deliberately lists the same physical speaker under two roles
+-- gets exactly that (driving it twice is their call now, not something to
+-- silently collapse).
 local function dedupe_speakers(found)
     if #found < 2 then return found end
     local silence = {}
@@ -157,26 +210,43 @@ local function dedupe_speakers(found)
     for _, s in ipairs(found) do
         local dup = false
         for _, u in ipairs(unique) do
-            u.stop(); s.stop()
+            u.dev.stop(); s.dev.stop()
             local guard = 0
-            while u.playAudio(silence) and guard < 64 do guard = guard + 1 end
-            if not s.playAudio(silence) then dup = true end   -- shares u's buffer
-            u.stop(); s.stop()
+            while u.dev.playAudio(silence) and guard < 64 do guard = guard + 1 end
+            if not s.dev.playAudio(silence) then dup = true end   -- shares u's buffer
+            u.dev.stop(); s.dev.stop()
             if dup then break end
         end
         if not dup then unique[#unique + 1] = s end
     end
-    for _, u in ipairs(unique) do u.stop() end
+    for _, u in ipairs(unique) do u.dev.stop() end
     return unique
 end
 
 local found_speakers = {}
 for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "speaker" then
-        found_speakers[#found_speakers + 1] = peripheral.wrap(name)
+        found_speakers[#found_speakers + 1] = { name = name, dev = peripheral.wrap(name) }
     end
 end
-local speakers = dedupe_speakers(found_speakers)
+local deduped_speakers = speaker_map and found_speakers or dedupe_speakers(found_speakers)
+
+-- `speakers`: flat device list of every speaker found (used for the status
+-- message/count below, and as the playback list itself in the no-map path).
+-- `speakers_by_role`: role id -> device list, built only when a map is active;
+-- a speaker absent from the map gets no role at all, so it stays silent.
+local speakers = {}
+local speakers_by_role = {}
+for _, s in ipairs(deduped_speakers) do
+    speakers[#speakers + 1] = s.dev
+    if speaker_map then
+        local role = speaker_map[s.name]
+        if role then
+            speakers_by_role[role] = speakers_by_role[role] or {}
+            table.insert(speakers_by_role[role], s.dev)
+        end
+    end
+end
 
 -- A stream is on unless disabled by flag; audio additionally needs a speaker, so
 -- the no-speaker case folds into --no-audio (which is what fixes the old hang:
@@ -193,7 +263,21 @@ else
     if #found_speakers > #speakers then
         msg = msg .. " (" .. (#found_speakers - #speakers) .. " duplicate ignored)"
     end
+    if speaker_map then
+        msg = msg .. ", channel map from " .. SPEAKER_MAP_FILE
+    end
     console(msg)
+    if speaker_map then
+        local mapped_total = 0
+        for _, list in pairs(speakers_by_role) do mapped_total = mapped_total + #list end
+        if mapped_total == 0 then
+            console("LiveCC: warning - no attached speaker matches any entry in "
+                .. SPEAKER_MAP_FILE .. "; every speaker will stay silent")
+        elseif mapped_total < #speakers then
+            console("LiveCC: " .. (#speakers - mapped_total)
+                .. " unlisted speaker(s) will stay silent")
+        end
+    end
 end
 
 if not WANT_VIDEO and not WANT_AUDIO then
@@ -247,13 +331,26 @@ local function room_body()
         .. VIDEO_URL
 end
 
+-- channels: bit0 (mono) is always advertised — it's the mandatory fallback
+-- (spec §5.4) — plus one bit per positional role a speaker map assigns.  The
+-- server picks the best group it can actually produce from these bits (source
+-- channel count permitting; docs/cc-media-format.md §4.6) and may end up
+-- sending mono anyway if the source or a stereo/5.1/7.1 match isn't there.
+local function channels_mask()
+    local mask = 1
+    for role in pairs(speakers_by_role) do
+        if role > 0 then mask = mask + 2 ^ role end
+    end
+    return mask
+end
+
 local function caps_body()
     local flags = (WANT_VIDEO and 1 or 0) + (WANT_AUDIO and 2 or 0)
     local fps = math.max(1, math.min(255, floor(WANTED_FPS)))
     return string.char(flags)
         .. string.char(0)                -- video: no optional encodings yet
         .. string.char(3)                -- audio: pcm8 + dfpwm both decodable
-        .. pack_u16(1)                   -- channels: mono only
+        .. pack_u16(channels_mask())
         .. string.char(1)                -- compression: none only
         .. pack_u16(TERM_W) .. pack_u16(TERM_H) .. string.char(fps)
 end
@@ -271,8 +368,18 @@ local ws = nil
 -- rendering instead of stalling it.  A bounded queue keeps back-pressure from
 -- blocking rendering; drop oldest if the client falls behind.
 
-local audio_queue = {}
 local MAX_AUDIO_CHUNKS = 80            -- ~8 s at 0.1 s/chunk (safety cap)
+
+-- No-map (legacy) path: one flat queue, every speaker plays every chunk.
+local audio_queue = {}
+
+-- Speaker-map path: one queue per channel role, only drained by the speakers
+-- assigned that role.  Built for exactly the roles present in speakers_by_role
+-- (spec §5.4: server may send one stream per role we asked for in CAPS).
+local audio_queues = {}
+if speaker_map then
+    for role in pairs(speakers_by_role) do audio_queues[role] = {} end
+end
 
 local dfpwm = require("cc.audio.dfpwm")
 
@@ -291,7 +398,13 @@ end
 local function handle_audio(payload)
     local hdr = payload:byte(1)
     local codec, channel = floor(hdr / 16), hdr % 16
-    if channel ~= 0 then return end      -- we only asked for mono
+    local queue
+    if speaker_map then
+        queue = audio_queues[channel]     -- nil if no speaker was assigned this role
+    elseif channel == 0 then
+        queue = audio_queue
+    end
+    if not queue then return end         -- no speaker wants this role
     local samples
     if codec == 0 then
         samples = decode_pcm8(payload:sub(2))
@@ -300,23 +413,23 @@ local function handle_audio(payload)
     else
         return                           -- unknown codec: skip the chunk
     end
-    audio_queue[#audio_queue + 1] = samples
-    while #audio_queue > MAX_AUDIO_CHUNKS do
-        table.remove(audio_queue, 1)     -- drop oldest, stay in sync
+    queue[#queue + 1] = samples
+    while #queue > MAX_AUDIO_CHUNKS do
+        table.remove(queue, 1)           -- drop oldest, stay in sync
     end
-    os.queueEvent("livecc_audio")        -- wake the audio player
+    os.queueEvent("livecc_audio")        -- wake the audio player(s)
 end
 
-local function play_on_all(samples)
+local function play_on(devs, samples)
     if #samples == 0 then return end
     local pending = {}
-    for i, spk in ipairs(speakers) do
+    for i, spk in ipairs(devs) do
         if not spk.playAudio(samples) then pending[i] = true end
     end
     while next(pending) do
         os.pullEvent("speaker_audio_empty")
         for i in pairs(pending) do
-            if speakers[i].playAudio(samples) then pending[i] = nil end
+            if devs[i].playAudio(samples) then pending[i] = nil end
         end
     end
 end
@@ -667,13 +780,30 @@ if WANT_VIDEO then
     end
 end
 
--- Audio player: drains the queue; may block on speaker_audio_empty.  Only present
--- when audio is on (WANT_AUDIO already requires at least one speaker).
-if WANT_AUDIO then
+-- Audio player(s): drain the queue(s); may block on speaker_audio_empty.  Only
+-- present when audio is on (WANT_AUDIO already requires at least one speaker).
+-- No map: a single task drains the flat queue onto every speaker (unchanged
+-- default behaviour).  With a map: one task per channel role, each draining
+-- only into the speakers assigned that role, so a stalled role's speakers
+-- can't block another role's playback.
+if WANT_AUDIO and speaker_map then
+    for role, devs in pairs(speakers_by_role) do
+        local queue = audio_queues[role]
+        tasks[#tasks + 1] = function()
+            while true do
+                if #queue > 0 then
+                    play_on(devs, table.remove(queue, 1))
+                else
+                    os.pullEvent("livecc_audio")   -- sleep until a chunk arrives
+                end
+            end
+        end
+    end
+elseif WANT_AUDIO then
     tasks[#tasks + 1] = function()
         while true do
             if #audio_queue > 0 then
-                play_on_all(table.remove(audio_queue, 1))
+                play_on(speakers, table.remove(audio_queue, 1))
             else
                 os.pullEvent("livecc_audio")   -- sleep until a chunk arrives
             end

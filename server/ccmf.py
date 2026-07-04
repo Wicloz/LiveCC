@@ -45,10 +45,18 @@ ENC_RAW = 0
 ENC_DELTA = 1
 ENC_REPEAT = 2
 
-# Audio codecs (a-hdr high nibble) and channel roles (a-hdr low nibble).
+# Audio codecs (a-hdr high nibble) and channel roles (a-hdr low nibble, spec §4.6).
 CODEC_PCM8 = 0
 CODEC_DFPWM = 1
-CHANNEL_MONO = 0                 # positional roles (stereo/5.1/7.1) are deferred
+CHANNEL_MONO = 0
+CHANNEL_FRONT_LEFT = 1
+CHANNEL_FRONT_RIGHT = 2
+CHANNEL_CENTER = 3
+CHANNEL_LFE = 4
+CHANNEL_SURROUND_LEFT = 5
+CHANNEL_SURROUND_RIGHT = 6
+CHANNEL_REAR_LEFT = 7
+CHANNEL_REAR_RIGHT = 8
 
 MAX_DURATION = 0xFFFF            # u16 samples (~1.36 s); longer holds use repeats
 _CHUNK_HEADER = 11               # marker + PTS + length + type
@@ -342,7 +350,16 @@ STATUS_PLAYING = 1
 CAP_AUDIO_PCM8 = 0x01
 CAP_AUDIO_DFPWM = 0x02
 CAP_COMPRESS_NONE = 0x01
-CAP_CHANNEL_MONO = 0x0001        # bit N = accepts channel role N
+# channels: bit N = accepts channel role N (spec §5.4, roles per §4.6).
+CAP_CHANNEL_MONO = 1 << CHANNEL_MONO
+CAP_CHANNEL_FRONT_LEFT = 1 << CHANNEL_FRONT_LEFT
+CAP_CHANNEL_FRONT_RIGHT = 1 << CHANNEL_FRONT_RIGHT
+CAP_CHANNEL_CENTER = 1 << CHANNEL_CENTER
+CAP_CHANNEL_LFE = 1 << CHANNEL_LFE
+CAP_CHANNEL_SURROUND_LEFT = 1 << CHANNEL_SURROUND_LEFT
+CAP_CHANNEL_SURROUND_RIGHT = 1 << CHANNEL_SURROUND_RIGHT
+CAP_CHANNEL_REAR_LEFT = 1 << CHANNEL_REAR_LEFT
+CAP_CHANNEL_REAR_RIGHT = 1 << CHANNEL_REAR_RIGHT
 
 
 def control(opcode: int, body: bytes = b"") -> bytes:

@@ -109,7 +109,7 @@ def _patch(monkeypatch, n_video, n_audio, is_live, ext="webm", moov_at_end=True)
             yield pts, ccmf.chunk(pts, ccmf.TYPE_VIDEO, b"\x00" * 16)
 
     async def fake_audio(url, rate, codec=None, start=0, end=None,
-                         source_path=None, loop=False):
+                         source_path=None, loop=False, source_channel=None):
         for _ in range(n_audio):
             yield b"\x00" * 4096
 
@@ -156,6 +156,49 @@ def test_audio_chunks_carry_sample_pts_and_codec(monkeypatch):
         assert len(data) == 4096
         ptss.append(pts)
     assert ptss == [0, 4096, 8192]      # PCM: 1 byte/sample -> running sample index
+
+
+def test_stereo_map_produces_both_channel_roles(monkeypatch):
+    # A client whose CAPS ask for a full front_left+front_right pair, against a
+    # (fake) 2-channel source, gets one independent audio stream per role,
+    # each tagged with its own channel id -- not both collapsed into mono.
+    _patch(monkeypatch, n_video=0, n_audio=3, is_live=False)
+
+    async def fake_channels(url):
+        return 2
+
+    monkeypatch.setattr(session, "probe_audio_channels", fake_channels)
+    caps_channels = ccmf.CAP_CHANNEL_MONO | ccmf.CAP_CHANNEL_FRONT_LEFT | ccmf.CAP_CHANNEL_FRONT_RIGHT
+    ws = FakeWS()
+    s = StreamSession("u", w=4, h=2, fps=50, want_audio=True, want_video=False,
+                      caps_channels=caps_channels)
+    run(s.run(ws))
+
+    assert s.channel_roles == [ccmf.CHANNEL_FRONT_LEFT, ccmf.CHANNEL_FRONT_RIGHT]
+    auds = _auds(ws.bins)
+    assert len(auds) == 6                    # 3 chunks per role x 2 roles
+    channels_seen = set()
+    for chunk in auds:
+        _pts, _ctype, payload, _ = ccmf.parse_chunk(chunk)
+        _codec, channel, _data = ccmf.parse_audio_payload(payload)
+        channels_seen.add(channel)
+    assert channels_seen == {ccmf.CHANNEL_FRONT_LEFT, ccmf.CHANNEL_FRONT_RIGHT}
+
+
+def test_mono_only_caps_never_probes_channel_count(monkeypatch):
+    # The common case (no speaker map -> CAPS channels is just the mandatory
+    # mono bit) must not pay for the extra channel-count probe at all.
+    _patch(monkeypatch, n_video=0, n_audio=2, is_live=False)
+
+    async def fail_probe(url):
+        raise AssertionError("must not probe channel count for a mono-only client")
+
+    monkeypatch.setattr(session, "probe_audio_channels", fail_probe)
+    ws = FakeWS()
+    s = StreamSession("u", w=4, h=2, fps=50, want_audio=True, want_video=False)
+    run(s.run(ws))
+    assert s.channel_roles == [0]
+    assert len(_auds(ws.bins)) == 2
 
 
 def test_session_reports_error_when_no_video(monkeypatch):
@@ -382,7 +425,7 @@ def test_cancel_finalizes_producer_generator(monkeypatch):
             closed["video"] = True
 
     async def fake_audio(url, rate, codec=None, start=0, end=None,
-                         source_path=None, loop=False):
+                         source_path=None, loop=False, source_channel=None):
         if False:
             yield b""
 

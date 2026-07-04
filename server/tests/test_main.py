@@ -170,6 +170,7 @@ def test_negotiate_defaults_prefer_pcm():
         "end": 20.0,
         "loop": True,
         "audio_codec": PCM,
+        "caps_channels": ccmf.CAP_CHANNEL_MONO,
     }
 
 

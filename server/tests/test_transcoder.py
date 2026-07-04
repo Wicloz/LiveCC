@@ -257,6 +257,44 @@ def test_audio_ffmpeg_cmd_has_no_server_side_filtering():
         assert "-filter:a" not in cmd
 
 
+def test_audio_ffmpeg_cmd_source_channel_extracts_discrete_channel():
+    # A positional role (source_channel set) must pick exactly one discrete
+    # source channel via `pan`, not downmix -- so it doesn't bleed into its
+    # sibling channel (e.g. front_left picking up front_right's content).
+    cmd = transcoder._audio_ffmpeg_cmd(48000, source_channel=1)
+    assert cmd[cmd.index("-af") + 1] == "pan=mono|c0=c1"
+    assert "-ac" not in cmd
+
+
+def test_negotiate_channel_roles_falls_back_to_mono():
+    # No positional roles requested, or source too thin for the smallest group.
+    assert transcoder.negotiate_channel_roles(ccmf.CAP_CHANNEL_MONO, 2) == [0]
+    assert transcoder.negotiate_channel_roles(
+        ccmf.CAP_CHANNEL_FRONT_LEFT | ccmf.CAP_CHANNEL_FRONT_RIGHT, 1) == [0]
+
+
+def test_negotiate_channel_roles_picks_stereo():
+    caps = ccmf.CAP_CHANNEL_MONO | ccmf.CAP_CHANNEL_FRONT_LEFT | ccmf.CAP_CHANNEL_FRONT_RIGHT
+    assert transcoder.negotiate_channel_roles(caps, source_channels=2) == [1, 2]
+
+
+def test_negotiate_channel_roles_needs_every_role_in_the_group():
+    # Only front_left requested (not front_right) -> not a full stereo pair,
+    # falls back to mono even though the source has 2 channels.
+    caps = ccmf.CAP_CHANNEL_MONO | ccmf.CAP_CHANNEL_FRONT_LEFT
+    assert transcoder.negotiate_channel_roles(caps, source_channels=2) == [0]
+
+
+def test_negotiate_channel_roles_picks_surround_51():
+    roles = (1, 2, 3, 4, 5, 6)
+    caps = ccmf.CAP_CHANNEL_MONO
+    for r in roles:
+        caps |= 1 << r
+    assert transcoder.negotiate_channel_roles(caps, source_channels=6) == list(roles)
+    # Same request but a stereo source can't fill 5.1 -> steps down to stereo.
+    assert transcoder.negotiate_channel_roles(caps, source_channels=2) == [1, 2]
+
+
 # --------------------------------------------------------------------------- #
 # _kill_wait
 # --------------------------------------------------------------------------- #

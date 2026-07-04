@@ -119,7 +119,11 @@ def _negotiate(room: ccmf.Room, caps: ccmf.Caps) -> Optional[dict]:
     Audio is optional: the codec is picked from the client's mask (pcm8
     preferred — the speaker's native format — else dfpwm); a client that
     advertises no usable codec, or no mono channel role (the mandatory
-    fallback, spec §5.4), simply gets no audio.
+    fallback, spec §5.4), simply gets no audio.  Positional channel roles
+    (front_left/right, 5.1, 7.1) aren't decided here — the client's raw
+    `channels` bitmask is just forwarded as caps_channels; StreamSession.run()
+    negotiates the actual role set once it knows the source's real channel
+    count (transcoder.negotiate_channel_roles).
     """
     codec = None
     if caps.audio_mask & ccmf.CAP_AUDIO_PCM8:
@@ -141,6 +145,7 @@ def _negotiate(room: ccmf.Room, caps: ccmf.Caps) -> Optional[dict]:
         "end": room.end_ms / 1000.0 if room.end_ms is not None else None,
         "loop": room.loop,
         "audio_codec": codec or PCM,
+        "caps_channels": caps.channels,
     }
 
 
@@ -154,6 +159,7 @@ def _sync_signature(kwargs: dict) -> tuple:
         kwargs["want_audio"],
         kwargs["want_video"],
         kwargs["audio_codec"].name,
+        kwargs["caps_channels"],
     )
 
 
