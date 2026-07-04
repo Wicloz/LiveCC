@@ -1,17 +1,20 @@
 """
 StreamSession — server-side buffering, A/V sync, and pacing.
 
-Two producers (video, audio) fill bounded TimedBuffers; each item is tagged with
-a media-time PTS derived from its output position (frame i -> i/fps; audio byte
-k -> k/rate) on one shared timeline.  A single scheduler advances a media clock
-and releases items whose PTS is due, sending them over one WebSocket:
+Two producers (video, audio) fill bounded TimedBuffers; each item is a finished
+CCMF chunk tagged with a media-time PTS derived from its output position (video
+GOP -> its first frame's index/fps; audio byte k -> k/rate) on one shared
+timeline.  A single scheduler advances a media clock and releases chunks whose
+PTS is due, writing them to one sink (the WebSocket, or a sync-group fanout):
 
-    32vid header -> binary message  "32VD" + W,H,fps,nstreams,flags  (once, up front)
-    video chunk  -> binary message  32vid chunk type 0 (one uncompressed frame)
-    audio chunk  -> binary message  32vid chunk type 1 (PCM, or DFPWM if crunchy)
-    status       -> text  message   "BUFFERING" / "PLAYING" / "ERROR ..."
+    video chunk  -> binary message  CCMF chunk type 0 (one self-contained GOP)
+    audio chunk  -> binary message  CCMF chunk type 1 (PCM or DFPWM samples)
+    status       -> binary message  CCMF control frame STATUS / ERROR / END
 
 Because both streams are released against the same clock, they stay in sync.
+Audio is released AUDIO_LEAD early (keeps the CC speaker buffer full); video
+GOPs are released VIDEO_LEAD early (the client paces the frames inside each
+chunk by PTS, so the lead is jitter slack, not a sync shift).
 
 Underrun / hiccup policy:
   * VOD  — buffers backpressure the producer; on underrun the clock PAUSES and
@@ -29,24 +32,16 @@ import shutil
 import tempfile
 from typing import Optional
 
-from cc_encoder import (
-    V32_FLAG_BASE,
-    V32_FLAG_DFPWM_AUDIO,
-    V32_TYPE_AUDIO,
-    V32_TYPE_VIDEO,
-    v32_chunk,
-    v32_stream_header,
-)
+import ccmf
 from transcoder import (
     AUDIO_CHUNK_SECONDS,
-    DFPWM,
+    GOP_SECONDS,
     PCM,
     download_source,
     iter_audio,
     iter_video,
     needs_download,
     needs_seekable_source,
-    parse_timestamp,
     probe_moov_at_end,
     probe_source_info,
 )
@@ -61,9 +56,13 @@ LIVE_MAX_BUFFER = 4.0
 
 # Release audio this far ahead of the playback clock so the CC speaker buffer
 # stays full (the speaker plays at 48 kHz, so playback stays at realtime — the
-# lead is pure jitter slack and does not desync from video, which is sent at
-# exactly the clock).
+# lead is pure jitter slack and does not desync from video).
 AUDIO_LEAD = 2.0
+
+# Release video GOP chunks this far ahead of the clock.  The client renders each
+# frame at its own PTS, so an early chunk just sits in its queue — this only
+# hides network/scheduler jitter at GOP boundaries.
+VIDEO_LEAD = 0.5
 
 _AUDIO_CHUNK_SECONDS = AUDIO_CHUNK_SECONDS   # ~0.1 s, same for both codecs
 
@@ -122,31 +121,34 @@ class TimedBuffer:
 
 
 class StreamSession:
+    """One production: a source URL transcoded and paced to one sink.
+
+    `start`/`end` are seconds into the source (the ROOM message carries ms; the
+    caller converts).  `audio_codec` is the transcoder.AudioCodec negotiated
+    from the client's CAPS (PCM preferred, DFPWM fallback).
+    """
+
     def __init__(self, url: str, w: int, h: int, fps: int, want_audio: bool,
-                 want_video: bool = True, start: str = "", end: str = "",
-                 loop: bool = False, rate: int = 48000, crunchy: bool = False) -> None:
+                 want_video: bool = True, start: float = 0,
+                 end: Optional[float] = None, loop: bool = False,
+                 rate: int = 48000, audio_codec=PCM) -> None:
         self.url = url
         self.w, self.h, self.fps = w, h, fps
         self.want_audio = want_audio
         self.want_video = want_video
         self.rate = rate
-        # --crunchy is the low-fidelity/low-bandwidth mode.  For audio it picks
-        # 1-bit DFPWM over raw 8-bit PCM; for video it drops the adaptive per-frame
-        # palette back to CC's fixed default palette (the simplest/cheapest client
-        # path).  (It also lowers video resolution, but that's driven by the smaller
-        # w/h the client sends, not here.)
-        self.codec = DFPWM if crunchy else PCM
-        self.adaptive_palette = not crunchy
+        self.codec = audio_codec
+        self._codec_id = ccmf.CODEC_PCM8 if audio_codec.name == "pcm" \
+            else ccmf.CODEC_DFPWM
 
-        self.start = parse_timestamp(start)             # seconds, 0 if absent
-        _end = parse_timestamp(end)
-        self.end: Optional[int] = _end if _end > 0 else None
+        self.start = max(0.0, float(start))
+        self.end: Optional[float] = float(end) if end else None
         self.loop = loop
 
         self.is_live = False
         self.prebuffer = VOD_PREBUFFER
-        self._start_eff = 0                             # effective offset (VOD only)
-        self._end_eff: Optional[int] = None
+        self._start_eff = 0.0                           # effective offset (VOD only)
+        self._end_eff: Optional[float] = None
         self._source_path: Optional[str] = None         # temp file (loop / seekable)
         self._tmpdir: Optional[str] = None
         self._need_download = False                      # decode from a downloaded file
@@ -168,7 +170,8 @@ class StreamSession:
         else:
             self.prebuffer = VOD_PREBUFFER
             max_s, drop = VOD_MAX_BUFFER, False
-        self.video_buf = TimedBuffer(int(max_s * self.fps), drop)
+        # Video items are whole GOPs (~GOP_SECONDS each), audio items ~0.1 s.
+        self.video_buf = TimedBuffer(int(max_s / GOP_SECONDS) + 1, drop)
         self.audio_buf = TimedBuffer(int(max_s / _AUDIO_CHUNK_SECONDS), drop)
 
     # ----- producers -------------------------------------------------------
@@ -188,12 +191,12 @@ class StreamSession:
         try:
             agen = iter_video(self.url, self.w, self.h, self.fps,
                               start=self._start_eff, end=self._end_eff,
-                              source_path=self._source_path, loop=self.loop,
-                              adaptive=self.adaptive_palette)
-            # iter_video tags each frame with its source PTS and may skip source
-            # frames to keep up (adaptive pacing) — so trust its pts, don't count.
-            async for pts, frame in agen:
-                await self.video_buf.put(pts, frame)
+                              source_path=self._source_path, loop=self.loop)
+            # iter_video yields finished CCMF GOP chunks tagged with their first
+            # frame's PTS in samples; it may skip source frames to keep up
+            # (adaptive pacing) — so trust its pts, don't count.
+            async for pts, chunk in agen:
+                await self.video_buf.put(pts / ccmf.SAMPLE_RATE, chunk)
         except Exception:
             log.exception("video producer failed")
         finally:
@@ -211,9 +214,13 @@ class StreamSession:
             agen = iter_audio(self.url, self.rate, self.codec,
                               start=self._start_eff, end=self._end_eff,
                               source_path=self._source_path, loop=self.loop)
-            async for chunk in agen:
+            async for data in agen:
+                # Wrap here, where the running sample counter (= the chunk's PTS,
+                # spec §4.6) is known; the buffer then holds wire-ready bytes.
+                chunk = ccmf.chunk(samples, ccmf.TYPE_AUDIO,
+                                   ccmf.audio_payload(self._codec_id, data))
                 await self.audio_buf.put(samples / self.rate, chunk)
-                samples += len(chunk) * self.codec.samples_per_byte
+                samples += len(data) * self.codec.samples_per_byte
         except Exception:
             log.exception("audio producer failed")
         finally:
@@ -258,23 +265,25 @@ class StreamSession:
         while not done.is_set() and buf.seconds() < self.prebuffer:
             await asyncio.sleep(0.05)
 
-    def _v32_header(self) -> bytes:
-        nstreams = (1 if self.want_video else 0) + (1 if self.want_audio else 0)
-        flags = V32_FLAG_BASE | (V32_FLAG_DFPWM_AUDIO if self.codec is DFPWM else 0)
-        return v32_stream_header(self.w, self.h, self.fps, nstreams, flags)
+    async def _send_status(self, ws, status: int) -> None:
+        await ws.send_bytes(ccmf.control(ccmf.OP_STATUS, bytes([status])))
+
+    async def _send_error(self, ws, message: str) -> None:
+        # ERROR bodies are client-facing: keep them sanitized (no internal
+        # detail; details go to the server log), per spec §7.
+        await ws.send_bytes(ccmf.control(ccmf.OP_ERROR, message.encode("utf-8")))
 
     async def _release(self, ws, media_now: float) -> bool:
         sent = False
-        # Each item goes out as a 32vid chunk (self-delimiting, typed) so video and
-        # audio interleave on one stream.  Audio leads so the speaker stays
-        # buffered; video is sent exactly on time.
+        # Both buffers hold wire-ready CCMF chunks; audio leads so the speaker
+        # stays buffered, video leads a little so the client-side PTS pacing
+        # never starves at a GOP boundary.
         for _pts, data in self.audio_buf.pop_due(media_now + AUDIO_LEAD):
-            samples = len(data) * self.codec.samples_per_byte
-            await ws.send_bytes(v32_chunk(V32_TYPE_AUDIO, samples, data))
+            await ws.send_bytes(data)
             self.audio_sent += 1
             sent = True
-        for _pts, data in self.video_buf.pop_due(media_now):
-            await ws.send_bytes(v32_chunk(V32_TYPE_VIDEO, 1, data))   # one frame/chunk
+        for _pts, data in self.video_buf.pop_due(media_now + VIDEO_LEAD):
+            await ws.send_bytes(data)
             self.video_sent += 1
             sent = True
         return sent
@@ -283,12 +292,12 @@ class StreamSession:
 
     async def run(self, ws) -> None:
         if not self.want_video and not self.want_audio:
-            await ws.send_text("ERROR Nothing to play (audio and video both disabled).")
+            await self._send_error(ws, "Nothing to play (audio and video both disabled).")
             return
         loop = asyncio.get_running_loop()
         self.is_live, ext = await probe_source_info(self.url)
         # start/end only make sense for VOD; ignore them for live streams.
-        self._start_eff = 0 if self.is_live else self.start
+        self._start_eff = 0.0 if self.is_live else self.start
         self._end_eff = None if self.is_live else self.end
         self._setup_buffers()
 
@@ -311,11 +320,7 @@ class StreamSession:
 
         tasks: list[asyncio.Task] = []
         try:
-            # The 32vid file header opens the stream (W/H/fps/flags); the client
-            # decodes the chunks that follow against it.  Re-sent only if fps
-            # changes (it doesn't mid-session here).
-            await ws.send_bytes(self._v32_header())
-            await ws.send_text("BUFFERING")
+            await self._send_status(ws, ccmf.STATUS_BUFFERING)
 
             # Download the [start,end] section to a temp file when we need to replay
             # it (--loop) or can't pipe-stream it (GIF / MP4 moov-at-end).  Then
@@ -326,8 +331,8 @@ class StreamSession:
                     self.url, self._tmpdir, self._start_eff, self._end_eff,
                     self.want_audio)
                 if not self._source_path:
-                    await ws.send_text(
-                        "ERROR Failed to prepare source. Check the server logs.")
+                    await self._send_error(
+                        ws, "Failed to prepare source. Check the server logs.")
                     return
 
             if self.want_video:
@@ -336,7 +341,7 @@ class StreamSession:
                 tasks.append(asyncio.create_task(self._produce_audio()))
 
             await self._prebuffer()
-            await ws.send_text("PLAYING")
+            await self._send_status(ws, ccmf.STATUS_PLAYING)
 
             t0 = loop.time()
             origin = self._oldest_pts() or 0.0   # media time of the first item
@@ -358,16 +363,18 @@ class StreamSession:
                         await asyncio.sleep(0.005)
                 else:  # VOD
                     if self._primary_buf().empty() and self._primary_producing():
-                        await ws.send_text("BUFFERING")     # underrun -> pause
-                        await self._prebuffer()
-                        await ws.send_text("PLAYING")
+                        await self._send_status(ws, ccmf.STATUS_BUFFERING)
+                        await self._prebuffer()             # underrun -> pause
+                        await self._send_status(ws, ccmf.STATUS_PLAYING)
                         origin, t0 = media_now, loop.time()
                     elif not sent:
                         await asyncio.sleep(0.005)
 
             if (self.video_sent if self.want_video else self.audio_sent) == 0:
                 what = "video" if self.want_video else "audio"
-                await ws.send_text(f"ERROR Failed to load {what}. Check the server logs.")
+                await self._send_error(ws, f"Failed to load {what}. Check the server logs.")
+            else:
+                await ws.send_bytes(ccmf.control(ccmf.OP_END))
         except Exception:
             # Catch-all for anything not handled deeper (producers self-contain
             # their errors): log the traceback and tell the client something broke
@@ -376,7 +383,7 @@ class StreamSession:
             # down normally.
             log.exception("session: unexpected error")
             try:
-                await ws.send_text("ERROR Internal server error. Check the server logs.")
+                await self._send_error(ws, "Internal server error. Check the server logs.")
             except Exception:
                 pass   # socket may already be gone; don't mask the original error
         finally:

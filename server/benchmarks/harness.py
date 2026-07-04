@@ -28,7 +28,7 @@ if str(_SERVER_DIR) not in sys.path:
 # the bench modules can keep importing them from `harness`.
 from cc_media import (  # noqa: E402  (needs the sys.path insert above)
     GRIDS, MEDIA_DIR, PREVIEW_DIR,
-    decode_frame, find_media, have_ffmpeg, sample_frames,
+    find_media, have_ffmpeg, render_cells, sample_frames,
 )
 
 

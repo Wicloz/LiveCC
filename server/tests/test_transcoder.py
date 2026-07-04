@@ -5,8 +5,9 @@ from pathlib import Path
 
 import pytest
 
+import ccmf
 import transcoder
-from transcoder import _FrameSplitter, _kill_wait, _ytdlp_cmd, parse_timestamp
+from transcoder import _FrameSplitter, _kill_wait, _ytdlp_cmd
 
 
 # --------------------------------------------------------------------------- #
@@ -17,9 +18,15 @@ def _px_dims(term_w, term_h):
     return term_w * 2, term_h * 3   # 2x3 sub-pixels per cell
 
 
-def _v32_size(w, h):
-    # 32vid uncompressed frame: screen ceil(W*H/8)*5 + colour W*H + palette 48.
-    return ((w * h + 7) // 8) * 5 + w * h + 48
+def _encode_one_gop(frame, fps=10):
+    """One frame through the real GOP encoder -> a parsed CCMF video chunk."""
+    from cc_encoder import GopEncoder
+    gop = GopEncoder(nominal_duration=round(ccmf.SAMPLE_RATE / fps))
+    gop.add(0, frame)
+    _pts, chunk = gop.flush()
+    pts, ctype, payload, _ = ccmf.parse_chunk(chunk)
+    assert (pts, ctype) == (0, ccmf.TYPE_VIDEO)
+    return ccmf.parse_video_payload(payload)
 
 
 def test_splitter_emits_one_complete_frame():
@@ -28,10 +35,12 @@ def test_splitter_emits_one_complete_frame():
     frames = list(s.push(bytes([17]) * (px_w * px_h * 3)))   # solid
     assert len(frames) == 1
     assert s.count == 1
-    # push() now yields the raw (H, W, 3) array; encoding is done separately.
+    # push() yields the raw (H, W, 3) array; encoding is done separately.
     assert frames[0].shape == (px_h, px_w, 3)
-    # encode_frame emits a 32vid uncompressed frame for the 4x2 cell grid.
-    assert len(transcoder.encode_frame(frames[0])) == _v32_size(4, 2)
+    # The split frame encodes into a well-formed CCMF GOP for the 4x2 cell grid.
+    w, h, decoded = _encode_one_gop(frames[0])
+    assert (w, h) == (4, 2)
+    assert decoded[0].encoding == ccmf.ENC_RAW
 
 
 def test_splitter_buffers_partial_frames():
@@ -94,6 +103,13 @@ def test_ytdlp_cmd_section_start_and_end():
     assert cmd[cmd.index("--download-sections") + 1] == "*30-90"
 
 
+def test_ytdlp_cmd_section_subsecond():
+    # ROOM start/end arrive in ms, so fractional seconds must survive the round
+    # trip into the yt-dlp argument.
+    cmd = _ytdlp_cmd("https://x", transcoder._VIDEO_FMT, start=90.5, end=120.25)
+    assert cmd[cmd.index("--download-sections") + 1] == "*90.5-120.25"
+
+
 def test_audio_fmt_prefers_best_source():
     # We resample to 8-bit PCM; feeding it the *worst* YouTube stream stacks a
     # second lossy pass on an already-crushed one (audible artifacts).  Pin
@@ -103,21 +119,6 @@ def test_audio_fmt_prefers_best_source():
     assert "worstaudio" not in fmt
     # webm/opus still preferred first for streaming-pipe compatibility.
     assert fmt.startswith("bestaudio[ext=webm]")
-
-
-@pytest.mark.parametrize("value,expected", [
-    ("90", 90),
-    ("90s", 90),
-    ("1m30s", 90),
-    ("3h2m", 10920),
-    ("1h2m3s", 3723),
-    ("25234s", 25234),
-    ("", 0),
-    (None, 0),
-    ("garbage", 0),
-])
-def test_parse_timestamp(value, expected):
-    assert parse_timestamp(value) == expected
 
 
 def test_video_ffmpeg_cmd_reads_pipe_outputs_rgb24():
@@ -177,7 +178,7 @@ def test_audio_ffmpeg_cmd_is_raw_pcm_mono():
     assert "dfpwm" not in cmd
 
 
-def test_audio_ffmpeg_cmd_dfpwm_for_crunchy():
+def test_audio_ffmpeg_cmd_dfpwm_when_negotiated():
     cmd = transcoder._audio_ffmpeg_cmd(48000, transcoder.DFPWM)
     assert cmd[cmd.index("-c:a") + 1] == "dfpwm"
     assert cmd[cmd.index("-f") + 1] == "dfpwm"
@@ -290,9 +291,9 @@ def test_ffmpeg_rawvideo_feeds_splitter():
     s = _FrameSplitter(px_w, px_h)
     raw_frames = list(s.push(proc.stdout))
     assert len(raw_frames) == fps
-    enc = transcoder.encode_frame(raw_frames[0])
-    # a 32vid uncompressed frame: screen + colour + 48-byte palette for the grid.
-    assert len(enc) == _v32_size(term_w, term_h)
+    w, h, decoded = _encode_one_gop(raw_frames[0], fps)
+    assert (w, h) == (term_w, term_h)
+    assert decoded[0].encoding == ccmf.ENC_RAW
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
@@ -328,29 +329,30 @@ def _ffmpeg_make(path, vcodec, *, acodec=None, extra=()):
     return subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
 
-def _collect_video_from_file(path, limit):
-    frames = []
+def _collect_video_from_file(path, limit=None):
+    chunks = []
 
     async def go():
         agen = transcoder.iter_video("ignored", term_w=8, term_h=4, fps=5,
                                      source_path=str(path))
         try:
-            async for _pts, f in agen:        # iter_video yields (pts, frame)
-                frames.append(f)
-                if len(frames) >= limit:
+            async for pts, chunk in agen:     # iter_video yields (pts, GOP chunk)
+                chunks.append((pts, chunk))
+                if limit and len(chunks) >= limit:
                     break
         finally:
             await agen.aclose()
 
     asyncio.run(go())
-    return frames
+    return chunks
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
 def test_adaptive_pacing_skips_frames_when_encode_is_slow(tmp_path, monkeypatch):
-    # When encode_frame can't keep up, iter_video must encode only a subset of
-    # source frames (so the stream doesn't out-run the encoder) while the PTS it
-    # emits stay on the true source grid (i/fps) so A/V sync is preserved.
+    # When the encoder can't keep up, iter_video must encode only a subset of
+    # source frames (so the stream doesn't out-run the encoder) while the frame
+    # PTS/durations it emits stay on the true source grid (i/fps) so A/V sync is
+    # preserved.
     import time
 
     import cc_encoder
@@ -359,69 +361,39 @@ def test_adaptive_pacing_skips_frames_when_encode_is_slow(tmp_path, monkeypatch)
     if _ffmpeg_make(path, "mpeg4").returncode != 0:     # ~10 frames at 10 fps
         pytest.skip("ffmpeg can't build the clip")
 
-    real = cc_encoder.encode_frame
+    class SlowGop(cc_encoder.GopEncoder):
+        def add(self, pts, frame):
+            time.sleep(0.15)     # 0.15*10*1.15 = 1.7 -> stride 2 -> ~half the frames
+            return super().add(pts, frame)
 
-    def slow(arr, adaptive=True):   # iter_video calls encode_frame(arr, adaptive)
-        time.sleep(0.15)            # 0.15*10*1.15 = 1.7 -> stride 2 -> ~half the frames
-        return real(arr, adaptive)
+    monkeypatch.setattr(transcoder, "GopEncoder", SlowGop)
 
-    monkeypatch.setattr(transcoder, "encode_frame", slow)
-
-    pts_list = []
+    frames = []
 
     async def go():
         agen = transcoder.iter_video("ignored", term_w=8, term_h=4, fps=10,
                                      source_path=str(path))
         try:
-            async for pts, _frame in agen:
-                pts_list.append(pts)
+            async for pts, chunk in agen:
+                cpts, _t, payload, _ = ccmf.parse_chunk(chunk)
+                assert cpts == pts
+                cur = cpts
+                for f in ccmf.parse_video_payload(payload)[2]:
+                    frames.append((cur, f.duration))
+                    cur += f.duration
         finally:
             await agen.aclose()
 
     asyncio.run(go())
 
-    assert len(pts_list) >= 2, "should still emit some frames"
+    assert len(frames) >= 2, "should still emit some frames"
     # Frames were skipped: fewer emitted than the ~10 source frames.
-    assert len(pts_list) <= 7
-    # PTS stay on the source grid (multiples of 1/fps) and strictly increase, and
-    # at least one gap is >1 frame (a skip actually happened).
-    steps = [round((b - a) * 10) for a, b in zip(pts_list, pts_list[1:])]
-    assert all(s >= 1 for s in steps) and any(s >= 2 for s in steps)
-    assert all(abs(p * 10 - round(p * 10)) < 1e-6 for p in pts_list)
-
-
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
-@pytest.mark.parametrize("adaptive", [True, False], ids=["adaptive", "fixed"])
-def test_iter_video_forwards_palette_strategy(tmp_path, monkeypatch, adaptive):
-    # iter_video must pass its `adaptive` flag through to encode_frame (so --crunchy,
-    # which sets adaptive=False, actually renders with CC's fixed palette).
-    import cc_encoder
-
-    path = tmp_path / "clip.mkv"
-    if _ffmpeg_make(path, "mpeg4").returncode != 0:
-        pytest.skip("ffmpeg can't build the clip")
-
-    real = cc_encoder.encode_frame
-    seen = []
-
-    def spy(arr, adaptive_arg=True):
-        seen.append(adaptive_arg)
-        return real(arr, adaptive_arg)
-
-    monkeypatch.setattr(transcoder, "encode_frame", spy)
-
-    async def go():
-        agen = transcoder.iter_video("ignored", term_w=8, term_h=4, fps=10,
-                                     source_path=str(path), adaptive=adaptive)
-        try:
-            async for _pts, _frame in agen:
-                pass
-        finally:
-            await agen.aclose()
-
-    asyncio.run(go())
-    assert seen, "no frames were encoded"
-    assert all(a is adaptive for a in seen)
+    assert len(frames) <= 7
+    grid = ccmf.SAMPLE_RATE // 10                     # 4800 samples per source frame
+    # Frame PTS stay on the source grid and at least one hold spans >1 source
+    # frame (a skip actually happened).
+    assert all(pts % grid == 0 for pts, _ in frames)
+    assert any(d >= 2 * grid for _, d in frames)
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
@@ -438,9 +410,15 @@ def test_decode_video_from_generated_file(tmp_path, fname, vcodec, extra):
     if res.returncode != 0 or not path.exists():
         pytest.skip(f"ffmpeg can't build {fname} ({vcodec}): "
                     f"{res.stderr.decode('utf-8', 'replace')[:200]}")
-    frames = _collect_video_from_file(path, limit=3)
-    assert len(frames) > 0
-    assert len(frames[0]) == _v32_size(8, 4)       # 32vid frame for the 8x4 grid
+    chunks = _collect_video_from_file(path)
+    assert len(chunks) > 0
+    # Every chunk is a well-formed, self-contained GOP for the 8x4 grid.
+    for _pts, chunk in chunks:
+        _cpts, ctype, payload, _ = ccmf.parse_chunk(chunk)
+        assert ctype == ccmf.TYPE_VIDEO
+        w, h, frames = ccmf.parse_video_payload(payload)
+        assert (w, h) == (8, 4)
+        assert frames[0].encoding == ccmf.ENC_RAW        # opens with a keyframe
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
@@ -454,7 +432,7 @@ def test_moov_at_end_mp4_decodes_from_seekable_file(tmp_path):
     data = path.read_bytes()
     mdat, moov = data.find(b"mdat"), data.find(b"moov")
     assert 0 < mdat < moov, "expected a genuine moov-at-end file for this test"
-    assert len(_collect_video_from_file(path, limit=3)) > 0
+    assert len(_collect_video_from_file(path)) > 0
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
@@ -515,12 +493,12 @@ _HAS_JS_RUNTIME = any(shutil.which(x) for x in ("deno", "node", "bun"))
 )
 @pytest.mark.parametrize("url", NASA_LIVE_STREAMS)
 def test_live_stream_produces_frames(url):
-    """A real live stream must produce frames through the video pipeline.
+    """A real live stream must produce chunks through the video pipeline.
 
     Confirms the stream is actually live first; if it isn't (taken down, or no
     network right now) the test skips, so it only fails on a genuine regression.
     """
-    state = {"frames": 0}
+    state = {"chunks": 0}
 
     async def go():
         if not await transcoder.probe_is_live(url):
@@ -529,9 +507,9 @@ def test_live_stream_produces_frames(url):
         async def collect():
             agen = transcoder.iter_video(url, term_w=20, term_h=8, fps=5)
             try:
-                async for _pts, _frame in agen:   # iter_video yields (pts, frame)
-                    state["frames"] += 1
-                    if state["frames"] >= 5:
+                async for _pts, _chunk in agen:   # iter_video yields (pts, chunk)
+                    state["chunks"] += 1
+                    if state["chunks"] >= 2:
                         break
             finally:
                 await agen.aclose()
@@ -542,4 +520,4 @@ def test_live_stream_produces_frames(url):
             pass
 
     asyncio.run(go())
-    assert state["frames"] > 0, f"live stream produced no frames: {url}"
+    assert state["chunks"] > 0, f"live stream produced no chunks: {url}"

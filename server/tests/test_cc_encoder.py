@@ -1,11 +1,7 @@
-import struct
-
 import numpy as np
 import pytest
 
-from cc_encoder import (_CC_RGB, V32_FLAG_BASE, V32_TYPE_VIDEO, decode_32vid,
-                        encode_frame, generate_palette, v32_chunk,
-                        v32_stream_header)
+from cc_encoder import _CC_RGB, encode_frame, generate_palette
 
 # palette indices used in the assertions
 _WHITE, _LGRAY, _BLUE, _RED = 0, 8, 11, 14
@@ -21,19 +17,18 @@ def _cell(pixels):
 
 
 def _enc(frame, adaptive=False):
-    """encode_frame -> decoded (glyph, fg, bg, palette) at the frame's grid.
+    """encode_frame -> (glyph, fg, bg, palette) at the frame's grid.
 
     Defaults to the FIXED CC palette so the palette-index assertions below have a
     known meaning; the adaptive (default) path is covered by its own tests."""
-    h, w = frame.shape[0] // 3, frame.shape[1] // 2
-    return decode_32vid(encode_frame(frame, adaptive=adaptive), w, h)
+    return encode_frame(frame, adaptive=adaptive)
 
 
-def test_frame_size_matches_32vid_formula():
+def test_grids_match_frame_dimensions():
     W, H = 4, 2
-    out = encode_frame(_solid((17, 17, 17), H * 3, W * 2))
-    # 32vid uncompressed: screen ceil(W*H/8)*5 + colour W*H + palette 48.
-    assert len(out) == ((W * H + 7) // 8) * 5 + W * H + 48
+    glyph, fg, bg, pal = encode_frame(_solid((17, 17, 17), H * 3, W * 2))
+    assert glyph.shape == fg.shape == bg.shape == (H, W)
+    assert pal.shape == (16, 3) and pal.dtype == np.uint8
 
 
 def test_solid_cell_is_empty_glyph():
@@ -76,23 +71,23 @@ def test_between_colors_region_is_dithered():
     assert _WHITE in used and _LGRAY in used, f"expected white/light_gray dither, got {used}"
 
 
-def test_fixed_palette_block_is_cc_default():
-    # adaptive=False emits CC's fixed default palette in the frame's palette block.
+def test_fixed_palette_is_cc_default():
+    # adaptive=False returns CC's fixed default palette.
     _glyph, _fg, _bg, pal = _enc(_solid((0, 0, 0), 3, 2), adaptive=False)
     assert np.array_equal(pal, _CC_RGB.astype(np.uint8))   # RGB order, 16 entries
 
 
 def test_adaptive_palette_is_valid_block():
-    # The default (adaptive) path emits a valid, content-derived 16x3 RGB palette.
+    # The default (adaptive) path yields a valid, content-derived 16x3 RGB palette.
     rng = np.random.default_rng(1)
     frame = rng.integers(0, 256, size=(5 * 3, 6 * 2, 3), dtype=np.uint8)
-    _glyph, _fg, _bg, pal = decode_32vid(encode_frame(frame), 6, 5)
+    _glyph, _fg, _bg, pal = encode_frame(frame)
     assert pal.shape == (16, 3) and pal.dtype == np.uint8
 
 
 def test_generate_palette_adapts_to_two_colours():
     # A frame made of two distinct out-of-gamut colours should yield a palette whose
-    # entries cluster near those two colours (median cut found both).
+    # entries cluster near those two colours (the quantiser found both).
     teal, gold = (0, 130, 130), (210, 110, 0)
     frame = np.concatenate([_solid(teal, 9, 8), _solid(gold, 9, 8)], axis=1)
     pal = generate_palette(frame).astype(np.int32)
@@ -105,7 +100,7 @@ def test_adaptive_beats_fixed_on_out_of_gamut_frame():
     # On content far from CC's fixed palette, the adaptive palette reconstructs the
     # frame more faithfully — measured with S-CIELAB (the perceptual metric the
     # encoder optimises for; lower ΔE = closer) — than the fixed palette does.
-    from cc_media import decode_frame
+    from cc_media import render_cells
     from cc_metrics import mean_scielab
 
     w, h = 24, 16
@@ -116,8 +111,8 @@ def test_adaptive_beats_fixed_on_out_of_gamut_frame():
     frame[..., 1] = (130 - t * 20 + yy / (h * 3) * 10).astype(np.uint8)
     frame[..., 2] = ((1 - t) * 130).astype(np.uint8)
 
-    adaptive = mean_scielab(frame, decode_frame(encode_frame(frame, adaptive=True), w, h))
-    fixed = mean_scielab(frame, decode_frame(encode_frame(frame, adaptive=False), w, h))
+    adaptive = mean_scielab(frame, render_cells(*encode_frame(frame, adaptive=True)))
+    fixed = mean_scielab(frame, render_cells(*encode_frame(frame, adaptive=False)))
     assert adaptive < fixed - 1.0, f"adaptive ΔE {adaptive:.1f} not < fixed {fixed:.1f}"
 
 
@@ -129,28 +124,12 @@ def test_each_palette_color_round_trips_solid():
         assert bg[0, 0] == i, f"palette {i} did not round-trip"
 
 
-def test_v32_stream_header():
-    h = v32_stream_header(82, 41, 24, 2, V32_FLAG_BASE)
-    assert h[:4] == b"32VD"
-    w, ht, fps, ns, flags = struct.unpack("<HHBBH", h[4:])
-    assert (w, ht, fps, ns) == (82, 41, 24, 2)
-    assert flags & 0x10                       # bit 4 is always set
-
-
-def test_v32_chunk_layout():
-    data = bytes(range(50))
-    c = v32_chunk(V32_TYPE_VIDEO, 1, data)
-    size, datalength, ctype = struct.unpack("<IIB", c[:9])
-    assert size == len(data) and datalength == 1 and ctype == V32_TYPE_VIDEO
-    assert c[9:] == data                      # header is exactly 9 bytes
-
-
 @pytest.mark.parametrize("adaptive", [False, True], ids=["fixed", "adaptive"])
 def test_numba_and_numpy_cores_agree(adaptive):
     # The compiled core is the active path; the numpy core is the reference.  They
     # implement the same algorithm, so they must reach the same per-cell colour pair
     # (the dither realisation can differ by float precision).  Checked for BOTH
-    # palette strategies: the fixed CC palette and an adaptive per-frame palette.
+    # palette strategies: the fixed CC palette and an adaptive palette.
     import cc_encoder as cc
     if not cc._HAVE_NUMBA:
         pytest.skip("numba not installed")

@@ -23,7 +23,7 @@ import harness
 from harness import CONTENT, GRIDS, fmt, measure, section, table
 
 import cc_encoder
-from cc_encoder import _assemble, _encode_numpy, _prepare, encode_frame
+from cc_encoder import _encode_numpy, _prepare, encode_frame
 from transcoder import _encode_stride
 
 _TARGET_FPS = 24
@@ -31,8 +31,7 @@ _TARGET_FPS = 24
 
 def _encode_numpy_full(frame):
     idx, h, w = _prepare(frame)
-    glyph, fg, bg = _encode_numpy(idx, h, w)
-    return _assemble(glyph, fg, bg, h, w)
+    return _encode_numpy(idx, h, w)
 
 
 def size_sweep() -> None:

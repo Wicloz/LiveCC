@@ -2,10 +2,11 @@
 Sample-driven pipeline tests.
 
 These exercise the *real* transcode pipeline (ffmpeg decode/scale -> frame split
--> encode_frame, and ffmpeg -> PCM audio) over whatever developer-provided clips
-sit in the repo-root media/ folder.  They are intentionally data-driven: with an
-empty media/ folder (e.g. CI) every case skips, and they light up automatically
-once a developer drops clips in.  ffmpeg is required.
+-> GOP encode into CCMF chunks, and ffmpeg -> PCM audio) over whatever
+developer-provided clips sit in the repo-root media/ folder.  They are
+intentionally data-driven: with an empty media/ folder (e.g. CI) every case
+skips, and they light up automatically once a developer drops clips in.  ffmpeg
+is required.
 """
 
 from __future__ import annotations
@@ -16,17 +17,13 @@ from pathlib import Path
 
 import pytest
 
+import ccmf
 import transcoder
-from cc_encoder import decode_32vid
 
 from cc_media import find_media, media_streams
 
 _HAS_FFMPEG = shutil.which("ffmpeg") is not None
 _HAS_FFPROBE = shutil.which("ffprobe") is not None
-
-
-def _v32_size(w, h):
-    return ((w * h + 7) // 8) * 5 + w * h + 48   # 32vid uncompressed frame bytes
 
 # Every developer-provided clip is expected to work; if one doesn't, the test for
 # it FAILS (not skips) — that's a genuine bug, since the file was put here on
@@ -53,8 +50,8 @@ async def _collect_video(path: Path, w: int, h: int, limit: int) -> list:
     agen = transcoder.iter_video("ignored", term_w=w, term_h=h, fps=10,
                                  source_path=str(path))
     try:
-        async for pts, frame in agen:
-            out.append((pts, frame))
+        async for pts, chunk in agen:
+            out.append((pts, chunk))
             if len(out) >= limit:
                 break
     finally:
@@ -62,34 +59,45 @@ async def _collect_video(path: Path, w: int, h: int, limit: int) -> list:
     return out
 
 
+def _parse_video_chunk(chunk: bytes):
+    pts, ctype, payload, _end = ccmf.parse_chunk(chunk)
+    assert ctype == ccmf.TYPE_VIDEO
+    return pts, ccmf.parse_video_payload(payload)
+
+
 @_skip_no_video
 @pytest.mark.parametrize("sample", _VIDEO_SAMPLES or [None], ids=_ids(_VIDEO_SAMPLES))
-def test_sample_video_encodes_valid_frames(sample):
-    # The full front-end must turn a real clip into well-formed blit frames.
+def test_sample_video_encodes_valid_chunks(sample):
+    # The full front-end must turn a real clip into well-formed CCMF GOP chunks.
     w, h = 20, 8
     items = asyncio.run(_collect_video(sample, w, h, limit=3))
-    assert items, f"no frames produced from {sample.name}"
+    assert items, f"no chunks produced from {sample.name}"
 
     pts = [p for p, _ in items]
     assert pts == sorted(pts)                     # PTS monotonically increases
     assert all(p >= 0 for p in pts)
 
-    for _, frame in items:
-        assert len(frame) == _v32_size(w, h)      # a 32vid uncompressed frame
-        glyph, fg, bg, pal = decode_32vid(frame, w, h)
-        assert ((glyph >= 0x80) & (glyph <= 0x9F)).all()   # valid 2x3 drawing chars
-        assert (fg <= 15).all() and (bg <= 15).all()       # valid palette indices
-        assert pal.shape == (16, 3)
+    for ipts, chunk in items:
+        cpts, (dw, dh, frames) = _parse_video_chunk(chunk)
+        assert cpts == ipts                       # yielded pts matches the header
+        assert (dw, dh) == (w, h)
+        assert frames[0].encoding == ccmf.ENC_RAW  # every chunk is a RAP
+        for f in frames:
+            assert ((f.glyph >= 0x80) & (f.glyph <= 0x9F)).all()  # valid 2x3 chars
+            assert (f.fg <= 15).all() and (f.bg <= 15).all()      # palette indices
+            assert f.palette.shape == (16, 3)
+            assert 0 < f.duration <= ccmf.MAX_DURATION
 
 
 @_skip_no_video
 @pytest.mark.parametrize("sample", _VIDEO_SAMPLES or [None], ids=_ids(_VIDEO_SAMPLES))
 def test_sample_video_grid_sizes(sample):
-    # A couple of representative grids both produce correctly-sized frames.
+    # A couple of representative grids both produce correctly-sized chunks.
     for w, h in [(10, 6), (40, 20)]:
         items = asyncio.run(_collect_video(sample, w, h, limit=1))
         assert items, f"{sample.name} produced nothing at {w}x{h}"
-        assert len(items[0][1]) == _v32_size(w, h)
+        _pts, (dw, dh, _frames) = _parse_video_chunk(items[0][1])
+        assert (dw, dh) == (w, h)
 
 
 @pytest.mark.skipif(

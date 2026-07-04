@@ -22,14 +22,13 @@ What picks them up:
   on real decoded frames from your samples (more representative than synthetic).
 - **Preview renderer** — `server/tools/render_cc.py` emulates exactly what a
   ComputerCraft monitor/speaker would show at various resolutions and writes MP4s
-  to `media/cc_preview/` for manual inspection (8-bit PCM audio, or 1-bit DFPWM
-  with `--crunchy`).
+  to `media/cc_preview/` for manual inspection (8-bit 48 kHz mono PCM audio).
 
 ```sh
 # from the repo root, after putting a clip or two in media/
 cd server
 python tools/render_cc.py                 # render every sample at default grids
-python tools/render_cc.py --help          # options (grids, duration, crunchy, ...)
+python tools/render_cc.py --help          # options (grids, duration, ...)
 pytest tests/test_media_samples.py
 python benchmarks/bench_samples.py
 ```

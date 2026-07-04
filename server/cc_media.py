@@ -141,14 +141,13 @@ def sample_frames(path, w: int, h: int, fps: int = 24, limit: int = 8) -> list:
     return frames[:limit]
 
 
-def decode_frame(buf: bytes, w: int, h: int) -> np.ndarray:
-    """Reverse encode_frame: a 32vid uncompressed frame -> (H*3, W*2, 3) uint8
-    image, exactly what the CC client paints (each cell = its two colours in the
-    glyph pattern, using the frame's own palette).  W/H aren't in the frame (the
-    decoder gets them from the 32vid stream header), so they're passed in."""
-    from cc_encoder import decode_32vid
-
-    glyph, fg, bg, palette = decode_32vid(buf, w, h)
+def render_cells(glyph: np.ndarray, fg: np.ndarray, bg: np.ndarray,
+                 palette: np.ndarray) -> np.ndarray:
+    """(glyph, fg, bg) grids + a (16,3) palette -> (H*3, W*2, 3) uint8 image,
+    exactly what the CC client paints (each cell = its two colours in the glyph
+    pattern).  Takes cc_encoder.encode_frame's output, or a ccmf.DecodedFrame's
+    fields, so both the encoder and the wire format can be eyeballed."""
+    h, w = glyph.shape
     mask = glyph.astype(np.intp) - 0x80
     fg_idx, bg_idx = fg.astype(np.intp), bg.astype(np.intp)
 

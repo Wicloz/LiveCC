@@ -2,8 +2,10 @@ import asyncio
 
 import pytest
 
+import ccmf
 import session
 from session import StreamSession, TimedBuffer
+from transcoder import DFPWM, PCM
 
 
 def run(coro):
@@ -63,35 +65,48 @@ def test_seconds_spans_head_to_tail():
 
 class FakeWS:
     def __init__(self):
-        self.texts = []
         self.bins = []
-
-    async def send_text(self, s):
-        self.texts.append(s)
 
     async def send_bytes(self, b):
         self.bins.append(b)
 
 
-# Binary messages are a 32vid stream: the "32VD" header, then chunks whose type
-# byte is at offset 8 ([size 4][datalength 4][type 1]).
-def _is_header(b):
-    return b[:4] == b"32VD"
+# Every message is binary CCMF: marker-led media chunks, or control frames.
+def _media(bins, ctype):
+    return [b for b in bins if b[0] == ccmf.MARKER and b[10] == ctype]
 
 
 def _vids(bins):
-    return [b for b in bins if not _is_header(b) and b[8] == session.V32_TYPE_VIDEO]
+    return _media(bins, ccmf.TYPE_VIDEO)
 
 
 def _auds(bins):
-    return [b for b in bins if not _is_header(b) and b[8] == session.V32_TYPE_AUDIO]
+    return _media(bins, ccmf.TYPE_AUDIO)
+
+
+def _controls(bins):
+    return [ccmf.parse_message(b) for b in bins if b[0] != ccmf.MARKER]
+
+
+def _statuses(bins):
+    return [body[0] for op, body in _controls(bins) if op == ccmf.OP_STATUS]
+
+
+def _errors(bins):
+    return [body.decode() for op, body in _controls(bins) if op == ccmf.OP_ERROR]
+
+
+def _ended(bins):
+    return any(op == ccmf.OP_END for op, _ in _controls(bins))
 
 
 def _patch(monkeypatch, n_video, n_audio, is_live, ext="webm", moov_at_end=True):
     async def fake_video(url, w, h, fps, start=0, end=None, source_path=None,
-                          loop=False, adaptive=True):
-        for i in range(n_video):   # iter_video yields (pts, frame); pts = i/fps
-            yield i / fps, bytes((0, w, 0, h)) + b"\x00" * (w * h * 3)
+                         loop=False):
+        # iter_video yields (pts_samples, GOP chunk); one fake chunk per "GOP"
+        for i in range(n_video):
+            pts = round(i * ccmf.SAMPLE_RATE / fps)
+            yield pts, ccmf.chunk(pts, ccmf.TYPE_VIDEO, b"\x00" * 16)
 
     async def fake_audio(url, rate, codec=None, start=0, end=None,
                          source_path=None, loop=False):
@@ -110,7 +125,7 @@ def _patch(monkeypatch, n_video, n_audio, is_live, ext="webm", moov_at_end=True)
     monkeypatch.setattr(session, "probe_moov_at_end", fake_moov)
 
 
-def test_vod_delivers_every_frame_in_order(monkeypatch):
+def test_vod_delivers_every_chunk_in_order(monkeypatch):
     _patch(monkeypatch, n_video=8, n_audio=4, is_live=False)
     ws = FakeWS()
     s = StreamSession("u", w=4, h=2, fps=50, want_audio=True)
@@ -120,8 +135,27 @@ def test_vod_delivers_every_frame_in_order(monkeypatch):
     auds = _auds(ws.bins)
     assert len(vids) == 8          # VOD never drops
     assert len(auds) == 4
-    assert _is_header(ws.bins[0])   # 32vid header opens the stream
-    assert "PLAYING" in ws.texts
+    assert _statuses(ws.bins)[0] == ccmf.STATUS_BUFFERING   # opens buffering
+    assert ccmf.STATUS_PLAYING in _statuses(ws.bins)
+    assert _ended(ws.bins)                                   # END closes the stream
+
+
+def test_audio_chunks_carry_sample_pts_and_codec(monkeypatch):
+    _patch(monkeypatch, n_video=0, n_audio=3, is_live=False)
+    ws = FakeWS()
+    s = StreamSession("u", w=4, h=2, fps=50, want_audio=True, want_video=False,
+                      audio_codec=PCM)
+    run(s.run(ws))
+    auds = _auds(ws.bins)
+    assert len(auds) == 3
+    ptss = []
+    for chunk in auds:
+        pts, ctype, payload, _ = ccmf.parse_chunk(chunk)
+        codec, channel, data = ccmf.parse_audio_payload(payload)
+        assert (codec, channel) == (ccmf.CODEC_PCM8, ccmf.CHANNEL_MONO)
+        assert len(data) == 4096
+        ptss.append(pts)
+    assert ptss == [0, 4096, 8192]      # PCM: 1 byte/sample -> running sample index
 
 
 def test_session_reports_error_when_no_video(monkeypatch):
@@ -129,7 +163,8 @@ def test_session_reports_error_when_no_video(monkeypatch):
     ws = FakeWS()
     s = StreamSession("u", w=4, h=2, fps=50, want_audio=False)
     run(s.run(ws))
-    assert any(t.startswith("ERROR") for t in ws.texts)
+    assert _errors(ws.bins)
+    assert not _ended(ws.bins)          # a failed stream is not a clean END
 
 
 def test_failing_video_producer_reports_error_without_hanging(monkeypatch):
@@ -145,7 +180,7 @@ def test_failing_video_producer_reports_error_without_hanging(monkeypatch):
     ws = FakeWS()
     s = StreamSession("u", w=4, h=2, fps=50, want_audio=False)
     run(asyncio.wait_for(s.run(ws), 5))
-    assert any(t.startswith("ERROR") for t in ws.texts)
+    assert _errors(ws.bins)
 
 
 def test_failing_audio_producer_degrades_to_silent_video(monkeypatch):
@@ -165,17 +200,19 @@ def test_failing_audio_producer_degrades_to_silent_video(monkeypatch):
 
 def test_unexpected_error_reports_generic_error(monkeypatch):
     # An error in the run path that nothing handles deeper (here: a socket send
-    # that explodes) must be caught and reported to the client, not dropped.
+    # that explodes on media) must be caught and reported, not dropped silently.
     _patch(monkeypatch, n_video=4, n_audio=0, is_live=False)
 
     class BoomWS(FakeWS):
         async def send_bytes(self, b):
-            raise RuntimeError("send exploded")
+            if b and b[0] == ccmf.MARKER:
+                raise RuntimeError("send exploded")
+            await super().send_bytes(b)
 
     ws = BoomWS()
     s = StreamSession("u", w=4, h=2, fps=50, want_audio=False)
     run(asyncio.wait_for(s.run(ws), 5))
-    assert any(t.startswith("ERROR Internal server error") for t in ws.texts)
+    assert any(e.startswith("Internal server error") for e in _errors(ws.bins))
 
 
 def test_audio_disabled_sends_no_audio(monkeypatch):
@@ -188,15 +225,15 @@ def test_audio_disabled_sends_no_audio(monkeypatch):
 
 def test_no_video_streams_audio_only(monkeypatch):
     # --no-video: audio-only.  The scheduler keys off the audio buffer instead of
-    # video; no video frames are produced and it must not hang.  n_video=99 is a
-    # canary — if a video producer were wrongly created we'd see frames.
+    # video; no video chunks are produced and it must not hang.  n_video=99 is a
+    # canary — if a video producer were wrongly created we'd see chunks.
     _patch(monkeypatch, n_video=99, n_audio=4, is_live=False)
     ws = FakeWS()
     s = StreamSession("u", w=4, h=2, fps=50, want_audio=True, want_video=False)
     run(asyncio.wait_for(s.run(ws), 5))
     assert len(_auds(ws.bins)) == 4
     assert not _vids(ws.bins)
-    assert "PLAYING" in ws.texts
+    assert ccmf.STATUS_PLAYING in _statuses(ws.bins)
 
 
 def test_both_streams_disabled_reports_error(monkeypatch):
@@ -204,7 +241,30 @@ def test_both_streams_disabled_reports_error(monkeypatch):
     ws = FakeWS()
     s = StreamSession("u", w=4, h=2, fps=50, want_audio=False, want_video=False)
     run(asyncio.wait_for(s.run(ws), 5))
-    assert any(t.startswith("ERROR Nothing to play") for t in ws.texts)
+    assert any(e.startswith("Nothing to play") for e in _errors(ws.bins))
+
+
+def test_audio_codec_is_negotiated_not_hardcoded():
+    # The codec comes from the client's CAPS via the caller; both spec codecs work.
+    assert StreamSession("u", w=4, h=2, fps=24, want_audio=True).codec.name == "pcm"
+    assert StreamSession("u", w=4, h=2, fps=24, want_audio=True,
+                         audio_codec=DFPWM).codec.name == "dfpwm"
+
+
+def test_dfpwm_chunks_are_tagged_dfpwm(monkeypatch):
+    _patch(monkeypatch, n_video=0, n_audio=2, is_live=False)
+    ws = FakeWS()
+    s = StreamSession("u", w=4, h=2, fps=50, want_audio=True, want_video=False,
+                      audio_codec=DFPWM)
+    run(s.run(ws))
+    auds = _auds(ws.bins)
+    assert auds
+    _pts, _t, payload, _ = ccmf.parse_chunk(auds[0])
+    codec, _chan, _data = ccmf.parse_audio_payload(payload)
+    assert codec == ccmf.CODEC_DFPWM
+    # DFPWM: 8 samples/byte -> the second chunk's PTS reflects that
+    pts2, _t, _p, _ = ccmf.parse_chunk(auds[1])
+    assert pts2 == 4096 * 8
 
 
 def test_loop_downloads_section_once_then_streams(monkeypatch):
@@ -219,11 +279,11 @@ def test_loop_downloads_section_once_then_streams(monkeypatch):
     monkeypatch.setattr(session, "download_source", fake_download)
     ws = FakeWS()
     s = StreamSession("u", w=4, h=2, fps=50, want_audio=False,
-                      start="30", end="1m", loop=True)
+                      start=30, end=60, loop=True)
     run(s.run(ws))
 
     assert calls["n"] == 1                  # cached exactly once
-    assert calls["args"] == (30, 60)        # parsed start=30s, end=60s
+    assert calls["args"] == (30, 60)        # seconds passed through
     assert s._source_path == "/tmp/fake_source.mkv"
     assert len(_vids(ws.bins)) == 6
 
@@ -290,21 +350,6 @@ def test_faststart_mp4_vod_streams_without_download(monkeypatch):
     assert s._source_path is None
 
 
-def test_crunchy_selects_dfpwm_codec():
-    # --crunchy trades fidelity for bandwidth: 1-bit DFPWM instead of raw PCM.
-    assert StreamSession("u", w=4, h=2, fps=24, want_audio=True).codec.name == "pcm"
-    assert StreamSession("u", w=4, h=2, fps=24, want_audio=True,
-                         crunchy=True).codec.name == "dfpwm"
-
-
-def test_crunchy_disables_adaptive_palette():
-    # --crunchy also drops the adaptive per-frame palette for video, back to CC's
-    # fixed default palette; the default streams keep the adaptive palette.
-    assert StreamSession("u", w=4, h=2, fps=24, want_audio=True).adaptive_palette is True
-    assert StreamSession("u", w=4, h=2, fps=24, want_audio=True,
-                         crunchy=True).adaptive_palette is False
-
-
 def test_webm_vod_streams_without_download(monkeypatch):
     # WebM streams fine from a pipe — must NOT even probe moov or download.
     _patch(monkeypatch, n_video=3, n_audio=0, is_live=False, ext="webm")
@@ -325,11 +370,12 @@ def test_cancel_finalizes_producer_generator(monkeypatch):
     closed = {"video": False}
 
     async def fake_video(url, w, h, fps, start=0, end=None, source_path=None,
-                          loop=False, adaptive=True):
+                         loop=False):
         i = 0
         try:
             while True:
-                yield i / fps, b"\x00" * 16   # (pts, frame)
+                pts = round(i * ccmf.SAMPLE_RATE / fps)
+                yield pts, ccmf.chunk(pts, ccmf.TYPE_VIDEO, b"\x00" * 16)
                 i += 1
                 await asyncio.sleep(0.01)
         finally:

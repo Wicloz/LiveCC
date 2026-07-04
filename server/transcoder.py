@@ -23,7 +23,6 @@ import glob
 import logging
 import math
 import os
-import re
 import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -31,7 +30,7 @@ from typing import AsyncGenerator, Deque, Iterator, Optional
 
 import numpy as np
 
-from cc_encoder import encode_frame
+from cc_encoder import GopEncoder
 
 # --------------------------------------------------------------------------- #
 # Logging
@@ -60,9 +59,10 @@ _FIRST_OUTPUT_TIMEOUT = 45
 _STALL_TIMEOUT = 30
 _DOWNLOAD_TIMEOUT = 1800   # full section download for --loop
 
-# Audio codecs.  Default is raw unsigned 8-bit PCM — the CC speaker's native format
-# (1 byte/sample, no client decode, no 1-bit noise).  --crunchy switches to DFPWM
-# (1 bit/sample) to cut audio bandwidth ~8x at the cost of fidelity.
+# Audio codecs.  The client advertises what it decodes in its CAPS message; the
+# server prefers raw unsigned 8-bit PCM — the CC speaker's native format (1 byte/
+# sample, no client decode, no 1-bit noise) — and falls back to DFPWM (1 bit/
+# sample, ~8x less bandwidth, lower fidelity) when that's all the client takes.
 #
 # Chunks stay short (~0.1 s): the client processes each chunk inline on the same
 # coroutine that renders video, so a large chunk would stall rendering for the
@@ -71,6 +71,12 @@ _DOWNLOAD_TIMEOUT = 1800   # full section download for --loop
 SAMPLE_RATE = 48000
 AUDIO_CHUNK_SECONDS = 0.1
 AUDIO_CHUNK_SAMPLES = int(SAMPLE_RATE * AUDIO_CHUNK_SECONDS)   # 4800
+
+# Target span of one video GOP chunk (a palette + keyframe + delta/repeat units).
+# Longer GOPs amortise the keyframe better but add that much latency to a live
+# stream (frames are batched per GOP) and make each chunk a bigger burst.
+GOP_SECONDS = 1.0
+GOP_SAMPLES = int(SAMPLE_RATE * GOP_SECONDS)
 
 AudioCodec = collections.namedtuple(
     "AudioCodec", "name ffmpeg_codec ffmpeg_fmt samples_per_byte read_bytes")
@@ -82,8 +88,8 @@ def _audio_codec(name: str, ffmpeg_codec: str, ffmpeg_fmt: str,
                       AUDIO_CHUNK_SAMPLES // samples_per_byte)
 
 
-PCM = _audio_codec("pcm", "pcm_u8", "u8", 1)         # default
-DFPWM = _audio_codec("dfpwm", "dfpwm", "dfpwm", 8)   # --crunchy
+PCM = _audio_codec("pcm", "pcm_u8", "u8", 1)         # preferred
+DFPWM = _audio_codec("dfpwm", "dfpwm", "dfpwm", 8)   # negotiated fallback
 AUDIO_CODECS = {c.name: c for c in (PCM, DFPWM)}
 
 # No server-side audio filtering.  Earlier encode-side processing (highpass /
@@ -92,34 +98,16 @@ AUDIO_CODECS = {c.name: c for c in (PCM, DFPWM)}
 
 
 # --------------------------------------------------------------------------- #
-# Timestamp parsing  ("90", "90s", "1m30s", "3h2m", "25234s")
+# Section selection (timestamps arrive from the client in ms, as seconds here)
 # --------------------------------------------------------------------------- #
 
-def parse_timestamp(value: str | None) -> int:
-    """Parse a duration into whole seconds; default unit is seconds.
-
-    Accepts plain seconds ("90"), an explicit "s" ("90s"), and the h/m/s form
-    ("3h2m", "1m30s", "1h2m3s").  Returns 0 for empty/unrecognised input.
-    """
-    if not value:
-        return 0
-    value = value.strip().lower()
-    if value.isdigit():
-        return int(value)
-    m = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?", value)
-    if not m or not any(m.groups()):
-        return 0
-    h, mn, s = (int(g) if g else 0 for g in m.groups())
-    return h * 3600 + mn * 60 + s
-
-
-def _sections_arg(start: int, end: Optional[int]) -> list[str]:
+def _sections_arg(start: float, end: Optional[float]) -> list[str]:
     """yt-dlp --download-sections for a [start, end] window (seconds)."""
     if start <= 0 and end is None:
         return []
     s = max(0, start)
-    e = "inf" if end is None else max(s, end)
-    return ["--download-sections", f"*{s}-{e}"]
+    e = "inf" if end is None else format(max(s, end), "g")
+    return ["--download-sections", f"*{s:g}-{e}"]
 
 
 # --------------------------------------------------------------------------- #
@@ -173,9 +161,9 @@ async def _read_with_timeout(proc: subprocess.Popen, size: int, timeout: float) 
 class _FrameSplitter:
     """Accumulate raw rgb24 bytes and emit each complete frame as an (H, W, 3) array.
 
-    Splitting only — the CPU-heavy encode_frame() is applied separately (in
-    iter_video) so it can run off the event loop in a worker thread.  Keeping the
-    two apart is what lets the pacing scheduler stay responsive; see iter_video.
+    Splitting only — the CPU-heavy encode (GopEncoder.add) is applied separately
+    (in iter_video) so it can run off the event loop in a worker thread.  Keeping
+    the two apart is what lets the pacing scheduler stay responsive; see iter_video.
     """
 
     def __init__(self, px_w: int, px_h: int) -> None:
@@ -202,8 +190,8 @@ class _FrameSplitter:
 # Command builders
 # --------------------------------------------------------------------------- #
 
-def _ytdlp_cmd(youtube_url: str, fmt: str, start: int = 0,
-               end: Optional[int] = None) -> list[str]:
+def _ytdlp_cmd(youtube_url: str, fmt: str, start: float = 0,
+               end: Optional[float] = None) -> list[str]:
     cmd = ["yt-dlp", "-f", fmt, "--no-playlist", "--no-progress"]
     cmd += _sections_arg(start, end)   # server-side seek via range requests
     cmd += ["-o", "-", youtube_url]
@@ -239,8 +227,8 @@ def _video_ffmpeg_cmd(px_w: int, px_h: int, fps: int,
 
 def _audio_ffmpeg_cmd(sample_rate: int, codec: AudioCodec = PCM,
                       source: Optional[str] = None, loop: bool = False) -> list[str]:
-    # Mono at the speaker rate, encoded as `codec` (raw PCM by default, DFPWM for
-    # --crunchy).  The client decodes/unpacks per the codec it requested.
+    # Mono at the speaker rate, encoded as `codec` (raw PCM preferred, DFPWM when
+    # that's all the client advertised).  The client decodes/unpacks per its CAPS.
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "info", "-nostats"]
     if source:
         if loop:
@@ -399,7 +387,7 @@ async def probe_is_live(url: str) -> bool:
 # Section download (for --loop)
 # --------------------------------------------------------------------------- #
 
-def _download_cmd(url: str, out_dir: str, start: int, end: Optional[int],
+def _download_cmd(url: str, out_dir: str, start: float, end: Optional[float],
                   want_audio: bool) -> list[str]:
     fmt = "worstvideo+worstaudio/worst" if want_audio else "worstvideo/worst"
     template = os.path.join(out_dir, "source.%(ext)s")
@@ -410,7 +398,7 @@ def _download_cmd(url: str, out_dir: str, start: int, end: Optional[int],
     return cmd
 
 
-async def download_source(url: str, out_dir: str, start: int, end: Optional[int],
+async def download_source(url: str, out_dir: str, start: float, end: Optional[float],
                           want_audio: bool) -> Optional[str]:
     """Download the [start,end] section to a temp file for --loop.
 
@@ -449,14 +437,15 @@ async def download_source(url: str, out_dir: str, start: int, end: Optional[int]
 # --------------------------------------------------------------------------- #
 # Adaptive frame pacing
 # --------------------------------------------------------------------------- #
-# encode_frame() cost scales with the cell grid; on a big monitor a frame can take
-# longer than its slot at the requested fps.  Rather than out-run the encoder
-# (frames pile up, the buffer drains, playback stalls into constant re-buffering),
-# we encode only every Nth source frame so the EFFECTIVE fps falls to a steady
-# rate the CPU sustains — low but smooth beats stuttery.  N tracks a smoothed
-# encode time, so it adapts to the host and to load from other streams sharing the
-# worker pool.  Emitted frames carry their true source PTS, so audio and the
-# playback clock stay in sync regardless of N.
+# Per-frame encode cost (GopEncoder.add) scales with the cell grid; on a big
+# monitor a frame can take longer than its slot at the requested fps.  Rather
+# than out-run the encoder (frames pile up, the buffer drains, playback stalls
+# into constant re-buffering), we encode only every Nth source frame so the
+# EFFECTIVE fps falls to a steady rate the CPU sustains — low but smooth beats
+# stuttery.  N tracks a smoothed encode time, so it adapts to the host and to
+# load from other streams sharing the worker pool.  Emitted frames carry their
+# true source PTS (as their durations inside the GOP), so audio and the playback
+# clock stay in sync regardless of N.
 _PACE_SAFETY = 1.15      # leave ~15% headroom over the measured encode time
 _PACE_EMA = 0.2          # weight of the newest encode-time sample in the average
 
@@ -475,25 +464,25 @@ def _encode_stride(enc_seconds: float, fps: int) -> int:
 # --------------------------------------------------------------------------- #
 
 async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
-                     start: int = 0, end: Optional[int] = None,
+                     start: float = 0, end: Optional[float] = None,
                      source_path: Optional[str] = None,
-                     loop: bool = False,
-                     adaptive: bool = True) -> AsyncGenerator[tuple[float, bytes], None]:
-    """Yield (pts_seconds, encoded 2x3 binary frame) pairs.
+                     loop: bool = False) -> AsyncGenerator[tuple[int, bytes], None]:
+    """Yield (pts_samples, CCMF video chunk) pairs — each chunk one self-contained
+    GOP (~GOP_SECONDS of palette + raw/delta/repeat units, see cc_encoder.GopEncoder).
 
-    pts is the frame's media time (source_index / fps), so the consumer can pace
-    it against the shared clock even when adaptive pacing skips source frames.
+    pts is the chunk's first frame in 48 kHz samples (source_index/fps of that
+    frame), so the consumer can pace it against the shared clock even when
+    adaptive pacing skips source frames.
 
     source_path set => decode that local (seekable) file; loop=True replays it
     forever (--loop).  Otherwise stream from the yt-dlp pipe.
-
-    adaptive => encode with the adaptive per-frame palette (default); False (used by
-    --crunchy) falls back to CC's fixed default palette.
     """
     px_w, px_h = term_w * 2, term_h * 3
     ytdlp: subprocess.Popen | None = None
     ffmpeg: subprocess.Popen | None = None
     splitter = _FrameSplitter(px_w, px_h)
+    gop = GopEncoder(gop_samples=GOP_SAMPLES,
+                     nominal_duration=round(SAMPLE_RATE / fps))
     ev_loop = asyncio.get_running_loop()
     # Adaptive pacing state: src_i counts source frames, next_i is the next source
     # index we'll actually encode, enc_ema smooths the encode wall-time, encoded
@@ -534,12 +523,11 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
                 src_i += 1
                 if idx < next_i:
                     continue                         # shed load: skip this frame
-                # Encode off the event loop.  encode_frame() is CPU-heavy numpy;
+                # Encode off the event loop.  GopEncoder.add() is CPU-heavy numpy;
                 # run inline it would block the single-threaded pacing scheduler
-                # (session.run) between frames, so frames go out in bursts and the
-                # client — which renders each frame on arrival, with no jitter
-                # buffer — stutters.  numpy releases the GIL, so offloading lets the
-                # loop release buffered frames on a steady cadence while this worker
+                # (session.run) between frames, so chunks go out in bursts and the
+                # client stutters.  numpy releases the GIL, so offloading lets the
+                # loop release buffered chunks on a steady cadence while this worker
                 # encodes.  Frames are awaited one at a time, preserving order.
                 #
                 # Deferred redesign: move the whole video pipeline (read + encode)
@@ -548,9 +536,9 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
                 # (agen.aclose) as things we'd hand-roll across a sync/async queue.
                 # See memory note [[video-encode-offload]].  Not worth it until this
                 # targeted offload proves insufficient.
+                pts = round(idx * SAMPLE_RATE / fps)
                 t0 = ev_loop.time()
-                # run_in_executor passes args positionally: encode_frame(arr, adaptive).
-                frame = await ev_loop.run_in_executor(_executor, encode_frame, arr, adaptive)
+                done = await ev_loop.run_in_executor(_executor, gop.add, pts, arr)
                 enc = ev_loop.time() - t0
                 # Smoothed encode time -> how many source frames to span next, so
                 # the effective fps tracks what the CPU can actually sustain.
@@ -558,7 +546,11 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
                     (1 - _PACE_EMA) * enc_ema + _PACE_EMA * enc
                 next_i = idx + _encode_stride(enc_ema, fps)
                 encoded += 1
-                yield (idx / fps, frame)
+                if done is not None:                 # this frame opened a new GOP
+                    yield done
+        done = await ev_loop.run_in_executor(_executor, gop.flush)
+        if done is not None:                         # trailing partial GOP
+            yield done
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -572,10 +564,10 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
 
 async def iter_audio(youtube_url: str, sample_rate: int = 48000,
                      codec: AudioCodec = PCM,
-                     start: int = 0, end: Optional[int] = None,
+                     start: float = 0, end: Optional[float] = None,
                      source_path: Optional[str] = None,
                      loop: bool = False) -> AsyncGenerator[bytes, None]:
-    """Yield audio chunks (mono) encoded as `codec` (raw PCM, or DFPWM for crunchy).
+    """Yield audio chunks (mono) encoded as `codec` (raw PCM, or negotiated DFPWM).
 
     source_path set => decode that local (seekable) file; loop=True replays it
     forever (--loop).  Otherwise stream from the yt-dlp pipe.

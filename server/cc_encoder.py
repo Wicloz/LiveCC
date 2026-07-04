@@ -4,11 +4,15 @@ CC "image codec" encoder — ground-up rewrite.
 Goal: turn a small RGB24 video frame into a W x H grid of CC blit cells, where
 each cell is one of the 8192 legal states (32 glyph masks x 16 fg x 16 bg).  The
 client renders each cell as a 2-wide x 3-tall block of sub-pixels, two colours,
-arranged by the glyph mask.  The 16 colours are an ADAPTIVE per-frame palette
-(sanjuuni's signature feature): `generate_palette` median-cuts each frame's own
-colours, and the chosen 16 RGB triples ride along in the 32vid frame (see
-_assemble) for the client to apply via setPaletteColour.  `encode_frame(...,
-adaptive=False)` falls back to CC's fixed default palette (_CC_RGB).
+arranged by the glyph mask.  The 16 colours are an ADAPTIVE palette (sanjuuni's
+signature feature): `generate_palette` quantises a frame's own colours, and the
+chosen 16 RGB triples travel as a CCMF palette unit for the client to apply via
+setPaletteColour.  `encode_frame(..., adaptive=False)` falls back to CC's fixed
+default palette (_CC_RGB).
+
+Wire format lives in ccmf.py (docs/cc-media-format.md); this module produces the
+per-cell (glyph, fg, bg) grids and, via GopEncoder, whole CCMF video chunks —
+self-contained GOPs of palette + raw/delta/repeat frame units.
 
 Why this is not "quantize each pixel, then keep the two commonest colours":
 That pipeline makes three independent decisions (resample -> per-pixel palette ->
@@ -50,9 +54,11 @@ Sub-pixel bit layout within a cell (matches the client's glyph decoding):
 
 from __future__ import annotations
 
-import struct
+from typing import Optional
 
 import numpy as np
+
+import ccmf
 
 # numba compiles the per-cell encode kernel AND the Wu palette box loop (both below).
 # It's a normal prod dependency; the pure-numpy paths are kept only as a safety-net
@@ -256,19 +262,13 @@ def _prepare(frame_rgb: np.ndarray):
     return idx, h, w
 
 
-# CC's fixed default palette as 48 bytes (R,G,B each) — the per-frame palette block
-# of a 32vid frame when adaptive palettes are off (encode_frame(adaptive=False)).
-_PALETTE_BYTES = _CC_RGB.astype(np.uint8).tobytes()
-
-
 # --------------------------------------------------------------------------- #
 # Adaptive per-frame palette — Wu's variance-minimising quantiser
 # --------------------------------------------------------------------------- #
-# Instead of CC's fixed 16 colours we pick 16 colours *per frame* from the frame's
-# own content, and the client applies them via setPaletteColour (the 32vid frame
-# already carries a 48-byte palette block, so this costs no extra bandwidth on the
-# uncompressed stream).  The encoder's perceptual OKLab matching then maps each cell
-# onto whatever 16 colours come out.
+# Instead of CC's fixed 16 colours we pick 16 colours adapted to the content, and
+# the client applies them via setPaletteColour (a 48-byte CCMF palette unit, one
+# per GOP — negligible bandwidth).  The encoder's perceptual OKLab matching then
+# maps each cell onto whatever 16 colours come out.
 #
 # Algorithm: Xiaolin Wu's greedy orthogonal bipartition (1992) — the variance-
 # minimising quantiser.  It builds one 3D colour histogram, accumulates the moments
@@ -616,85 +616,6 @@ def _palette_tables(pal_rgb: np.ndarray):
     return pal, pal2, lin_pal, np.ascontiguousarray(dot.astype(np.float32))
 
 
-def _assemble(glyph, fg, bg, h: int, w: int, palette_bytes: bytes = _PALETTE_BYTES) -> bytes:
-    """(glyph, fg, bg) per-cell arrays -> one 32vid *uncompressed* video frame
-    (MCJack123/sanjuuni's format, compression mode 0).  No per-frame header — the
-    decoder knows W/H from the 32vid stream header — so the frame is exactly:
-
-        screen : ceil(W*H/8)*5 bytes — 8 cells packed into 5 bytes, MSB-first;
-                 each cell is the 5-bit drawing-char index (glyph - 0x80)
-        colour : W*H bytes — one per cell, (bg << 4) | fg
-        palette: 48 bytes — 16 * (R,G,B)
-
-    Cells are row-major (i = y*W + x).
-    """
-    n = h * w
-    # --- screen: 8 five-bit codes -> 5 bytes, code0 in the high bits ---------- #
-    codes = (np.asarray(glyph, np.uint8).ravel() - np.uint8(0x80))   # (n,) 0..31
-    pad = (-n) % 8
-    if pad:
-        codes = np.concatenate([codes, np.zeros(pad, np.uint8)])
-    grp = codes.reshape(-1, 8).astype(np.uint64)
-    val = (grp[:, 0] << 35 | grp[:, 1] << 30 | grp[:, 2] << 25 | grp[:, 3] << 20
-           | grp[:, 4] << 15 | grp[:, 5] << 10 | grp[:, 6] << 5 | grp[:, 7])
-    screen = np.empty((val.shape[0], 5), np.uint8)
-    screen[:, 0] = (val >> 32) & 0xFF
-    screen[:, 1] = (val >> 24) & 0xFF
-    screen[:, 2] = (val >> 16) & 0xFF
-    screen[:, 3] = (val >> 8) & 0xFF
-    screen[:, 4] = val & 0xFF
-    # --- colour: bg in the high nibble, fg in the low nibble ----------------- #
-    colour = (np.asarray(bg, np.uint8).ravel() << 4) | np.asarray(fg, np.uint8).ravel()
-    return screen.tobytes() + colour.tobytes() + bytes(palette_bytes)
-
-
-def decode_32vid(frame: bytes, w: int, h: int):
-    """Reference decoder (inverse of _assemble) -> (glyph, fg, bg, palette).
-
-    glyph/fg/bg are (H, W) uint8 (glyph = 0x80 + 5-bit code); palette is (16, 3)
-    uint8 RGB.  Used by the Python tooling/tests and mirrored by the Lua client.
-    """
-    n = h * w
-    ng = (n + 7) // 8
-    scr = np.frombuffer(frame, np.uint8, count=ng * 5, offset=0).reshape(ng, 5).astype(np.uint64)
-    val = (scr[:, 0] << 32 | scr[:, 1] << 24 | scr[:, 2] << 16 | scr[:, 3] << 8 | scr[:, 4])
-    codes = np.empty((ng, 8), np.uint8)
-    for j in range(8):
-        codes[:, j] = (val >> np.uint64(5 * (7 - j))) & np.uint64(0x1F)
-    glyph = (codes.ravel()[:n].reshape(h, w) + np.uint8(0x80))
-    off = ng * 5
-    colour = np.frombuffer(frame, np.uint8, count=n, offset=off).reshape(h, w)
-    fg = colour & 0x0F
-    bg = colour >> 4
-    palette = np.frombuffer(frame, np.uint8, count=48, offset=off + n).reshape(16, 3)
-    return glyph, fg, bg, palette
-
-
-# --------------------------------------------------------------------------- #
-# 32vid container (chunked stream)
-# --------------------------------------------------------------------------- #
-# A 32vid stream is the 12-byte file header followed by a sequence of chunks, each
-# self-delimiting (its own size) and tagged by type, so video and audio chunks can
-# be interleaved live.  We send one video frame per chunk.
-_V32_MAGIC = b"32VD"
-V32_FLAG_BASE = 0x10       # bit 4 is always set
-V32_FLAG_DFPWM_AUDIO = 0x04  # audio compression bits 2-3: 0=PCM, 1 (bit 2)=DFPWM
-V32_TYPE_VIDEO = 0
-V32_TYPE_AUDIO = 1
-
-
-def v32_stream_header(w: int, h: int, fps: int, nstreams: int, flags: int) -> bytes:
-    """The 12-byte 32vid file header: "32VD" + <width,height,fps,nstreams,flags>.
-    Sent once at the start of the stream (and re-sent if fps changes)."""
-    return _V32_MAGIC + struct.pack("<HHBBH", w, h, fps, nstreams, flags)
-
-
-def v32_chunk(ctype: int, datalength: int, data: bytes) -> bytes:
-    """One 32vid chunk: <size, datalength, type> header + data.  `datalength` is the
-    number of video frames or audio samples carried in `data`."""
-    return struct.pack("<IIB", len(data), datalength, ctype) + bytes(data)
-
-
 def _encode_numpy(idx, h, w, pal=_PAL, pal2=_PAL2, lin_pal=_LIN_PAL, dot=_DOT):
     """Reference vectorised core: 6-bit indices -> (glyph, fg, bg) palette-index
     arrays.  The palette tables (`pal`/`pal2`/`lin_pal`/`dot`, see _palette_tables)
@@ -948,19 +869,163 @@ else:                                        # pragma: no cover - numba present 
     _encode_core = _encode_numpy
 
 
-def encode_frame(frame_rgb: np.ndarray, adaptive: bool = True) -> bytes:
-    """Encode a (H*3) x (W*2) x 3 RGB frame into the 32vid wire format (see
-    _assemble).  Uses the compiled numba core, falling back to pure numpy.
+def encode_frame(frame_rgb: np.ndarray, adaptive: bool = True):
+    """Encode a (H*3) x (W*2) x 3 RGB frame -> (glyph, fg, bg, palette) arrays:
+    (H, W) uint8 grids (glyph = 0x80 + 5-bit code) plus the (16, 3) uint8 RGB
+    palette they index.  Uses the compiled numba core, falling back to pure numpy.
 
-    adaptive=True (default) picks a fresh 16-colour palette per frame from the
-    frame's own content (generate_palette) — sanjuuni's signature feature, and the
-    biggest quality lever for out-of-gamut content.  adaptive=False uses CC's fixed
-    default palette (_CC_RGB)."""
+    adaptive=True (default) picks a fresh 16-colour palette from the frame's own
+    content (generate_palette) — sanjuuni's signature feature, and the biggest
+    quality lever for out-of-gamut content.  adaptive=False uses CC's fixed
+    default palette (_CC_RGB).  Streaming uses GopEncoder below, which reuses one
+    palette across a GOP so delta frames stay meaningful."""
     idx, h, w = _prepare(frame_rgb)
     pal_rgb = generate_palette(frame_rgb) if adaptive else _CC_RGB.astype(np.uint8)
     pal, pal2, lin_pal, dot = _palette_tables(pal_rgb)
     glyph, fg, bg = _encode_core(idx, h, w, pal, pal2, lin_pal, dot)
-    return _assemble(glyph, fg, bg, h, w, pal_rgb.tobytes())
+    return glyph, fg.astype(np.uint8), bg.astype(np.uint8), pal_rgb
+
+
+# --------------------------------------------------------------------------- #
+# GOP encoder — frames in, CCMF video chunks out
+# --------------------------------------------------------------------------- #
+
+class GopEncoder:
+    """Accumulate encoded frames into self-contained CCMF video chunks (GOPs).
+
+    Each GOP opens with a palette unit + a raw keyframe (spec §4.4), generated
+    from the keyframe's own content; subsequent frames reuse that palette so
+    their deltas describe genuine content change (a per-frame palette would
+    re-index every cell and make deltas as big as keyframes).  Per frame:
+
+      * unchanged grid            -> `repeat` unit (duration only),
+      * delta smaller than raw    -> `delta` unit (changed spans),
+      * delta >= raw, OR a big
+        RGB-level jump (scene cut)-> fresh palette + `raw` mid-GOP, per the
+                                     spec's SHOULD; later frames delta against
+                                     the new palette.
+
+    The RGB check exists because grid-space deltas can't see through a
+    degenerate palette: after a near-solid keyframe all 16 entries collapse to
+    one colour, so a scene cut encoded against them still lands near-identical
+    cells and a tiny delta — the frame would hold the stale look until the next
+    GOP.  Comparing the source pixels (subsampled mean |diff|) catches that.
+
+    Frame durations are the true PTS gaps to the next encoded frame (adaptive
+    pacing may skip source frames, so gaps vary); the last frame of a GOP gets
+    its gap from the frame that opens the next GOP, or `nominal_duration` at
+    end of stream.  Not thread-safe; one instance per video stream.
+    """
+
+    # Mean |RGB diff| (subsampled) above which a frame counts as a scene cut.
+    # Motion/noise on continuous footage sits well under this; a genuine cut
+    # jumps far past it.  A false positive only costs one extra keyframe.
+    _SCENE_CUT_DIFF = 24.0
+
+    def __init__(self, gop_samples: int = ccmf.SAMPLE_RATE,
+                 nominal_duration: int = 2000) -> None:
+        self.gop_samples = gop_samples          # target GOP span (default 1 s)
+        self.nominal_duration = min(nominal_duration, ccmf.MAX_DURATION)
+        self._entries: list[tuple] = []         # ("pal", bytes) | (enc, pts, body)
+        self._gop_pts = 0
+        self._w = self._h = 0
+        self._tables = None                     # palette tables for delta frames
+        self._prev = None                       # (glyph, fg, bg) of the last frame
+        self._prev_rgb = None                   # subsampled pixels of the last frame
+
+    @staticmethod
+    def _subsample(frame_rgb: np.ndarray) -> np.ndarray:
+        arr = np.asarray(frame_rgb)
+        ph, pw = arr.shape[:2]
+        step = max(1, round((ph * pw / 4096) ** 0.5))
+        return arr[::step, ::step].astype(np.int16)
+
+    def _encode(self, frame_rgb: np.ndarray, tables) -> tuple:
+        idx, h, w = _prepare(frame_rgb)
+        self._w, self._h = w, h
+        glyph, fg, bg = _encode_core(idx, h, w, *tables)
+        return glyph, fg.astype(np.uint8), bg.astype(np.uint8)
+
+    def _open_gop(self, pts: int, frame_rgb: np.ndarray) -> None:
+        pal_rgb = generate_palette(frame_rgb)
+        self._tables = _palette_tables(pal_rgb)
+        self._prev = self._encode(frame_rgb, self._tables)
+        self._gop_pts = pts
+        self._entries = [("pal", pal_rgb.tobytes()),
+                         (ccmf.ENC_RAW, pts, self._prev)]   # planes packed at flush
+
+    def add(self, pts: int, frame_rgb: np.ndarray) -> Optional[tuple[int, bytes]]:
+        """Feed the next frame (absolute `pts` in 48 kHz samples).  Returns the
+        finished (gop_pts, chunk_bytes) when this frame starts a new GOP, else
+        None.  Call flush() after the last frame."""
+        done = None
+        if self._entries and pts - self._gop_pts >= self.gop_samples:
+            done = self._flush(next_pts=pts)
+        rgb_sub = self._subsample(frame_rgb)
+        if not self._entries:
+            self._open_gop(pts, frame_rgb)
+            self._prev_rgb = rgb_sub
+            return done
+
+        cut = (self._prev_rgb is None or rgb_sub.shape != self._prev_rgb.shape
+               or np.abs(rgb_sub - self._prev_rgb).mean() > self._SCENE_CUT_DIFF)
+        self._prev_rgb = rgb_sub
+        if not cut:
+            grids = self._encode(frame_rgb, self._tables)
+            body = ccmf.delta_spans(self._prev, grids)
+            if body is None:
+                self._entries.append((ccmf.ENC_REPEAT, pts, b""))
+            elif len(body) < ccmf.raw_planes_size(self._w, self._h):
+                self._entries.append((ccmf.ENC_DELTA, pts, body))
+            else:
+                cut = True                       # busier than a keyframe: re-key
+        if cut:
+            # Scene cut: the old palette no longer fits, so re-quantise and drop
+            # in a fresh keyframe mid-GOP (may cost a second encode; cuts are rare).
+            pal_rgb = generate_palette(frame_rgb)
+            self._tables = _palette_tables(pal_rgb)
+            grids = self._encode(frame_rgb, self._tables)
+            self._entries.append(("pal", pal_rgb.tobytes()))
+            self._entries.append((ccmf.ENC_RAW, pts, grids))
+        self._prev = grids
+        return done
+
+    def flush(self, next_pts: Optional[int] = None) -> Optional[tuple[int, bytes]]:
+        """Close the open GOP -> (gop_pts, chunk_bytes), or None if empty."""
+        if not self._entries:
+            return None
+        return self._flush(next_pts)
+
+    def _flush(self, next_pts: Optional[int]) -> tuple[int, bytes]:
+        frame_pts = [e[1] for e in self._entries if e[0] != "pal"]
+        # Duration of frame i = gap to frame i+1; the last runs to the next GOP
+        # (or the nominal frame interval at end of stream).  Clamped to the u16
+        # the unit carries — a longer hold just saturates, which is harmless
+        # because the next chunk's own PTS re-anchors playback.
+        last_end = next_pts if next_pts is not None else \
+            frame_pts[-1] + self.nominal_duration
+        gaps = [b - a for a, b in zip(frame_pts, frame_pts[1:])] + \
+               [max(0, last_end - frame_pts[-1])]
+        durations = iter(min(g, ccmf.MAX_DURATION) for g in gaps)
+
+        units = []
+        for entry in self._entries:
+            if entry[0] == "pal":
+                units.append(ccmf.palette_unit(entry[1]))
+                continue
+            enc, _pts, body = entry
+            duration = next(durations)
+            if enc == ccmf.ENC_RAW:
+                units.append(ccmf.raw_frame_unit(duration, *body))
+            elif enc == ccmf.ENC_DELTA:
+                units.append(ccmf.delta_frame_unit(duration, body))
+            else:
+                units.append(ccmf.repeat_frame_unit(duration))
+
+        payload = ccmf.video_payload(self._w, self._h, b"".join(units))
+        out = (self._gop_pts, ccmf.chunk(self._gop_pts, ccmf.TYPE_VIDEO, payload))
+        self._entries = []
+        return out
 
 
 # Warm the JIT at import (compile now, or load the on-disk cache) so the first

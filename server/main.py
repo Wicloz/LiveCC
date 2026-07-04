@@ -5,22 +5,24 @@ CC's http.get caps responses at http.max_response_size (16 MiB) and buffers the
 whole body, so streaming uses a single multiplexed WebSocket.  Server-side
 buffering, A/V sync and pacing live in session.StreamSession.
 
-WebSocket endpoint (used by the CC player):
-    /ws/play?url=<url>[&width=51&height=19&fps=10&audio=1&video=1&start=&end=&loop=0&crunchy=0&sync=0]
-      audio/video : "0" to disable that stream (audio-only / video-only).
-      start/end : timestamps ("90", "1m30s", "3h2m"); seek a VOD section.
-      loop      : "1" to cache the section once and replay it forever.
-      crunchy   : "1" for low-bandwidth/low-fidelity mode — 1-bit DFPWM audio and
-                  CC's fixed default palette instead of the adaptive per-frame one
-                  (the client also lowers video resolution via a smaller width/height).
-            sync      : "1" to share one provider across clients with the same URL.
-  The binary side of the socket is a sanjuuni 32vid stream: a 12-byte "32VD" file
-  header (W, H, fps, nstreams, flags) followed by self-delimiting chunks, each
-  <size, datalength, type> + data, interleaving video and audio:
-      video chunk -> binary  32vid chunk, type 0 — one uncompressed frame (packed
-                     5-bit screen + per-cell colour byte + 48-byte palette)
-      audio chunk -> binary  32vid chunk, type 1 — raw 8-bit PCM, or DFPWM if crunchy
-      status      -> text    "BUFFERING" / "PLAYING" / "ERROR ..."  (out-of-band)
+The socket speaks the CCMF Stream Format (docs/cc-media-format.md §5): every
+message is binary.  The client opens with a lock-step handshake —
+
+    C→S  ROOM   (url, start, end, loop, sync)
+    S→C  ACK | ERROR
+    C→S  CAPS   (capabilities + preferences: streams, codecs, W/H/fps)
+    S→C  ACK | ERROR          <- accept-or-drop decision
+    C→S  START
+
+— after which it is a passive subscriber to the media hose: CCMF container
+chunks (video GOPs / audio) pass through verbatim as marker-led MEDIA messages,
+interleaved with STATUS (buffering/playing), ERROR and END control frames.
+A client may send QUIT to leave cleanly.
+
+Rooms (spec §5.5): sync=0 gives the client a private production; sync=1 joins
+the shared room keyed by (url, start, end, loop).  A joiner whose CAPS diverge
+from the room's running production is dropped with ERROR (it may retry with
+sync=0) — reconciliation is out of scope.
 
 Both Lua scripts are served with this server's own URL baked in, so the player
 is installed and run as `livecc <url>` (no address argument).
@@ -40,9 +42,11 @@ from typing import Optional
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import PlainTextResponse
 
+import ccmf
 from session import StreamSession
+from transcoder import DFPWM, PCM
 
-app = FastAPI(title="LiveCC", version="3.0.0")
+app = FastAPI(title="LiveCC", version="4.0.0")
 
 _LUA_DIR = Path(__file__).parent.parent / "lua"
 
@@ -53,19 +57,16 @@ class _BroadcastSocket:
     def __init__(self, group: "_SyncGroup") -> None:
         self._group = group
 
-    async def send_text(self, message: str) -> None:
-        await self._group.send_text(message)
-
     async def send_bytes(self, payload: bytes) -> None:
         await self._group.send_bytes(payload)
 
 
 class _SyncGroup:
-    """A shared stream for sync=1 clients watching the same URL."""
+    """A shared production for sync=1 clients in the same room."""
 
-    def __init__(self, url: str, signature: tuple, session: StreamSession) -> None:
-        self.url = url
-        self.signature = signature
+    def __init__(self, key: tuple, signature: tuple, session: StreamSession) -> None:
+        self.key = key                       # (url, start, end, loop), spec §5.5
+        self.signature = signature           # production settings from CAPS
         self.session = session
         self._subs: set[WebSocket] = set()
         self._subs_lock = asyncio.Lock()
@@ -83,26 +84,15 @@ class _SyncGroup:
             self._run_task.cancel()
         return empty
 
-    async def send_text(self, message: str) -> None:
-        await self._broadcast("text", message)
-
     async def send_bytes(self, payload: bytes) -> None:
-        await self._broadcast("bytes", payload)
-
-    async def _broadcast(self, mode: str, payload) -> None:
+        # One serialization, identical bytes to every subscriber (spec §5.5).
         async with self._subs_lock:
             subs = list(self._subs)
         if not subs:
             return
 
-        async def _send(ws: WebSocket):
-            if mode == "text":
-                await ws.send_text(payload)
-            else:
-                await ws.send_bytes(payload)
-
-        results = await asyncio.gather(*(_send(ws) for ws in subs), return_exceptions=True)
-
+        results = await asyncio.gather(*(ws.send_bytes(payload) for ws in subs),
+                                       return_exceptions=True)
         dead = [ws for ws, res in zip(subs, results) if isinstance(res, Exception)]
         if dead:
             async with self._subs_lock:
@@ -113,77 +103,76 @@ class _SyncGroup:
         if self._run_task is None or self._run_task.done():
             self._run_task = asyncio.create_task(self.session.run(_BroadcastSocket(self)))
 
-    async def wait(self) -> None:
-        if self._run_task is not None:
-            await self._run_task
 
-
-_sync_groups: dict[str, _SyncGroup] = {}
+_sync_groups: dict[tuple, _SyncGroup] = {}
 _sync_groups_lock = asyncio.Lock()
 
 
-def _int(qp, key: str, default: int, lo: int, hi: int) -> int:
-    try:
-        return max(lo, min(int(qp.get(key, default)), hi))
-    except (TypeError, ValueError):
-        return default
+def _clamp(value: int, default: int, lo: int, hi: int) -> int:
+    return max(lo, min(value, hi)) if value else default
 
 
-async def _until_disconnect(ws: WebSocket) -> None:
-    """Resolve when the client goes away.  Our protocol is server->client only,
-    so receiving simply blocks until the socket closes."""
-    try:
-        while True:
-            await ws.receive()
-    except Exception:
-        return
+def _negotiate(room: ccmf.Room, caps: ccmf.Caps) -> Optional[dict]:
+    """CAPS + ROOM -> StreamSession kwargs, or None when there is nothing the
+    server could send (the accept-or-drop decision, spec §5.3).
 
-
-def _session_kwargs(qp, url: str) -> dict:
+    Audio is optional: the codec is picked from the client's mask (pcm8
+    preferred — the speaker's native format — else dfpwm); a client that
+    advertises no usable codec, or no mono channel role (the mandatory
+    fallback, spec §5.4), simply gets no audio.
+    """
+    codec = None
+    if caps.audio_mask & ccmf.CAP_AUDIO_PCM8:
+        codec = PCM
+    elif caps.audio_mask & ccmf.CAP_AUDIO_DFPWM:
+        codec = DFPWM
+    want_audio = (caps.want_audio and codec is not None
+                  and bool(caps.channels & ccmf.CAP_CHANNEL_MONO))
+    if not caps.want_video and not want_audio:
+        return None
     return {
-        "url": url,
-        "w": _int(qp, "width", 51, 1, 500),
-        "h": _int(qp, "height", 19, 1, 500),
-        "fps": _int(qp, "fps", 24, 1, 30),
-        "want_audio": qp.get("audio", "1") != "0",
-        "want_video": qp.get("video", "1") != "0",
-        "start": qp.get("start", ""),
-        "end": qp.get("end", ""),
-        "loop": qp.get("loop", "0") == "1",
-        "crunchy": qp.get("crunchy", "0") == "1",
+        "url": room.url,
+        "w": _clamp(caps.width, 51, 1, 500),
+        "h": _clamp(caps.height, 19, 1, 500),
+        "fps": _clamp(caps.fps, 24, 1, 30),
+        "want_audio": want_audio,
+        "want_video": caps.want_video,
+        "start": (room.start_ms or 0) / 1000.0,
+        "end": room.end_ms / 1000.0 if room.end_ms is not None else None,
+        "loop": room.loop,
+        "audio_codec": codec or PCM,
     }
 
 
 def _sync_signature(kwargs: dict) -> tuple:
+    """Production settings a shared room is locked to.  (url/start/end/loop are
+    already the room key; this is the CAPS-derived remainder.)"""
     return (
         kwargs["w"],
         kwargs["h"],
         kwargs["fps"],
         kwargs["want_audio"],
         kwargs["want_video"],
-        kwargs["start"],
-        kwargs["end"],
-        kwargs["loop"],
-        kwargs["crunchy"],
+        kwargs["audio_codec"].name,
     )
 
 
-async def _acquire_sync_group(url: str, kwargs: dict) -> Optional[_SyncGroup]:
-    sig = _sync_signature(kwargs)
+async def _acquire_sync_group(room: ccmf.Room, kwargs: dict) -> Optional[_SyncGroup]:
+    key, sig = room.key(), _sync_signature(kwargs)
     async with _sync_groups_lock:
-        group = _sync_groups.get(url)
+        group = _sync_groups.get(key)
         if group is None:
-            group = _SyncGroup(url, sig, StreamSession(**kwargs))
-            _sync_groups[url] = group
+            group = _SyncGroup(key, sig, StreamSession(**kwargs))
+            _sync_groups[key] = group
             return group
         if group.signature != sig:
             return None
         return group
 
 
-async def _release_sync_group(url: str, ws: WebSocket) -> None:
+async def _release_sync_group(key: tuple, ws: WebSocket) -> None:
     async with _sync_groups_lock:
-        group = _sync_groups.get(url)
+        group = _sync_groups.get(key)
         if group is None:
             return
 
@@ -192,50 +181,137 @@ async def _release_sync_group(url: str, ws: WebSocket) -> None:
         return
 
     async with _sync_groups_lock:
-        if _sync_groups.get(url) is group:
-            _sync_groups.pop(url, None)
+        if _sync_groups.get(key) is group:
+            _sync_groups.pop(key, None)
+
+
+# --------------------------------------------------------------------------- #
+# Stream Format plumbing
+# --------------------------------------------------------------------------- #
+
+async def _recv_control(ws: WebSocket) -> Optional[tuple[int, bytes]]:
+    """Receive one control frame -> (opcode, body); None once the socket closes
+    or the client sends something unparseable."""
+    try:
+        while True:
+            message = await ws.receive()
+            if message.get("type") != "websocket.receive":
+                return None                     # websocket.disconnect
+            data = message.get("bytes")
+            if data is None:
+                continue                        # text frames aren't part of CCMF
+            return ccmf.parse_message(data)
+    except Exception:
+        return None
+
+
+async def _send_control(ws: WebSocket, opcode: int, body: bytes = b"") -> None:
+    await ws.send_bytes(ccmf.control(opcode, body))
+
+
+async def _reject(ws: WebSocket, message: str) -> None:
+    """ERROR + drop.  Bodies stay sanitized (spec §7): protocol-level phrasing
+    only, never internal detail."""
+    try:
+        await _send_control(ws, ccmf.OP_ERROR, message.encode("utf-8"))
+        await ws.close(code=1008)
+    except Exception:
+        pass
+
+
+async def _handshake(ws: WebSocket) -> Optional[tuple[ccmf.Room, ccmf.Caps]]:
+    """Run the lock-step ROOM/CAPS/START handshake; None if it fails (the socket
+    is already ERROR'd + closed).  The CAPS ACK (accept-or-drop) is deferred to
+    the caller, which knows whether the requested room can take this client."""
+    got = await _recv_control(ws)
+    if got is None or got[0] != ccmf.OP_ROOM:
+        await _reject(ws, "Expected ROOM.")
+        return None
+    try:
+        room = ccmf.parse_room(got[1])
+    except ValueError:
+        await _reject(ws, "Malformed ROOM.")
+        return None
+    await _send_control(ws, ccmf.OP_ACK)
+
+    got = await _recv_control(ws)
+    if got is None or got[0] != ccmf.OP_CAPS:
+        await _reject(ws, "Expected CAPS.")
+        return None
+    try:
+        caps = ccmf.parse_caps(got[1])
+    except ValueError:
+        await _reject(ws, "Malformed CAPS.")
+        return None
+    return room, caps
+
+
+async def _await_start(ws: WebSocket) -> bool:
+    got = await _recv_control(ws)
+    if got is None or got[0] != ccmf.OP_START:
+        await _reject(ws, "Expected START.")
+        return False
+    return True
+
+
+async def _until_quit_or_disconnect(ws: WebSocket) -> None:
+    """Resolve when the client goes away or sends QUIT.  After START the client
+    is a passive subscriber, so anything else it sends is ignored."""
+    while True:
+        got = await _recv_control(ws)
+        if got is None or got[0] == ccmf.OP_QUIT:
+            return
 
 
 @app.websocket("/ws/play")
 async def ws_play(websocket: WebSocket):
     await websocket.accept()
-    qp = websocket.query_params
-    url = qp.get("url")
-    if not url:
-        await websocket.close(code=1008)
+
+    hello = await _handshake(websocket)
+    if hello is None:
+        return
+    room, caps = hello
+
+    kwargs = _negotiate(room, caps)
+    if kwargs is None:
+        await _reject(websocket, "Nothing to play (no usable stream requested).")
         return
 
-    kwargs = _session_kwargs(qp, url)
-
-    if qp.get("sync", "0") == "1":
-        group = await _acquire_sync_group(url, kwargs)
+    if room.sync:
+        group = await _acquire_sync_group(room, kwargs)
         if group is None:
-            await websocket.send_text(
-                "ERROR Sync clients on the same URL must use identical playback settings."
-            )
-            await websocket.close(code=1008)
+            await _reject(websocket,
+                          "Room settings mismatch; retry without sync.")
             return
+        await _send_control(websocket, ccmf.OP_ACK)      # CAPS accepted
 
+        if not await _await_start(websocket):
+            await _release_sync_group(room.key(), websocket)
+            return
         await group.subscribe(websocket)
         group.start_if_needed()
         try:
-            await _until_disconnect(websocket)
+            await _until_quit_or_disconnect(websocket)
         finally:
-            await _release_sync_group(url, websocket)
+            await _release_sync_group(room.key(), websocket)
             try:
                 await websocket.close()
             except RuntimeError:
                 pass
         return
 
+    await _send_control(websocket, ccmf.OP_ACK)          # CAPS accepted
+    if not await _await_start(websocket):
+        return
+
     session = StreamSession(**kwargs)
 
-    # Run the session alongside a disconnect watcher.  Whichever finishes first
-    # (stream ends, or the client terminates) cancels the other — so an aborted
+    # Run the session alongside a disconnect/QUIT watcher.  Whichever finishes
+    # first (stream ends, or the client leaves) cancels the other — so an aborted
     # CC program promptly tears the session down (kills yt-dlp/ffmpeg, frees the
     # temp file) instead of leaving it running against a dead socket.
     run_task = asyncio.create_task(session.run(websocket))
-    watch_task = asyncio.create_task(_until_disconnect(websocket))
+    watch_task = asyncio.create_task(_until_quit_or_disconnect(websocket))
     try:
         await asyncio.wait({run_task, watch_task}, return_when=asyncio.FIRST_COMPLETED)
     finally:
