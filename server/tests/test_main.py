@@ -228,7 +228,7 @@ def test_sync_group_reuse_and_release():
         assert g1 is g2
 
         ws = WS()
-        await g1.subscribe(ws)
+        await g1.subscribe(ws, ccmf.CAP_CHANNEL_MONO)
         await main._release_sync_group(room.key(), ws)
         assert room.key() not in main._sync_groups
 
@@ -244,6 +244,69 @@ def test_sync_group_rejects_mismatched_caps():
         _room2, changed = _room_and_kwargs(fps=12)
         got = await main._acquire_sync_group(room, changed)
         assert got is None
+
+    asyncio.run(go())
+
+
+def test_sync_group_accepts_mismatched_channels():
+    # Unlike fps/codec/etc, a differing `channels` request is NOT a mismatch --
+    # it's merged into the room's union (spec: serve the union, not reject).
+    async def go():
+        main._sync_groups.clear()
+        room1, kwargs1 = _room_and_kwargs()
+        g1 = await main._acquire_sync_group(room1, kwargs1)
+
+        room2 = ccmf.parse_room(ccmf.build_room("u", sync=True))
+        caps2 = ccmf.parse_caps(ccmf.build_caps(
+            fps=24, channels=ccmf.CAP_CHANNEL_MONO | ccmf.CAP_CHANNEL_FRONT_LEFT
+            | ccmf.CAP_CHANNEL_FRONT_RIGHT))
+        kwargs2 = main._negotiate(room2, caps2)
+        g2 = await main._acquire_sync_group(room2, kwargs2)
+        assert g1 is g2
+
+    asyncio.run(go())
+
+
+class _FakeSession:
+    """Stand-in for StreamSession: records what _SyncGroup tells it to do,
+    without needing a real run() loop (source probing, ffmpeg, etc)."""
+
+    def __init__(self):
+        self.requested_channels = 0
+        self.reconcile_calls = 0
+
+    async def reconfigure_channels(self):
+        self.reconcile_calls += 1
+
+
+def test_sync_group_reconciles_channel_union_on_join_and_leave():
+    # The example from the feature request: one subscriber wants mono+lfe,
+    # another wants front_left+front_right -- the group must union both, and
+    # re-derive the union (dropping what's now unwanted) when one leaves.
+    async def go():
+        fake_session = _FakeSession()
+        group = main._SyncGroup(("u", None, None, False), (), fake_session)
+        ws1, ws2 = object(), object()
+
+        await group.subscribe(ws1, ccmf.CAP_CHANNEL_MONO | ccmf.CAP_CHANNEL_LFE)
+        await asyncio.sleep(0.01)   # let the fire-and-forget reconcile task run
+        assert fake_session.requested_channels == ccmf.CAP_CHANNEL_MONO | ccmf.CAP_CHANNEL_LFE
+        assert fake_session.reconcile_calls == 1
+
+        await group.subscribe(ws2, ccmf.CAP_CHANNEL_FRONT_LEFT | ccmf.CAP_CHANNEL_FRONT_RIGHT)
+        await asyncio.sleep(0.01)
+        assert fake_session.requested_channels == (
+            ccmf.CAP_CHANNEL_MONO | ccmf.CAP_CHANNEL_LFE
+            | ccmf.CAP_CHANNEL_FRONT_LEFT | ccmf.CAP_CHANNEL_FRONT_RIGHT)
+        assert fake_session.reconcile_calls == 2
+
+        # ws1 leaves: mono+lfe drop out of the union, front_left/front_right remain.
+        empty = await group.unsubscribe(ws1)
+        assert not empty
+        await asyncio.sleep(0.01)
+        assert fake_session.requested_channels == (
+            ccmf.CAP_CHANNEL_FRONT_LEFT | ccmf.CAP_CHANNEL_FRONT_RIGHT)
+        assert fake_session.reconcile_calls == 3
 
     asyncio.run(go())
 

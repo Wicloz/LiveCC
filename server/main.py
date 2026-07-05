@@ -21,8 +21,13 @@ A client may send QUIT to leave cleanly.
 
 Rooms (spec §5.5): sync=0 gives the client a private production; sync=1 joins
 the shared room keyed by (url, start, end, loop).  A joiner whose CAPS diverge
-from the room's running production is dropped with ERROR (it may retry with
-sync=0) — reconciliation is out of scope.
+from the room's running production (w/h/fps/codec/want_audio) is dropped with
+ERROR (it may retry with sync=0).  Requested channel roles are the one
+exception: they aren't a mismatch, they're a union to serve -- _SyncGroup
+re-derives the union and updates the running production every time a
+subscriber joins or leaves (session.StreamSession.reconfigure_channels), so a
+room can serve e.g. mono+lfe for one client and front_left+front_right for
+another at once, and stop producing a role once nobody wants it anymore.
 
 Both Lua scripts are served with this server's own URL baked in, so the player
 is installed and run as `livecc <url>` (no address argument).
@@ -62,27 +67,56 @@ class _BroadcastSocket:
 
 
 class _SyncGroup:
-    """A shared production for sync=1 clients in the same room."""
+    """A shared production for sync=1 clients in the same room.
+
+    Channel roles are NOT part of the mismatch check (_sync_signature): unlike
+    w/h/fps/codec/want_audio, which the running production is locked to,
+    subscribers may each want a different set of channel roles (e.g. one
+    wanting mono+lfe, another front_left+front_right). The group tracks each
+    subscriber's requested roles and keeps the session's produced set equal to
+    their union (session.reconfigure_channels), re-deriving it on every join
+    and leave -- a role nobody currently wants stops being served.
+    """
 
     def __init__(self, key: tuple, signature: tuple, session: StreamSession) -> None:
         self.key = key                       # (url, start, end, loop), spec §5.5
         self.signature = signature           # production settings from CAPS
         self.session = session
         self._subs: set[WebSocket] = set()
+        self._sub_channels: dict[WebSocket, int] = {}
         self._subs_lock = asyncio.Lock()
         self._run_task: Optional[asyncio.Task] = None
 
-    async def subscribe(self, ws: WebSocket) -> None:
+    async def subscribe(self, ws: WebSocket, caps_channels: int) -> None:
         async with self._subs_lock:
             self._subs.add(ws)
+            self._sub_channels[ws] = caps_channels
+        self._reconcile_channels()
 
     async def unsubscribe(self, ws: WebSocket) -> bool:
         async with self._subs_lock:
             self._subs.discard(ws)
+            self._sub_channels.pop(ws, None)
             empty = not self._subs
         if empty and self._run_task and not self._run_task.done():
             self._run_task.cancel()
+        elif not empty:
+            self._reconcile_channels()   # obsolete channels no longer served
         return empty
+
+    def _reconcile_channels(self) -> None:
+        # Fire-and-forget: subscribe()/unsubscribe() must return promptly even
+        # if the session's run() hasn't started yet (session.reconfigure_channels
+        # waits for it internally) -- callers here shouldn't block on that.
+        asyncio.create_task(self._reconcile_channels_async())
+
+    async def _reconcile_channels_async(self) -> None:
+        async with self._subs_lock:
+            union = 0
+            for channels in self._sub_channels.values():
+                union |= channels
+        self.session.requested_channels = union
+        await self.session.reconfigure_channels()
 
     async def send_bytes(self, payload: bytes) -> None:
         # One serialization, identical bytes to every subscriber (spec §5.5).
@@ -151,7 +185,13 @@ def _negotiate(room: ccmf.Room, caps: ccmf.Caps) -> Optional[dict]:
 
 def _sync_signature(kwargs: dict) -> tuple:
     """Production settings a shared room is locked to.  (url/start/end/loop are
-    already the room key; this is the CAPS-derived remainder.)"""
+    already the room key; this is the CAPS-derived remainder.)
+
+    `caps_channels` is deliberately NOT part of this: channel roles aren't a
+    mismatch to reject, they're a union to serve (_SyncGroup reconciles the
+    session's produced roles to match every subscriber's request, added to or
+    dropped from as the room's membership changes).
+    """
     return (
         kwargs["w"],
         kwargs["h"],
@@ -159,7 +199,6 @@ def _sync_signature(kwargs: dict) -> tuple:
         kwargs["want_audio"],
         kwargs["want_video"],
         kwargs["audio_codec"].name,
-        kwargs["caps_channels"],
     )
 
 
@@ -168,7 +207,11 @@ async def _acquire_sync_group(room: ccmf.Room, kwargs: dict) -> Optional[_SyncGr
     async with _sync_groups_lock:
         group = _sync_groups.get(key)
         if group is None:
-            group = _SyncGroup(key, sig, StreamSession(**kwargs))
+            # dynamic_channels=True: this session's channel set isn't fixed at
+            # creation (unlike a private session) -- later subscribers with a
+            # different `channels` request get merged in, not rejected.
+            session_kwargs = dict(kwargs, dynamic_channels=True)
+            group = _SyncGroup(key, sig, StreamSession(**session_kwargs))
             _sync_groups[key] = group
             return group
         if group.signature != sig:
@@ -294,7 +337,7 @@ async def ws_play(websocket: WebSocket):
         if not await _await_start(websocket):
             await _release_sync_group(room.key(), websocket)
             return
-        await group.subscribe(websocket)
+        await group.subscribe(websocket, caps.channels)
         group.start_if_needed()
         try:
             await _until_quit_or_disconnect(websocket)

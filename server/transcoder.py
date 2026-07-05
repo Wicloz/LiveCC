@@ -105,30 +105,32 @@ AUDIO_CODECS = {c.name: c for c in (PCM, DFPWM)}
 # channel.
 ROLE_SOURCE_CHANNEL = {1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6, 8: 7}
 
-# Role groups a client can be offered, largest first -- each a strict superset
-# of the next tier down (spec §4.6: mono / stereo / 5.1 / 7.1 roles).  A group
-# is only used when the client's CAPS asked for EVERY role in it *and* the
-# source has at least that many discrete channels, so positional audio is
-# never invented for a mono/stereo source; otherwise we fall through to a
-# smaller group, down to plain mono (the universal fallback, spec §5.4).
-_ROLE_GROUPS = (
-    (1, 2, 3, 4, 5, 6, 7, 8),   # 7.1
-    (1, 2, 3, 4, 5, 6),         # 5.1
-    (1, 2),                     # stereo
-)
 
-
-def negotiate_channel_roles(caps_channels: int, source_channels: int) -> list[int]:
+def negotiate_channel_roles(requested_channels: int, source_channels: int) -> list[int]:
     """Pick which CCMF channel roles (spec §4.6) to actually produce.
 
-    caps_channels is the client's CAPS `channels` bitmask; source_channels is
-    the source's discrete channel count (see probe_audio_channels).  Returns
-    [0] (mono) when no positional group is fully satisfied by both.
+    `requested_channels` is a CAPS `channels` bitmask -- for a private session
+    that's simply the one client's request; for a shared (sync) room it's the
+    OR of every current subscriber's request, so e.g. one client wanting
+    mono+lfe and another wanting front_left+front_right together produce all
+    four distinct roles (session.StreamSession.reconfigure_channels re-derives
+    this union and calls back in whenever a sync room's membership changes).
+
+    Every individual role bit set in `requested_channels` is produced as long
+    as the source can actually supply it: role 0 (mono) always can (it's a
+    downmix of everything), a positional role N needs the source to have more
+    than ROLE_SOURCE_CHANNEL[N] discrete channels. There's no bundling
+    requirement (e.g. asking for just front_left without front_right is
+    honoured as just front_left) -- a room's union may well be a combination
+    no single client would ever request on its own.  Falls back to [0] (mono)
+    if the request has nothing the source can supply, since mono is the
+    universal fallback (spec §5.4) and always available.
     """
-    for group in _ROLE_GROUPS:
-        if source_channels >= len(group) and all(caps_channels & (1 << r) for r in group):
-            return list(group)
-    return [0]
+    roles = [0] if requested_channels & 1 else []   # bit0 = mono (ccmf.CAP_CHANNEL_MONO)
+    for role, idx in ROLE_SOURCE_CHANNEL.items():
+        if requested_channels & (1 << role) and idx < source_channels:
+            roles.append(role)
+    return sorted(roles) or [0]
 
 
 # --------------------------------------------------------------------------- #

@@ -37,7 +37,9 @@ from transcoder import (
     AUDIO_CHUNK_SECONDS,
     GOP_SECONDS,
     PCM,
+    ROLE_SOURCE_CHANNEL,
     download_source,
+    iter_audio,
     iter_audio_channels,
     iter_video,
     needs_download,
@@ -47,6 +49,11 @@ from transcoder import (
     probe_moov_at_end,
     probe_source_info,
 )
+
+# Bound how long reconfigure_channels() waits for a session's initial setup
+# (run()) before giving up -- only matters if run() never gets scheduled or
+# is stuck; a normal session becomes ready within milliseconds.
+_READY_TIMEOUT = 30.0
 
 log = logging.getLogger("livecc")
 
@@ -127,25 +134,37 @@ class StreamSession:
 
     `start`/`end` are seconds into the source (the ROOM message carries ms; the
     caller converts).  `audio_codec` is the transcoder.AudioCodec negotiated
-    from the client's CAPS (PCM preferred, DFPWM fallback).  `caps_channels` is
-    the client's raw CAPS `channels` bitmask; the actual channel roles to
-    produce (self.channel_roles) are decided in run(), once the source's real
-    channel count is known (negotiate_channel_roles) -- mono unless the client
-    asked for more AND the source actually has it (spec §4.6/§5.4).
+    from the client's CAPS (PCM preferred, DFPWM fallback).
+
+    `caps_channels` seeds `self.requested_channels` -- for a private session
+    that's simply the one client's CAPS `channels` bitmask and never changes;
+    for a sync room (`dynamic_channels=True`) it's the union of every current
+    subscriber's request, which main._SyncGroup updates and re-applies (via
+    reconfigure_channels) each time a client joins or leaves. self.channel_roles
+    (the roles actually being produced right now) is derived from
+    self.requested_channels and the source's real channel count
+    (transcoder.negotiate_channel_roles) and can change over the session's
+    lifetime for a sync room -- newly-wanted roles start producing without
+    disturbing ones already flowing; roles nobody wants anymore stop being
+    served (their buffer closes) though their underlying decode pipeline (see
+    _produce_audio_positional) keeps running rather than restart later.
     """
 
     def __init__(self, url: str, w: int, h: int, fps: int, want_audio: bool,
                  want_video: bool = True, start: float = 0,
                  end: Optional[float] = None, loop: bool = False,
                  rate: int = 48000, audio_codec=PCM,
-                 caps_channels: int = ccmf.CAP_CHANNEL_MONO) -> None:
+                 caps_channels: int = ccmf.CAP_CHANNEL_MONO,
+                 dynamic_channels: bool = False) -> None:
         self.url = url
         self.w, self.h, self.fps = w, h, fps
         self.want_audio = want_audio
         self.want_video = want_video
         self.rate = rate
         self.codec = audio_codec
-        self.caps_channels = caps_channels
+        self.requested_channels = caps_channels
+        self.dynamic_channels = dynamic_channels
+        self.source_channels = 1                         # probed in run() if needed
         self._codec_id = ccmf.CODEC_PCM8 if audio_codec.name == "pcm" \
             else ccmf.CODEC_DFPWM
 
@@ -160,29 +179,87 @@ class StreamSession:
         self._source_path: Optional[str] = None         # temp file (loop / seekable)
         self._tmpdir: Optional[str] = None
         self._need_download = False                      # decode from a downloaded file
+        self._buf_max_s = VOD_MAX_BUFFER                 # set for real in _setup_buffers
+        self._buf_drop = False
 
         self.video_buf: TimedBuffer | None = None
-        self.channel_roles: list[int] = [0]              # refined in run()
-        self.audio_bufs: dict[int, TimedBuffer] = {}     # role -> buffer
+        self.channel_roles: list[int] = []               # populated by _apply_channel_target
+        self.audio_bufs: dict[int, TimedBuffer] = {}      # role -> buffer
 
         self.video_done = asyncio.Event()
-        self.audio_done: dict[int, asyncio.Event] = {}   # role -> done
+        self.audio_done: dict[int, asyncio.Event] = {}    # role -> done
         self.video_sent = 0
         self.audio_sent = 0
+
+        # Set once run()'s initial setup (probe + _apply_channel_target) has
+        # happened, so a racing reconfigure_channels() call (a sync room's
+        # second subscriber joining before the first's session finished
+        # starting up) waits instead of touching half-initialised state.
+        self._ready = asyncio.Event()
+        self._mono_task: Optional[asyncio.Task] = None
+        self._positional_task: Optional[asyncio.Task] = None
 
     # ----- setup -----------------------------------------------------------
 
     def _setup_buffers(self) -> None:
         if self.is_live:
             self.prebuffer = LIVE_PREBUFFER
-            max_s, drop = LIVE_MAX_BUFFER, True
+            self._buf_max_s, self._buf_drop = LIVE_MAX_BUFFER, True
         else:
             self.prebuffer = VOD_PREBUFFER
-            max_s, drop = VOD_MAX_BUFFER, False
-        # Video items are whole GOPs (~GOP_SECONDS each), audio items ~0.1 s.
-        self.video_buf = TimedBuffer(int(max_s / GOP_SECONDS) + 1, drop)
-        self.audio_bufs = {role: TimedBuffer(int(max_s / _AUDIO_CHUNK_SECONDS), drop)
-                           for role in self.channel_roles}
+            self._buf_max_s, self._buf_drop = VOD_MAX_BUFFER, False
+        # Video items are whole GOPs (~GOP_SECONDS each); audio buffers are
+        # created on demand in _apply_channel_target (audio items ~0.1 s).
+        self.video_buf = TimedBuffer(int(self._buf_max_s / GOP_SECONDS) + 1, self._buf_drop)
+
+    def _apply_channel_target(self) -> None:
+        """Diff self.channel_roles against what self.requested_channels +
+        self.source_channels now call for, and apply the delta: create a
+        buffer for each newly-wanted role (starting the mono and/or positional
+        producer the first time either is needed), close the buffer for each
+        role nobody wants anymore. Synchronous and await-free by construction
+        (buffer/task creation and TimedBuffer.close()/Event.set() never
+        suspend), so concurrent callers can't interleave mid-update.
+
+        A no-op when audio is off for this session: a sync room's subscriber
+        churn (main._SyncGroup) calls reconfigure_channels() unconditionally,
+        without knowing whether this particular room even wants audio.
+        """
+        if not self.want_audio:
+            return
+        target = set(negotiate_channel_roles(self.requested_channels, self.source_channels))
+        current = set(self.channel_roles)
+        added, removed = target - current, current - target
+        if not added and not removed:
+            return
+
+        for role in added:
+            self.audio_bufs[role] = TimedBuffer(int(self._buf_max_s / _AUDIO_CHUNK_SECONDS),
+                                                self._buf_drop)
+            self.audio_done[role] = asyncio.Event()
+        if 0 in added and self._mono_task is None:
+            self._mono_task = asyncio.create_task(self._produce_audio_mono())
+        if (added - {0}) and self._positional_task is None:
+            self._positional_task = asyncio.create_task(self._produce_audio_positional())
+
+        for role in removed:
+            self.audio_bufs.pop(role).close()
+            self.audio_done.pop(role).set()
+
+        self.channel_roles = sorted(target)
+        log.info("session: %s audio roles now %s (added=%s removed=%s)",
+                 self.url, self.channel_roles, sorted(added), sorted(removed))
+
+    async def reconfigure_channels(self) -> None:
+        """Public entry point for an external caller (main._SyncGroup, when a
+        sync room's subscriber set changes) to re-derive and apply the target
+        role set from the current self.requested_channels. Waits for run()'s
+        initial setup first so it never touches the session before it's ready."""
+        try:
+            await asyncio.wait_for(self._ready.wait(), _READY_TIMEOUT)
+        except asyncio.TimeoutError:
+            return
+        self._apply_channel_target()
 
     # ----- producers -------------------------------------------------------
 
@@ -215,39 +292,83 @@ class StreamSession:
             self.video_buf.close()
             self.video_done.set()
 
-    async def _produce_audio(self) -> None:
-        # One shared decode pass covers every negotiated role (self.channel_roles)
-        # -- iter_audio_channels handles both mono (one pipeline) and positional
-        # roles (one pipeline, split in Python) so every role's sample 0 is the
-        # same source sample; see its docstring for why per-role pipelines would
-        # let stereo drift apart on a live source.  Same guarantee as video: every
-        # role's audio_done is always set so a failed producer degrades to
-        # silent rather than hanging the scheduler.
+    async def _produce_audio_mono(self) -> None:
+        # Role 0's independent downmix pipeline -- started the first time mono
+        # is wanted (_apply_channel_target), kept running for the rest of the
+        # session even if mono later becomes momentarily unwanted (a sync room
+        # might ask for it again; restarting a live decode mid-stream is worse
+        # than idling). A chunk is simply dropped (not buffered/sent) whenever
+        # role 0 currently has no buffer -- see the `buf is not None` check --
+        # which is exactly what "obsolete channels no longer served" means here.
         agen = None
         samples = 0
         try:
-            agen = iter_audio_channels(self.url, self.rate, self.codec, self.channel_roles,
-                                       start=self._start_eff, end=self._end_eff,
-                                       source_path=self._source_path, loop=self.loop)
-            async for chunks in agen:
-                # Wrap here, where the running sample counter (= the chunk's PTS,
-                # spec §4.6) is known; the buffers then hold wire-ready bytes.
-                # All roles share this one counter -- they come from the same
-                # decode pass, so they're frame-aligned by construction.
-                pts = samples / self.rate
-                for role, data in chunks.items():
+            agen = iter_audio(self.url, self.rate, self.codec,
+                              start=self._start_eff, end=self._end_eff,
+                              source_path=self._source_path, loop=self.loop,
+                              source_channel=None)
+            async for data in agen:
+                buf = self.audio_bufs.get(0)
+                if buf is not None:
                     chunk = ccmf.chunk(samples, ccmf.TYPE_AUDIO,
-                                       ccmf.audio_payload(self._codec_id, data, channel=role))
-                    await self.audio_bufs[role].put(pts, chunk)
-                samples += len(next(iter(chunks.values()))) * self.codec.samples_per_byte
+                                       ccmf.audio_payload(self._codec_id, data, channel=0))
+                    await buf.put(samples / self.rate, chunk)
+                samples += len(data) * self.codec.samples_per_byte
         except Exception:
-            log.exception("audio producer failed (roles=%s)", self.channel_roles)
+            log.exception("audio producer failed (role=mono)")
         finally:
             if agen is not None:
                 await agen.aclose()
-            for role in self.channel_roles:
-                self.audio_bufs[role].close()
-                self.audio_done[role].set()
+            # close()/set() only -- NOT pop(): self.channel_roles still lists
+            # role 0 (only _apply_channel_target's "removed" path retires a
+            # role from there), so the dict entry must stay for the scheduler's
+            # self.audio_done[r]/self.audio_bufs[r] lookups to keep working.
+            if 0 in self.audio_bufs:
+                self.audio_bufs[0].close()
+            if 0 in self.audio_done:
+                self.audio_done[0].set()
+            self._mono_task = None
+
+    async def _produce_audio_positional(self) -> None:
+        # One shared decode covers every positional role the source can
+        # possibly supply (spec §4.6), decoded once at full source width
+        # regardless of which subset is CURRENTLY wanted -- so a later-joining
+        # sync-room client asking for a not-yet-served channel doesn't need a
+        # pipeline restart (which would briefly hiccup a live source). Started
+        # the first time ANY positional role is wanted; like mono, kept running
+        # for the rest of the session once started. iter_audio_channels
+        # guarantees every role's sample 0 is the same source sample -- see its
+        # docstring for why independent per-role pipelines would let stereo
+        # drift apart on a live source.
+        agen = None
+        samples = 0
+        roles = sorted(r for r, idx in ROLE_SOURCE_CHANNEL.items() if idx < self.source_channels)
+        try:
+            agen = iter_audio_channels(self.url, self.rate, self.codec, roles,
+                                       start=self._start_eff, end=self._end_eff,
+                                       source_path=self._source_path, loop=self.loop)
+            async for chunks in agen:
+                pts = samples / self.rate
+                for role, data in chunks.items():
+                    buf = self.audio_bufs.get(role)
+                    if buf is not None:
+                        chunk = ccmf.chunk(samples, ccmf.TYPE_AUDIO,
+                                           ccmf.audio_payload(self._codec_id, data, channel=role))
+                        await buf.put(pts, chunk)
+                samples += len(next(iter(chunks.values()))) * self.codec.samples_per_byte
+        except Exception:
+            log.exception("audio producer failed (positional, roles=%s)", roles)
+        finally:
+            if agen is not None:
+                await agen.aclose()
+            # close()/set() only -- see _produce_audio_mono's finally for why
+            # these dict entries must NOT be popped here.
+            for role in roles:
+                if role in self.audio_bufs:
+                    self.audio_bufs[role].close()
+                if role in self.audio_done:
+                    self.audio_done[role].set()
+            self._positional_task = None
 
     # ----- scheduler helpers ----------------------------------------------
 
@@ -260,9 +381,12 @@ class StreamSession:
     # The "primary" stream drives prebuffer/underrun gating: video when present,
     # else audio (audio-only / --no-video).  Both streams are still released by PTS
     # against the shared clock — this only picks what startup/underrun keys off.
-    # With multiple audio roles, the first negotiated role stands in for all of
-    # them -- they all come from the one shared decode/producer (_produce_audio),
-    # so their buffers fill in lockstep anyway.
+    # With multiple audio roles, the first one stands in for all of them (their
+    # buffers fill in lockstep, being fed by at most two shared pipelines --
+    # mono and positional). channel_roles[0] is always role 0 (mono) whenever
+    # want_audio and at least one subscriber is present: a client can only get
+    # want_audio=True with the mandatory mono bit set (main._negotiate), so the
+    # union driving negotiate_channel_roles always includes it.
     def _primary_buf(self) -> TimedBuffer:
         return self.video_buf if self.want_video else self.audio_bufs[self.channel_roles[0]]
 
@@ -328,6 +452,7 @@ class StreamSession:
     async def run(self, ws) -> None:
         if not self.want_video and not self.want_audio:
             await self._send_error(ws, "Nothing to play (audio and video both disabled).")
+            self._ready.set()   # unblock any racing reconfigure_channels() caller
             return
         loop = asyncio.get_running_loop()
         self.is_live, ext = await probe_source_info(self.url)
@@ -335,16 +460,14 @@ class StreamSession:
         self._start_eff = 0.0 if self.is_live else self.start
         self._end_eff = None if self.is_live else self.end
 
-        # Channel roles to actually produce (spec §4.6): mono unless the client
-        # asked for more than that.  The extra channel-count probe only runs in
-        # that case -- the common mono-only client (no CAPS channels beyond the
-        # mandatory bit) never pays for it.
-        if self.want_audio and self.caps_channels != ccmf.CAP_CHANNEL_MONO:
-            source_channels = await probe_audio_channels(self.url)
-            self.channel_roles = negotiate_channel_roles(self.caps_channels, source_channels)
-        else:
-            self.channel_roles = [0]
-        self.audio_done = {role: asyncio.Event() for role in self.channel_roles}
+        # The channel-count probe only runs when it could actually change the
+        # outcome: a dynamic (sync-room) session's future subscribers are
+        # unpredictable, so it always probes; a private session's request is
+        # fixed for its whole lifetime, so the common mono-only client (no
+        # CAPS channels beyond the mandatory bit) skips it.
+        if self.want_audio and (self.dynamic_channels
+                                or self.requested_channels != ccmf.CAP_CHANNEL_MONO):
+            self.source_channels = await probe_audio_channels(self.url)
 
         self._setup_buffers()
 
@@ -360,9 +483,9 @@ class StreamSession:
             elif needs_seekable_source(ext):
                 self._need_download = await probe_moov_at_end(self.url)
 
-        log.info("session: %s is_live=%s ext=%s audio=%s channels=%s "
+        log.info("session: %s is_live=%s ext=%s audio=%s "
                  "start=%ss end=%s loop=%s download=%s",
-                 self.url, self.is_live, ext, self.want_audio, self.channel_roles,
+                 self.url, self.is_live, ext, self.want_audio,
                  self._start_eff, self._end_eff, self.loop and not self.is_live,
                  self._need_download)
 
@@ -372,7 +495,11 @@ class StreamSession:
 
             # Download the [start,end] section to a temp file when we need to replay
             # it (--loop) or can't pipe-stream it (GIF / MP4 moov-at-end).  Then
-            # ffmpeg decodes the seekable file; --loop also replays it.
+            # ffmpeg decodes the seekable file; --loop also replays it.  This MUST
+            # happen before starting anything that reads self._source_path (the
+            # video producer, and _apply_channel_target's audio pipelines just
+            # below) -- otherwise they'd start against the pipe/None and never
+            # pick up the downloaded file.
             if (self.loop or self._need_download) and not self.is_live:
                 self._tmpdir = tempfile.mkdtemp(prefix="livecc_")
                 self._source_path = await download_source(
@@ -381,12 +508,13 @@ class StreamSession:
                 if not self._source_path:
                     await self._send_error(
                         ws, "Failed to prepare source. Check the server logs.")
+                    self._ready.set()   # unblock any racing reconfigure_channels() caller
                     return
 
             if self.want_video:
                 tasks.append(asyncio.create_task(self._produce_video()))
-            if self.want_audio:
-                tasks.append(asyncio.create_task(self._produce_audio()))
+            self._apply_channel_target()   # no-op if not self.want_audio
+            self._ready.set()
 
             await self._prebuffer()
             await self._send_status(ws, ccmf.STATUS_PLAYING)
@@ -443,8 +571,12 @@ class StreamSession:
             except Exception:
                 pass   # socket may already be gone; don't mask the original error
         finally:
-            for t in tasks:
+            self._ready.set()   # safety net: unblock a racing caller even on an
+                                # unexpected exception before the normal set() above
+            audio_tasks = [t for t in (self._mono_task, self._positional_task)
+                          if t is not None]
+            for t in tasks + audio_tasks:
                 t.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(*tasks, *audio_tasks, return_exceptions=True)
             if self._tmpdir:
                 shutil.rmtree(self._tmpdir, ignore_errors=True)

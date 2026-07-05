@@ -267,32 +267,49 @@ def test_audio_ffmpeg_cmd_source_channel_extracts_discrete_channel():
 
 
 def test_negotiate_channel_roles_falls_back_to_mono():
-    # No positional roles requested, or source too thin for the smallest group.
+    # Mono-only request -> just mono, regardless of source width.
     assert transcoder.negotiate_channel_roles(ccmf.CAP_CHANNEL_MONO, 2) == [0]
+    # No mono bit and a source too thin for front_right -> only front_left
+    # survives (dropped, not rounded down to mono -- there's no bundling or
+    # mono/positional exclusivity in this model, see the tests below).
     assert transcoder.negotiate_channel_roles(
-        ccmf.CAP_CHANNEL_FRONT_LEFT | ccmf.CAP_CHANNEL_FRONT_RIGHT, 1) == [0]
+        ccmf.CAP_CHANNEL_FRONT_LEFT | ccmf.CAP_CHANNEL_FRONT_RIGHT, 1) == [1]
 
 
 def test_negotiate_channel_roles_picks_stereo():
+    # mono and positional roles aren't mutually exclusive: a client asking for
+    # both gets both (mono downmix AND the discrete stereo pair), unlike the
+    # old canonical-group model which picked the larger tier over mono.
     caps = ccmf.CAP_CHANNEL_MONO | ccmf.CAP_CHANNEL_FRONT_LEFT | ccmf.CAP_CHANNEL_FRONT_RIGHT
-    assert transcoder.negotiate_channel_roles(caps, source_channels=2) == [1, 2]
+    assert transcoder.negotiate_channel_roles(caps, source_channels=2) == [0, 1, 2]
 
 
-def test_negotiate_channel_roles_needs_every_role_in_the_group():
-    # Only front_left requested (not front_right) -> not a full stereo pair,
-    # falls back to mono even though the source has 2 channels.
-    caps = ccmf.CAP_CHANNEL_MONO | ccmf.CAP_CHANNEL_FRONT_LEFT
-    assert transcoder.negotiate_channel_roles(caps, source_channels=2) == [0]
+def test_negotiate_channel_roles_has_no_bundling_requirement():
+    # Only front_left requested (not front_right) -> that role alone is
+    # produced, not bundled up to a full stereo pair or dropped to mono. This
+    # matters for a sync room's union: one client's mono+lfe combined with
+    # another's front_left+front_right must yield exactly those four roles,
+    # not get rounded up/down to a canonical stereo/5.1/7.1 group.
+    caps = ccmf.CAP_CHANNEL_FRONT_LEFT
+    assert transcoder.negotiate_channel_roles(caps, source_channels=2) == [1]
 
 
-def test_negotiate_channel_roles_picks_surround_51():
+def test_negotiate_channel_roles_union_combines_unrelated_roles():
+    # e.g. one subscriber's mono+lfe OR'd with another's front_left+front_right.
+    caps = ccmf.CAP_CHANNEL_MONO | ccmf.CAP_CHANNEL_LFE \
+        | ccmf.CAP_CHANNEL_FRONT_LEFT | ccmf.CAP_CHANNEL_FRONT_RIGHT
+    assert transcoder.negotiate_channel_roles(caps, source_channels=6) == [0, 1, 2, 4]
+
+
+def test_negotiate_channel_roles_drops_roles_the_source_cant_supply():
     roles = (1, 2, 3, 4, 5, 6)
     caps = ccmf.CAP_CHANNEL_MONO
     for r in roles:
         caps |= 1 << r
-    assert transcoder.negotiate_channel_roles(caps, source_channels=6) == list(roles)
-    # Same request but a stereo source can't fill 5.1 -> steps down to stereo.
-    assert transcoder.negotiate_channel_roles(caps, source_channels=2) == [1, 2]
+    assert transcoder.negotiate_channel_roles(caps, source_channels=6) == [0] + list(roles)
+    # A stereo source can only ever supply front_left/front_right -- the rest
+    # of the 5.1 request is simply dropped (not rounded down to plain mono).
+    assert transcoder.negotiate_channel_roles(caps, source_channels=2) == [0, 1, 2]
 
 
 # --------------------------------------------------------------------------- #
