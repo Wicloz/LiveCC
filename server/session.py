@@ -429,7 +429,9 @@ class StreamSession:
     async def _send_error(self, ws, message: str) -> None:
         # ERROR bodies are client-facing: keep them sanitized (no internal
         # detail; details go to the server log), per spec §7.
-        await ws.send_bytes(ccmf.control(ccmf.OP_ERROR, message.encode("utf-8")))
+        # Latin-1, printable range, per spec §3 — the CC client paints these bytes
+        # straight to the terminal font (no UTF-8, which would render as mojibake).
+        await ws.send_bytes(ccmf.control(ccmf.OP_ERROR, message.encode("latin-1", "replace")))
 
     async def _release(self, ws, media_now: float) -> bool:
         sent = False

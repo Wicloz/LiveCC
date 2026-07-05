@@ -77,6 +77,14 @@ as in RFC 2119.
 - All header fields are **byte-aligned**; sub-byte packing is permitted only
   *within* a single byte (flag bits / nibbles). Payload bodies MAY bit-pack.
 - Bit 7 is the most significant bit of a byte.
+- **Human-readable text** (`ERROR` bodies; subtitle payloads when defined) is
+  **ISO-8859-1 (Latin-1)** restricted to **printable** code points (`0x20–0x7E`
+  and `0xA0–0xFF`); bytes in the control/graphics ranges (`0x00–0x1F`, `0x7F`,
+  `0x80–0x9F`) MUST NOT appear. UTF-8 is **not** used — a multi-byte sequence
+  renders as several glyphs on a CC terminal. (A CC font additionally maps
+  `0x00–0x1F` to CP437 symbols and `0x80–0x9F` to the block glyphs of
+  Section 4.5; those are implementation-specific and outside this spec's text
+  definition.)
 
 ---
 
@@ -283,7 +291,7 @@ Control opcode values **MUST** differ from `marker`.
 | 3   | START  | C→S  | unicast  | empty                             |
 | 4   | QUIT   | C→S  | unicast  | empty                             |
 | 5   | ACK    | S→C  | unicast  | empty                             |
-| 6   | ERROR  | S→C  | unicast  | UTF-8 message (sanitized)         |
+| 6   | ERROR  | S→C  | unicast  | Latin-1 text, sanitized (§3)      |
 | 7   | STATUS | S→C  | multicast| Section 5.6                       |
 | 67  | MEDIA  | S→C  | multicast| = a container chunk (marker-led)  |
 

@@ -785,6 +785,19 @@ local function mon_print(msg)
     screen.write(msg)
 end
 
+-- Human-readable server text (ERROR bodies) is printable ISO-8859-1 (spec §3):
+-- the terminal font renders those bytes directly, so no decoding is needed.  Map
+-- anything outside the printable ranges (0x20-0x7E, 0xA0-0xFF) to '?' so a non-
+-- conforming server can't paint control glyphs or the 0x80-0x9F graphics blocks
+-- across a message.
+local function printable(s)
+    return (s:gsub(".", function(ch)
+        local b = ch:byte()
+        if (b >= 0x20 and b <= 0x7E) or b >= 0xA0 then return ch end
+        return "?"
+    end))
+end
+
 local errored = false   -- an ERROR was shown; don't overwrite it with "Stream ended"
 local ended = false
 
@@ -808,8 +821,9 @@ local function handle_control(opcode, body)
         end
     elseif opcode == OP_ERROR then
         errored = true
-        console("LiveCC error: " .. body)
-        mon_print("Error: " .. body)
+        local text = printable(body)
+        console("LiveCC error: " .. text)
+        mon_print("Error: " .. text)
     end
 end
 
@@ -859,7 +873,7 @@ local function expect_ack(step)
             if opcode == OP_ACK then return end
             if opcode == OP_ERROR then
                 ws.close()
-                die("Server refused " .. step .. ": " .. body)
+                die("Server refused " .. step .. ": " .. printable(body))
             end
         end
     end
@@ -873,7 +887,7 @@ ws.send(control_frame(OP_START), true)
 
 -- ── Main loop ─────────────────────────────────────────────────────────────────
 
-console("LiveCC: streaming — press Q to quit")
+console("LiveCC: streaming \7 press Q to quit")   -- \7 = CC bullet dingbat (no em-dash in the font)
 
 -- Build the coroutine set.  parallel.waitForAny stops as soon as ANY function
 -- returns, so the audio engine must only join when audio is actually on — adding
