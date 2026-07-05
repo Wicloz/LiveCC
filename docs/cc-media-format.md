@@ -1,13 +1,13 @@
 ---
 title: ComputerCraft Media Format (CCMF)
-docname: draft-ccmf-00
+docname: draft-ccmf-01
 category: info
 status: Working Draft
 ---
 
 # ComputerCraft Media Format (CCMF)
 
-Working Draft 00 — replaces the legacy "32vid" transport used by LiveCC.
+Working Draft 01 — replaces the legacy "32vid" transport used by LiveCC.
 
 Stored files use the extension `.ccmf`.
 
@@ -120,6 +120,13 @@ wide margin.
 stream/file (origin 0). Audio PTS is a sample index (exact); video chunk PTS is
 that of its first frame. 48 bits gives ~186 years and stays below Lua's 2^53
 exact-integer limit; a full u64 MUST NOT be used (it breaks CC arithmetic).
+
+All chunk types share **one** timeline: a video frame and an audio sample with
+equal PTS are simultaneous.  A producer transcoding audio and video through
+separate pipelines (or fetching them separately from a live source) **MUST**
+place both on this common timeline — synchronization is expressed *only*
+through PTS; receivers are entitled to trust it and have no other signal to
+correct with.
 
 Common frame intervals are exact: 24 fps = 2000, 30 = 1600, 25 = 1920 samples.
 
@@ -277,7 +284,7 @@ Control opcode values **MUST** differ from `marker`.
 | 4   | QUIT   | C→S  | unicast  | empty                             |
 | 5   | ACK    | S→C  | unicast  | empty                             |
 | 6   | ERROR  | S→C  | unicast  | UTF-8 message (sanitized)         |
-| 7   | STATUS | S→C  | multicast| 1 B: `0` buffering, `1` playing   |
+| 7   | STATUS | S→C  | multicast| Section 5.6                       |
 | 8   | END    | S→C  | multicast| empty                             |
 | 67  | MEDIA  | S→C  | multicast| = a container chunk (marker-led)  |
 
@@ -355,6 +362,46 @@ the container `channel` field (Section 4.6). The other bitmasks advertise
   **implementation-defined** and out of scope; the container's self-describing
   fields make any such mid-stream change expressible without signaling.
 
+### 5.6. STATUS and the Playback Clock
+
+```
++-------+============================+
+| state |  origin (state = 1 only)   |
+|  1 B  |  PTS u48                   |
++-------+============================+
+```
+
+`state`: `0` buffering · `1` playing.  A `playing` STATUS carries **origin**,
+the PTS (Section 4.2) that is *due for presentation now* — it maps the shared
+PTS timeline onto the receiver's local clock.
+
+A streamer **MUST** send `playing` + origin:
+
+1. when playback starts (after its initial prebuffer),
+2. whenever the mapping changes — resuming after a rebuffer (`buffering` was
+   sent, the timeline is later than wall time suggested) or skipping toward
+   the live edge (the timeline jumped forward),
+3. unicast to a subscriber that joins a room mid-stream, so a late joiner
+   anchors to the room's running clock instead of guessing from arrival times.
+
+Receivers **SHOULD** anchor a single media clock to origin at receipt (plus a
+small fixed startup delay of their choosing) and present *both* video frames
+and audio samples against that clock.  On a new origin, queued media behind it
+is stale and SHOULD be dropped (whole GOPs for video — resume at a keyframe).
+
+**Delivery is not presentation.**  A streamer MAY deliver chunks ahead of
+their PTS (jitter slack); a receiver MUST buffer early chunks and schedule
+them by PTS, never play them on arrival.  In particular, audio for a role
+whose PTS is not yet due MUST be held (or fed to a device whose own buffering
+preserves the timing), and audio whose PTS has entirely passed MUST be
+discarded — this, not arrival order, is what keeps multiple channel roles
+sample-aligned with each other and with video.
+
+While a role is active its audio chunks are contiguous in PTS (chunk N+1's
+PTS = chunk N's PTS + its sample count).  Roles MAY join or leave mid-stream
+(Section 5.4); a receiver realigns a (re)joining role by its PTS against the
+same clock.
+
 ---
 
 ## 6. Versioning
@@ -419,3 +466,15 @@ counts, and `start`/`length` against `W·H` before allocating or drawing.
 5. **Compression** (4.4) and **subtitles** (4.3) — deferred.
 6. ~~Endianness~~ — resolved: little-endian (§3), verified against the current
    decoder ([player.lua](../lua/player.lua)).
+
+## Appendix B. Changes from draft-00
+
+- STATUS `playing` now carries the clock **origin** (u48 PTS) and is re-sent at
+  every timeline discontinuity and to mid-stream room joiners (Section 5.6).
+  draft-00 receivers that read only the first body byte are unaffected;
+  draft-00 *senders* leave a draft-01 receiver anchoring heuristically.
+- Section 4.2 now states explicitly that audio and video share one timeline
+  and that producers must reconcile separately-fetched streams onto it.
+- Section 5.6 defines the delivery-vs-presentation contract: receivers
+  schedule media by PTS against the STATUS-anchored clock; early delivery is
+  buffered, stale media is dropped, and channel roles are aligned by PTS.

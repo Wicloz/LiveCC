@@ -346,6 +346,29 @@ OP_END = 8
 STATUS_BUFFERING = 0
 STATUS_PLAYING = 1
 
+
+def status_body(state: int, origin: Optional[int] = None) -> bytes:
+    """STATUS body (spec §5.6): [state u8], plus the clock origin (u48 PTS,
+    the sample due for presentation now) when state is STATUS_PLAYING."""
+    if state == STATUS_PLAYING:
+        if origin is None:
+            raise ValueError("STATUS playing requires a clock origin")
+        if not 0 <= origin < 1 << 48:
+            raise ValueError(f"origin out of u48 range: {origin}")
+        return bytes([state]) + origin.to_bytes(6, "little")
+    return bytes([state])
+
+
+def parse_status(body: bytes) -> tuple[int, Optional[int]]:
+    """STATUS body -> (state, origin).  origin is None for buffering (and for
+    a draft-00 playing STATUS, which carried no origin)."""
+    if not body:
+        raise ValueError("empty STATUS body")
+    state = body[0]
+    if state == STATUS_PLAYING and len(body) >= 7:
+        return state, int.from_bytes(body[1:7], "little")
+    return state, None
+
 # CAPS bitmask values.
 CAP_AUDIO_PCM8 = 0x01
 CAP_AUDIO_DFPWM = 0x02

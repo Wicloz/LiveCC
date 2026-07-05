@@ -10,6 +10,16 @@
 -- (palette + raw/delta/repeat frame units) or ~0.1 s of audio — and anything
 -- else is a control frame [opcode][len u16][body]: STATUS, ERROR, END.
 -- The client opens with ROOM -> ACK, CAPS -> ACK, START, then just consumes.
+--
+-- Synchronization (spec §5.6): ONE media clock, anchored by the server's
+-- STATUS playing message (it carries the origin PTS that is due "now") and
+-- re-anchored whenever the server re-sends it (rebuffer, live-edge skip).
+-- EVERYTHING presents against that clock by PTS: video frames render when
+-- due, and audio — every channel role — is fed to the speakers when due, not
+-- when it arrives.  The server delivers chunks a second or two early on
+-- purpose; that lead is jitter slack to keep queued here, never a cue to play
+-- sooner.  This is what keeps audio on video and every speaker on every other
+-- speaker: they all follow the same clock, so none of them can drift.
 
 local DEFAULT_FPS = 24
 
@@ -234,9 +244,10 @@ end
 local deduped_speakers = speaker_map and found_speakers or dedupe_speakers(found_speakers)
 
 -- `speakers`: flat device list of every speaker found (used for the status
--- message/count below, and as the playback list itself in the no-map path).
--- `speakers_by_role`: role id -> device list, built only when a map is active;
--- a speaker absent from the map gets no role at all, so it stays silent.
+-- message/count below).  `speakers_by_role`: role id -> device list — the ONE
+-- shape the audio engine drives.  No map: every speaker sits under role 0
+-- (mono), the original default.  With a map: exactly the mapped assignments;
+-- an unlisted speaker gets no role at all, so it stays silent.
 local speakers = {}
 local speakers_by_role = {}
 for _, s in ipairs(deduped_speakers) do
@@ -248,6 +259,9 @@ for _, s in ipairs(deduped_speakers) do
             table.insert(speakers_by_role[role], s.dev)
         end
     end
+end
+if not speaker_map and #speakers > 0 then
+    speakers_by_role[0] = speakers
 end
 
 -- A stream is on unless disabled by flag; audio additionally needs a speaker, so
@@ -359,28 +373,63 @@ end
 
 local ws = nil
 
--- ── Audio ────────────────────────────────────────────────────────────────────────
--- The codec arrives per chunk in the a-hdr nibble, matching what we advertised:
---   pcm8   raw unsigned 8-bit PCM — the speaker's native format; just unpack
---          each byte to a signed amplitude (byte - 128 gives -128..127), no
---          decode state.  Sliced to stay under string.byte's multi-return limit.
---   dfpwm  1-bit DFPWM — needs the CC decoder; its state MUST reset per chunk
---          (spec §4.6), so each chunk gets a fresh decoder.
--- Chunks are short (~0.1 s) so decoding stays brief and interleaves with video
--- rendering instead of stalling it.  A bounded queue keeps back-pressure from
--- blocking rendering; drop oldest if the client falls behind.
+-- ── The media clock ──────────────────────────────────────────────────────────────
+-- One clock for everything, in 48 kHz samples: PTS `anchor_pts` is due at real
+-- time `anchor_ms` (os.epoch "utc").  The server anchors it explicitly with
+-- STATUS playing (+ origin PTS, spec §5.6) at start and at every discontinuity
+-- (rebuffer resume, live-edge skip); a draft-00 server without origins falls
+-- back to anchoring on the first media chunk.  CLIENT_DELAY_MS is fixed
+-- startup slack so the first frames/samples are in hand before they're due —
+-- the same constant on every client, so --sync rooms stay aligned.
 
-local MAX_AUDIO_CHUNKS = 80            -- ~8 s at 0.1 s/chunk (safety cap)
+local CLIENT_DELAY_MS = 300
+local anchor_pts, anchor_ms = nil, nil
 
--- No-map (legacy) path: one flat queue, every speaker plays every chunk.
-local audio_queue = {}
+local function clock_now()
+    if not anchor_pts then return nil end
+    return anchor_pts + (os.epoch("utc") - anchor_ms) * 48   -- 48 samples per ms
+end
 
--- Speaker-map path: one queue per channel role, only drained by the speakers
--- assigned that role.  Built for exactly the roles present in speakers_by_role
--- (spec §5.4: server may send one stream per role we asked for in CAPS).
-local audio_queues = {}
-if speaker_map then
-    for role in pairs(speakers_by_role) do audio_queues[role] = {} end
+local function due_ms(pts)
+    return anchor_ms + (pts - anchor_pts) / 48
+end
+
+-- ── Audio: per-role queues + clock-paced speaker feed ───────────────────────────
+-- Chunks land in a per-role queue as RAW payload strings tagged with PTS, and
+-- a single engine feeds every role's speakers against the clock:
+--
+--   * a chunk is fed when it is DUE (its PTS reaches the clock) — the speaker
+--     then plays it immediately, so audible time ≈ clock time;
+--   * once a role's pipeline is rolling (the speaker holds future samples),
+--     contiguous chunks are fed up to SPK_AHEAD early so the device stays
+--     buffered across event-loop hiccups; the speaker's own refusal
+--     (playAudio -> false, retried on speaker_audio_empty) self-clocks the
+--     rest — samples play back-to-back at 48 kHz, in step with the clock;
+--   * a chunk whose time has entirely passed is DROPPED, and one that
+--     straddles "now" is trimmed, so a role that fell behind (or just joined)
+--     re-enters exactly on the clock instead of late;
+--   * a HOLE in a role's stream stops the feed until the device drains, then
+--     the due-gate restarts it on time — the gap is heard as silence, and the
+--     role comes back aligned, never shifted.
+--
+-- Every role follows the same discipline against the same clock, which is
+-- what keeps stereo/5.1/7.1 speakers sample-aligned with each other: nothing
+-- about one role's delivery, drops, or stalls can shift another role, and
+-- none of them can walk away from video.
+--
+-- Decoding happens at feed time (pcm8 unpack, or a fresh DFPWM decoder per
+-- chunk — its state MUST reset per chunk, spec §4.6): queued chunks stay as
+-- compact strings instead of huge Lua number tables.
+
+local MAX_AUDIO_CHUNKS = 60            -- ~6 s of raw strings per role (safety cap)
+local SPK_AHEAD = 38400                -- feed ≤0.8 s ahead once a role is rolling
+local PTS_SLOP = 240                   -- 5 ms: chunks this close count as contiguous
+
+local audio_queues = {}                -- role -> { {pts, n, data, codec}, ... }
+local role_state = {}                  -- role -> { fed_until, pending }
+for role in pairs(speakers_by_role) do
+    audio_queues[role] = {}
+    role_state[role] = {}
 end
 
 local dfpwm = require("cc.audio.dfpwm")
@@ -397,75 +446,135 @@ local function decode_pcm8(data)
     return out
 end
 
-local function handle_audio(payload)
-    local hdr = payload:byte(1)
-    local codec, channel = floor(hdr / 16), hdr % 16
-    local queue
-    if speaker_map then
-        queue = audio_queues[channel]     -- nil if no speaker was assigned this role
-    elseif channel == 0 then
-        queue = audio_queue
+local function decode_samples(head)
+    if head.codec == 0 then
+        return decode_pcm8(head.data)
     end
-    if not queue then return end         -- no speaker wants this role
-    local samples
-    if codec == 0 then
-        samples = decode_pcm8(payload:sub(2))
-    elseif codec == 1 then
-        samples = dfpwm.make_decoder()(payload:sub(2))
-    else
-        return                           -- unknown codec: skip the chunk
-    end
-    queue[#queue + 1] = samples
-    while #queue > MAX_AUDIO_CHUNKS do
-        table.remove(queue, 1)           -- drop oldest, stay in sync
-    end
-    os.queueEvent("livecc_audio")        -- wake the audio player(s)
+    return dfpwm.make_decoder()(head.data)   -- fresh state per chunk (spec §4.6)
 end
 
-local function play_on(devs, samples)
-    if #samples == 0 then return end
-    local pending = {}
-    for i, spk in ipairs(devs) do
-        if not spk.playAudio(samples) then pending[i] = true end
+local function trim_front(samples, skip)
+    if skip <= 0 then return samples end
+    local out = {}
+    for i = skip + 1, #samples do out[i - skip] = samples[i] end
+    return out
+end
+
+local function handle_audio(pts, payload)
+    local hdr = payload:byte(1)
+    local codec, channel = floor(hdr / 16), hdr % 16
+    local queue = audio_queues[channel]  -- nil if no speaker plays this role
+    if not queue or codec > 1 then return end
+    local data = payload:sub(2)
+    queue[#queue + 1] = {
+        pts = pts,
+        n = codec == 1 and #data * 8 or #data,   -- dfpwm: 8 samples/byte
+        data = data,
+        codec = codec,
+    }
+    while #queue > MAX_AUDIO_CHUNKS do
+        table.remove(queue, 1)           -- overflow: drop oldest (PTS re-syncs)
     end
-    while next(pending) do
-        os.pullEvent("speaker_audio_empty")
-        for i in pairs(pending) do
-            if devs[i].playAudio(samples) then pending[i] = nil end
+    os.queueEvent("livecc_audio")        -- wake the audio engine
+end
+
+-- One pass over every role: retry refused feeds, drop stale, feed what the
+-- gates allow.  Returns how many ms until the next scheduled feed (for a
+-- wake-up timer), or nil to sleep until an event.
+local function feed_roles()
+    local now = clock_now()
+    if not now then return nil end
+    local wake = nil
+    local function sooner(ms)
+        if not wake or ms < wake then wake = ms end
+    end
+
+    for role, devs in pairs(speakers_by_role) do
+        local st = role_state[role]
+        -- Per-device feed order must hold, so a role with refused devices
+        -- retries those first and feeds nothing new until they clear.
+        if st.pending then
+            local left = {}
+            for _, d in ipairs(st.pending.devs) do
+                if not d.playAudio(st.pending.samples) then left[#left + 1] = d end
+            end
+            if #left > 0 then
+                st.pending.devs = left
+                sooner(100)              -- safety net besides speaker_audio_empty
+            else
+                st.pending = nil
+            end
         end
+        local q = audio_queues[role]
+        while not st.pending and q[1] do
+            now = clock_now()
+            local head = q[1]
+            if head.pts + head.n <= now then
+                table.remove(q, 1)       -- stale: its whole span already passed
+            else
+                local live = st.fed_until ~= nil and st.fed_until > now
+                if live and head.pts > st.fed_until + PTS_SLOP then
+                    -- Hole in this role's stream: let the device drain, then
+                    -- the due-gate below restarts exactly on the clock.
+                    sooner((st.fed_until - now) / 48)
+                    break
+                elseif live and head.pts > now + SPK_AHEAD then
+                    sooner((head.pts - SPK_AHEAD - now) / 48)     -- budget gate
+                    break
+                elseif not live and head.pts > now then
+                    sooner((head.pts - now) / 48)                 -- due gate
+                    break
+                end
+                table.remove(q, 1)
+                local samples = decode_samples(head)
+                if not live and head.pts < now then
+                    samples = trim_front(samples, floor(now - head.pts))
+                end
+                if #samples > 0 then
+                    local refused = {}
+                    for _, d in ipairs(devs) do
+                        if not d.playAudio(samples) then refused[#refused + 1] = d end
+                    end
+                    if #refused > 0 then
+                        st.pending = { samples = samples, devs = refused }
+                        sooner(100)
+                    end
+                end
+                st.fed_until = head.pts + head.n
+            end
+        end
+    end
+    return wake
+end
+
+local function audio_pending()
+    for role, q in pairs(audio_queues) do
+        if #q > 0 then return true end
+        if role_state[role].pending then return true end
+    end
+    return false
+end
+
+-- Drop everything queued/buffered so playback can restart cleanly at a new
+-- clock position (speaker.stop() flushes the device's buffered samples).
+local function flush_speakers()
+    for role, devs in pairs(speakers_by_role) do
+        for _, d in ipairs(devs) do pcall(d.stop) end
+        role_state[role].pending = nil
+        role_state[role].fed_until = nil
     end
 end
 
 -- ── Video: unit queue + PTS pacing ──────────────────────────────────────────────
 -- A video chunk is a self-contained GOP: [w u16][h u16][compression u8] then a
 -- unit stream — a 48-byte palette unit, a raw keyframe, and delta/repeat units,
--- each frame carrying its hold duration in 48 kHz samples.  The server releases
--- whole GOPs slightly early, so the client itself schedules each frame:
--- arriving units land in `vqueue` with an absolute PTS, and the player coroutine
--- renders whatever is due against a media clock (os.epoch is real time, ms).
---
--- The clock anchors on the first chunk (plus a little startup slack so the queue
--- never starts empty).  Chunks arriving LATE re-anchor after 1 s (server
--- re-buffer: resume smoothly); chunks arriving EARLY are simply queued — only a
--- big PTS jump (live-edge skip) re-anchors, dropping the stale queue.
+-- each frame carrying its hold duration in 48 kHz samples.  Arriving units land
+-- in `vqueue` with an absolute PTS, and the player coroutine renders whatever
+-- is due against the media clock.
+
+local MAX_VIDEO_UNITS = 400            -- OOM guard only; the server's lead is ~2 s
 
 local vqueue = {}
-local anchor_pts, anchor_ms = nil, nil
-local START_SLACK_MS = 200
--- Re-anchor thresholds are asymmetric.  LATE (chunk arrives after its due
--- time): the server stalled/re-buffered — resume promptly, so 1 s.  EARLY
--- (chunk PTS is far ahead of the clock): normal operation is ALWAYS somewhat
--- early — the server releases video ahead of the clock and live-edge skips
--- add more — so small earliness must just queue (re-anchoring on it burst-
--- rendered the whole queue and then froze until the next chunk).  Only a big
--- jump (a genuine live-edge skip) re-anchors, and then the stale queue is
--- DROPPED, not burst-rendered.
-local RESYNC_LATE_MS = 1000
-local RESYNC_EARLY_MS = 3000
-
-local function due_ms(pts)
-    return anchor_ms + (pts - anchor_pts) / 48   -- 48 samples per ms
-end
 
 local HEXB = {}                          -- palette index 0-15 -> blit hex char byte
 for i = 0, 15 do HEXB[i] = ("0123456789abcdef"):byte(i + 1) end
@@ -596,27 +705,29 @@ local function queue_video(chunk_pts, payload)
             cur = cur + duration
         end
     end
+    while #vqueue > MAX_VIDEO_UNITS do
+        table.remove(vqueue, 1)          -- runaway server: shed oldest
+    end
     os.queueEvent("livecc_video")        -- wake the video player
 end
 
--- Anchor (or re-anchor) the media clock from an arriving chunk's PTS.
-local function sync_clock(pts)
-    local now = os.epoch("utc")
-    if anchor_pts == nil then
-        anchor_pts, anchor_ms = pts, now + START_SLACK_MS
-        return
+-- After a forward clock jump, everything queued before `origin` is stale —
+-- but deltas chain off their keyframe, so resume at the LAST raw keyframe at
+-- or before origin (keeping the palette unit that precedes it) and let the
+-- due-drain burst through the few remaining deltas up to "now".
+local function prune_video(origin)
+    local keep = nil
+    for i = 1, #vqueue do
+        local e = vqueue[i]
+        if e.pts > origin then break end
+        if e.raw then keep = i end
     end
-    local lateness = now - due_ms(pts)
-    if lateness > RESYNC_LATE_MS then
-        -- Server stalled/re-buffered: shift the clock so playback resumes
-        -- smoothly (the queue is empty or overdue anyway).
-        anchor_pts, anchor_ms = pts, now + START_SLACK_MS
-    elseif lateness < -RESYNC_EARLY_MS then
-        -- Live-edge skip: the stream jumped ahead.  Jump with it — drop
-        -- whatever is still queued (it is stale content behind the edge)
-        -- rather than fast-forwarding through it on screen.
-        vqueue = {}
-        anchor_pts, anchor_ms = pts, now + START_SLACK_MS
+    if not keep then return end
+    if keep > 1 and vqueue[keep - 1].palette then keep = keep - 1 end
+    if keep > 1 then
+        local rest = {}
+        for i = keep, #vqueue do rest[i - keep + 1] = vqueue[i] end
+        vqueue = rest
     end
 end
 
@@ -640,6 +751,28 @@ local function drain_due()
     screen.setVisible(true)          -- flush: palette + all cells land together
 end
 
+-- ── Anchoring ────────────────────────────────────────────────────────────────────
+
+-- (Re)anchor the clock: `origin` plays at now + CLIENT_DELAY_MS.  On a real
+-- jump (>1 s either way) buffered audio is flushed — the device would
+-- otherwise play out samples timed against the OLD clock — and on a forward
+-- jump stale video is pruned.  Both engines are then woken to re-evaluate.
+local function set_anchor(origin)
+    local old = clock_now()
+    anchor_pts, anchor_ms = origin, os.epoch("utc") + CLIENT_DELAY_MS
+    if old then
+        local jump = clock_now() - old
+        if jump > 48000 or jump < -48000 then
+            flush_speakers()
+        end
+        if jump > 48000 then
+            prune_video(origin)
+        end
+    end
+    os.queueEvent("livecc_clock")
+    os.queueEvent("livecc_video")
+end
+
 -- ── UI ──────────────────────────────────────────────────────────────────────────
 
 local function mon_print(msg)
@@ -657,12 +790,20 @@ local ended = false
 
 local function handle_control(opcode, body)
     if opcode == OP_STATUS then
-        if body:byte(1) == 0 then
+        local state = body:byte(1)
+        if state == 0 then
             mon_print("Buffering...")
-        elseif not WANT_VIDEO then
-            mon_print("Playing (audio only)")   -- no frames will paint over this
+        else
+            -- playing: anchor to the origin PTS when present (spec §5.6); a
+            -- draft-00 server sends none — first-chunk fallback covers that.
+            if #body >= 7 then
+                set_anchor(u48(body, 2))
+            end
+            if not WANT_VIDEO then
+                mon_print("Playing (audio only)")   -- no frames paint over this
+            end
+            -- else the next due video frame paints over "Buffering..."
         end
-        -- else the next video frame paints over the "Buffering..." message
     elseif opcode == OP_ERROR then
         errored = true
         console("LiveCC error: " .. body)
@@ -679,10 +820,11 @@ local function handle_message(msg)
         local pts = u48(msg, 2)
         local ctype = msg:byte(11)
         if ctype == TYPE_VIDEO and WANT_VIDEO then
-            sync_clock(pts)
+            if not anchor_pts then set_anchor(pts) end   -- draft-00 fallback
             queue_video(pts, msg:sub(12))
         elseif ctype == TYPE_AUDIO and WANT_AUDIO then
-            handle_audio(msg:sub(12))
+            if not anchor_pts then set_anchor(pts) end   -- draft-00 fallback
+            handle_audio(pts, msg:sub(12))
         end
         -- unknown chunk types: skip (self-describing stream, spec §6)
     else
@@ -734,7 +876,7 @@ ws.send(control_frame(OP_START), true)
 console("LiveCC: streaming — press Q to quit")
 
 -- Build the coroutine set.  parallel.waitForAny stops as soon as ANY function
--- returns, so the audio player must only join when audio is actually on — adding
+-- returns, so the audio engine must only join when audio is actually on — adding
 -- a no-op coroutine that returns immediately would tear the whole player down
 -- before the receiver rendered anything (the old no-speaker "stuck on Connecting"
 -- bug).
@@ -753,9 +895,15 @@ tasks[#tasks + 1] = function()
             handle_message(msg)
         end
     end
-    -- Let queued video play out before declaring the stream over.
-    while #vqueue > 0 and not errored do
-        os.pullEvent("livecc_drained")
+    -- Let queued video AND the audio tail play out before declaring the
+    -- stream over (bounded: a missing clock must not hang shutdown).
+    local deadline = os.epoch("utc") + 10000
+    while not errored and os.epoch("utc") < deadline
+          and (#vqueue > 0 or audio_pending()) do
+        local t = os.startTimer(0.25)
+        repeat
+            local ev, id = os.pullEvent()
+        until ev == "timer" and id == t
     end
     if not errored then mon_print("Stream ended.") end   -- keep any error on screen
     console("LiveCC: stream ended.")
@@ -766,49 +914,37 @@ if WANT_VIDEO then
     tasks[#tasks + 1] = function()
         while true do
             drain_due()
-            if #vqueue > 0 then
+            if #vqueue > 0 and anchor_pts then
                 local wait = (due_ms(vqueue[1].pts) - os.epoch("utc")) / 1000
                 if wait > 0 then
                     local timer = os.startTimer(wait)
                     repeat
                         local ev, id = os.pullEvent()
-                    until (ev == "timer" and id == timer) or ev == "livecc_video"
+                    until (ev == "timer" and id == timer)
+                        or ev == "livecc_video" or ev == "livecc_clock"
                 end
             else
-                os.queueEvent("livecc_drained")   -- receiver may be waiting to end
-                os.pullEvent("livecc_video")
+                repeat
+                    local ev = os.pullEvent()
+                until ev == "livecc_video" or ev == "livecc_clock"
             end
         end
     end
 end
 
--- Audio player(s): drain the queue(s); may block on speaker_audio_empty.  Only
--- present when audio is on (WANT_AUDIO already requires at least one speaker).
--- No map: a single task drains the flat queue onto every speaker (unchanged
--- default behaviour).  With a map: one task per channel role, each draining
--- only into the speakers assigned that role, so a stalled role's speakers
--- can't block another role's playback.
-if WANT_AUDIO and speaker_map then
-    for role, devs in pairs(speakers_by_role) do
-        local queue = audio_queues[role]
-        tasks[#tasks + 1] = function()
-            while true do
-                if #queue > 0 then
-                    play_on(devs, table.remove(queue, 1))
-                else
-                    os.pullEvent("livecc_audio")   -- sleep until a chunk arrives
-                end
-            end
-        end
-    end
-elseif WANT_AUDIO then
+-- Audio engine: ONE task drives every speaker of every role against the
+-- clock (see the audio section above).  Only present when audio is on
+-- (WANT_AUDIO already requires at least one speaker).
+if WANT_AUDIO then
     tasks[#tasks + 1] = function()
         while true do
-            if #audio_queue > 0 then
-                play_on(speakers, table.remove(audio_queue, 1))
-            else
-                os.pullEvent("livecc_audio")   -- sleep until a chunk arrives
-            end
+            local wait_ms = feed_roles()
+            local timer = wait_ms and os.startTimer(math.max(wait_ms, 5) / 1000)
+            repeat
+                local ev, id = os.pullEvent()
+            until ev == "livecc_audio" or ev == "livecc_clock"
+                or ev == "speaker_audio_empty"
+                or (timer and ev == "timer" and id == timer)
         end
     end
 end
@@ -822,6 +958,7 @@ tasks[#tasks + 1] = function()
                 pcall(function() ws.send(control_frame(OP_QUIT), true) end)
                 ws.close()
             end
+            flush_speakers()             -- don't let buffered audio play on
             mon_print("Stopped.")
             console("LiveCC: stopped by user.")
             return

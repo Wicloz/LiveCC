@@ -192,6 +192,29 @@ def test_channel_roles_are_distinct_one_hot_bits():
 # Stream format: control frames + HELLO bodies
 # --------------------------------------------------------------------------- #
 
+def test_status_body_playing_carries_origin():
+    body = ccmf.status_body(ccmf.STATUS_PLAYING, 123_456_789)
+    assert len(body) == 7                       # state u8 + origin u48
+    assert ccmf.parse_status(body) == (ccmf.STATUS_PLAYING, 123_456_789)
+
+
+def test_status_body_buffering_is_bare():
+    body = ccmf.status_body(ccmf.STATUS_BUFFERING)
+    assert body == b"\x00"
+    assert ccmf.parse_status(body) == (ccmf.STATUS_BUFFERING, None)
+
+
+def test_status_playing_requires_origin():
+    with pytest.raises(ValueError):
+        ccmf.status_body(ccmf.STATUS_PLAYING)
+
+
+def test_status_draft00_playing_parses_without_origin():
+    # A draft-00 sender's bare playing byte still parses; origin is just None
+    # (the receiver falls back to heuristic anchoring).
+    assert ccmf.parse_status(b"\x01") == (ccmf.STATUS_PLAYING, None)
+
+
 def test_control_frame_layout_and_parse():
     f = ccmf.control(ccmf.OP_STATUS, bytes([ccmf.STATUS_PLAYING]))
     assert f == bytes([ccmf.OP_STATUS, 1, 0, ccmf.STATUS_PLAYING])

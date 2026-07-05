@@ -278,6 +278,9 @@ class _FakeSession:
     async def reconfigure_channels(self):
         self.reconcile_calls += 1
 
+    def playback_origin(self):
+        return None                      # not playing yet: no anchor to send
+
 
 def test_sync_group_reconciles_channel_union_on_join_and_leave():
     # The example from the feature request: one subscriber wants mono+lfe,
@@ -307,6 +310,39 @@ def test_sync_group_reconciles_channel_union_on_join_and_leave():
         assert fake_session.requested_channels == (
             ccmf.CAP_CHANNEL_FRONT_LEFT | ccmf.CAP_CHANNEL_FRONT_RIGHT)
         assert fake_session.reconcile_calls == 3
+
+    asyncio.run(go())
+
+
+def test_sync_group_anchors_late_joiner_to_running_clock():
+    # A mid-stream joiner missed the room's STATUS playing, so subscribe()
+    # must unicast one carrying the session's CURRENT clock position — the
+    # joiner anchors to the room's clock instead of guessing from arrivals.
+    class _PlayingSession(_FakeSession):
+        def playback_origin(self):
+            return 96_000                # 2 s in, in 48 kHz samples
+
+    class _WS:
+        def __init__(self):
+            self.sent = []
+
+        async def send_bytes(self, b):
+            self.sent.append(b)
+
+    async def go():
+        group = main._SyncGroup(("u", None, None, False), (), _PlayingSession())
+        ws = _WS()
+        await group.subscribe(ws, ccmf.CAP_CHANNEL_MONO)
+        statuses = [ccmf.parse_status(body) for op, body in
+                    (ccmf.parse_message(b) for b in ws.sent)
+                    if op == ccmf.OP_STATUS]
+        assert (ccmf.STATUS_PLAYING, 96_000) in statuses
+
+        # Before playback starts (origin None) nothing is sent.
+        group2 = main._SyncGroup(("u", None, None, False), (), _FakeSession())
+        ws2 = _WS()
+        await group2.subscribe(ws2, ccmf.CAP_CHANNEL_MONO)
+        assert ws2.sent == []
 
     asyncio.run(go())
 

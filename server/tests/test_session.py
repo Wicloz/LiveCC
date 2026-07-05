@@ -102,24 +102,21 @@ def _ended(bins):
 
 def _patch(monkeypatch, n_video, n_audio, is_live, ext="webm", moov_at_end=True):
     async def fake_video(url, w, h, fps, start=0, end=None, source_path=None,
-                         loop=False):
+                         loop=False, timeline=None):
         # iter_video yields (pts_samples, GOP chunk); one fake chunk per "GOP"
         for i in range(n_video):
             pts = round(i * ccmf.SAMPLE_RATE / fps)
             yield pts, ccmf.chunk(pts, ccmf.TYPE_VIDEO, b"\x00" * 16)
 
-    # _produce_audio_mono uses iter_audio directly (role 0's own pipeline);
-    # _produce_audio_positional uses iter_audio_channels (shared decode for
-    # roles 1-8). Both need faking so either producer can run in a test.
-    async def fake_audio_mono(url, rate, codec, start=0, end=None,
-                              source_path=None, loop=False, source_channel=None):
+    # The ONE audio producer: yields (pts, {role: u8 PCM chunk}) for every
+    # producible role; the session serves whichever roles have open buffers.
+    async def fake_audio_roles(url, rate, roles, decode_channels=1, start=0,
+                               end=None, source_path=None, loop=False,
+                               timeline=None):
+        samples = 0
         for _ in range(n_audio):
-            yield b"\x00" * 4096
-
-    async def fake_audio_channels(url, rate, codec, roles, start=0, end=None,
-                                  source_path=None, loop=False):
-        for _ in range(n_audio):
-            yield {role: b"\x00" * 4096 for role in roles}
+            yield samples, {role: b"\x80" * 4096 for role in roles}
+            samples += 4096
 
     async def fake_probe(url):
         return is_live, ext
@@ -128,10 +125,24 @@ def _patch(monkeypatch, n_video, n_audio, is_live, ext="webm", moov_at_end=True)
         return moov_at_end
 
     monkeypatch.setattr(session, "iter_video", fake_video)
-    monkeypatch.setattr(session, "iter_audio", fake_audio_mono)
-    monkeypatch.setattr(session, "iter_audio_channels", fake_audio_channels)
+    monkeypatch.setattr(session, "iter_audio_roles", fake_audio_roles)
     monkeypatch.setattr(session, "probe_source_info", fake_probe)
     monkeypatch.setattr(session, "probe_moov_at_end", fake_moov)
+
+
+def test_playing_status_carries_clock_origin(monkeypatch):
+    # STATUS playing must carry the clock origin (spec §5.6): the PTS due for
+    # presentation at receipt.  A VOD starts at its first frame -> origin 0.
+    _patch(monkeypatch, n_video=8, n_audio=0, is_live=False)
+    ws = FakeWS()
+    s = StreamSession("u", w=4, h=2, fps=50, want_audio=False)
+    run(s.run(ws))
+    statuses = [ccmf.parse_status(body) for op, body in _controls(ws.bins)
+                if op == ccmf.OP_STATUS]
+    assert (ccmf.STATUS_BUFFERING, None) == statuses[0]
+    playing = [origin for state, origin in statuses
+               if state == ccmf.STATUS_PLAYING]
+    assert playing and playing[0] == 0
 
 
 def test_vod_delivers_every_chunk_in_order(monkeypatch):
@@ -197,25 +208,22 @@ def test_stereo_map_produces_both_channel_roles(monkeypatch):
 def test_reconfigure_channels_adds_and_removes_roles_live(monkeypatch):
     # The sync-room scenario: a subscriber union that grows (another client
     # joins wanting front_left+front_right) and later shrinks (that client
-    # leaves) while the session keeps running -- newly-wanted roles start
-    # producing without disturbing mono, and roles nobody wants anymore stop
-    # being served (buffer closed) without tearing anything else down.
-    async def fake_video(url, w, h, fps, start=0, end=None, source_path=None, loop=False):
+    # leaves) while the session keeps running -- newly-wanted roles are just
+    # buffers opening on the one running producer (so their chunks continue
+    # the session timeline), and roles nobody wants anymore stop being served
+    # (buffer closed) without tearing anything else down.
+    async def fake_video(url, w, h, fps, start=0, end=None, source_path=None,
+                         loop=False, timeline=None):
         if False:
             yield 0, b""
 
-    async def fake_audio_mono(url, rate, codec, start=0, end=None,
-                              source_path=None, loop=False, source_channel=None):
-        i = 0
+    async def fake_audio_roles(url, rate, roles, decode_channels=1, start=0,
+                               end=None, source_path=None, loop=False,
+                               timeline=None):
+        samples = 0
         while True:
-            yield b"\x00" * 4096
-            i += 1
-            await asyncio.sleep(0.01)
-
-    async def fake_audio_channels(url, rate, codec, roles, start=0, end=None,
-                                  source_path=None, loop=False):
-        while True:
-            yield {role: b"\x00" * 4096 for role in roles}
+            yield samples, {role: b"\x80" * 4096 for role in roles}
+            samples += 4096
             await asyncio.sleep(0.01)
 
     async def fake_probe(url):
@@ -225,27 +233,38 @@ def test_reconfigure_channels_adds_and_removes_roles_live(monkeypatch):
         return 2
 
     monkeypatch.setattr(session, "iter_video", fake_video)
-    monkeypatch.setattr(session, "iter_audio", fake_audio_mono)
-    monkeypatch.setattr(session, "iter_audio_channels", fake_audio_channels)
+    monkeypatch.setattr(session, "iter_audio_roles", fake_audio_roles)
     monkeypatch.setattr(session, "probe_source_info", fake_probe)
     monkeypatch.setattr(session, "probe_audio_channels", fake_channels)
 
     async def go():
+        ws = FakeWS()
         s = StreamSession("u", w=2, h=2, fps=50, want_audio=True, want_video=False,
                           caps_channels=ccmf.CAP_CHANNEL_MONO, dynamic_channels=True)
-        task = asyncio.create_task(s.run(FakeWS()))
+        task = asyncio.create_task(s.run(ws))
         await asyncio.sleep(0.05)
-        assert s.channel_roles == [0]              # only mono so far
+        assert s.channel_roles == [0]              # only mono served so far
+        assert s.producible_roles == [0, 1, 2]     # but everything is produced
+        audio_task_before = s._audio_task
 
         # A second subscriber joins wanting front_left+front_right too.
         s.requested_channels = (ccmf.CAP_CHANNEL_MONO | ccmf.CAP_CHANNEL_FRONT_LEFT
                                 | ccmf.CAP_CHANNEL_FRONT_RIGHT)
         await s.reconfigure_channels()
-        await asyncio.sleep(0.05)
+        # Long enough for the fake (~8x realtime) to fill the live prebuffer
+        # and for the scheduler to start releasing chunks.
+        await asyncio.sleep(0.4)
         assert s.channel_roles == [0, 1, 2]
         assert 1 in s.audio_bufs and 2 in s.audio_bufs
-        assert s._positional_task is not None
-        mono_task_before = s._mono_task
+        # The newly-served roles continue the running timeline -- their chunks
+        # start at "now", not back at PTS 0 (the old per-role pipelines used
+        # to restart their sample counters).
+        role1_pts = []
+        for chunk in _auds(ws.bins):
+            pts, _t, payload, _ = ccmf.parse_chunk(chunk)
+            if ccmf.parse_audio_payload(payload)[1] == ccmf.CHANNEL_FRONT_LEFT:
+                role1_pts.append(pts)
+        assert role1_pts and min(role1_pts) > 0
 
         # That subscriber leaves: front_left/front_right are no longer served,
         # but mono (still wanted) keeps flowing undisturbed.
@@ -253,13 +272,65 @@ def test_reconfigure_channels_adds_and_removes_roles_live(monkeypatch):
         await s.reconfigure_channels()
         assert s.channel_roles == [0]
         assert 1 not in s.audio_bufs and 2 not in s.audio_bufs
-        assert s._mono_task is mono_task_before     # mono's pipeline never restarted
+        assert s._audio_task is audio_task_before   # the pipeline never restarted
 
         task.cancel()
         try:
             await task
         except asyncio.CancelledError:
             pass
+
+    run(go())
+
+
+def test_live_skip_reannounces_clock(monkeypatch):
+    # When a live session skips to the buffered head (fell behind the edge),
+    # the timeline jumped — the client can only follow if the server re-sends
+    # STATUS playing with the new origin (spec §5.6).
+    jump = 30 * ccmf.SAMPLE_RATE
+
+    async def fake_video(url, w, h, fps, start=0, end=None, source_path=None,
+                         loop=False, timeline=None):
+        if False:
+            yield 0, b""
+
+    async def fake_audio_roles(url, rate, roles, decode_channels=1, start=0,
+                               end=None, source_path=None, loop=False,
+                               timeline=None):
+        samples = 0
+        for _ in range(20):                    # ~1.7 s: fills the live prebuffer
+            yield samples, {role: b"\x80" * 4096 for role in roles}
+            samples += 4096
+        samples += jump                        # source discontinuity: way ahead
+        for _ in range(5):
+            yield samples, {role: b"\x80" * 4096 for role in roles}
+            samples += 4096
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(3600)              # live: never ends on its own
+
+    async def fake_probe(url):
+        return True, "webm"
+
+    monkeypatch.setattr(session, "iter_video", fake_video)
+    monkeypatch.setattr(session, "iter_audio_roles", fake_audio_roles)
+    monkeypatch.setattr(session, "probe_source_info", fake_probe)
+
+    async def go():
+        ws = FakeWS()
+        s = StreamSession("u", w=2, h=2, fps=50, want_audio=True, want_video=False)
+        task = asyncio.create_task(s.run(ws))
+        await asyncio.sleep(0.5)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        playing = [origin for state, origin in
+                   (ccmf.parse_status(body) for op, body in _controls(ws.bins)
+                    if op == ccmf.OP_STATUS)
+                   if state == ccmf.STATUS_PLAYING]
+        assert playing[0] == 0                     # started at the first chunk
+        assert any(o >= jump for o in playing)     # the skip was re-announced
 
     run(go())
 
@@ -307,14 +378,13 @@ def test_failing_video_producer_reports_error_without_hanging(monkeypatch):
 
 def test_failing_audio_producer_degrades_to_silent_video(monkeypatch):
     # If only audio fails, video must keep flowing (audio_done still gets set) —
-    # graceful degradation, not a hang.  A default (mono-only) session's audio
-    # runs through _produce_audio_mono, which uses iter_audio directly.
+    # graceful degradation, not a hang.
     _patch(monkeypatch, n_video=4, n_audio=0, is_live=False)
 
     def boom(*a, **k):
         raise RuntimeError("audio kaboom")
 
-    monkeypatch.setattr(session, "iter_audio", boom)
+    monkeypatch.setattr(session, "iter_audio_roles", boom)
     ws = FakeWS()
     s = StreamSession("u", w=4, h=2, fps=50, want_audio=True)
     run(asyncio.wait_for(s.run(ws), 5))
@@ -374,7 +444,7 @@ def test_audio_codec_is_negotiated_not_hardcoded():
                          audio_codec=DFPWM).codec.name == "dfpwm"
 
 
-def test_dfpwm_chunks_are_tagged_dfpwm(monkeypatch):
+def test_dfpwm_chunks_are_tagged_and_packed_dfpwm(monkeypatch):
     _patch(monkeypatch, n_video=0, n_audio=2, is_live=False)
     ws = FakeWS()
     s = StreamSession("u", w=4, h=2, fps=50, want_audio=True, want_video=False,
@@ -383,11 +453,13 @@ def test_dfpwm_chunks_are_tagged_dfpwm(monkeypatch):
     auds = _auds(ws.bins)
     assert auds
     _pts, _t, payload, _ = ccmf.parse_chunk(auds[0])
-    codec, _chan, _data = ccmf.parse_audio_payload(payload)
+    codec, _chan, data = ccmf.parse_audio_payload(payload)
     assert codec == ccmf.CODEC_DFPWM
-    # DFPWM: 8 samples/byte -> the second chunk's PTS reflects that
+    # The producer yields PCM (4096 samples); the session packs DFPWM at
+    # 8 samples/byte, and PTS advances by SAMPLES either way.
+    assert len(data) == 4096 // 8
     pts2, _t, _p, _ = ccmf.parse_chunk(auds[1])
-    assert pts2 == 4096 * 8
+    assert pts2 == 4096
 
 
 def test_loop_downloads_section_once_then_streams(monkeypatch):
@@ -493,7 +565,7 @@ def test_cancel_finalizes_producer_generator(monkeypatch):
     closed = {"video": False}
 
     async def fake_video(url, w, h, fps, start=0, end=None, source_path=None,
-                         loop=False):
+                         loop=False, timeline=None):
         i = 0
         try:
             while True:
@@ -504,16 +576,16 @@ def test_cancel_finalizes_producer_generator(monkeypatch):
         finally:
             closed["video"] = True
 
-    async def fake_audio(url, rate, codec, roles, start=0, end=None,
-                         source_path=None, loop=False):
+    async def fake_audio(url, rate, roles, decode_channels=1, start=0, end=None,
+                         source_path=None, loop=False, timeline=None):
         if False:
-            yield {}
+            yield 0, {}
 
     async def fake_probe(url):
         return False, "webm"
 
     monkeypatch.setattr(session, "iter_video", fake_video)
-    monkeypatch.setattr(session, "iter_audio_channels", fake_audio)
+    monkeypatch.setattr(session, "iter_audio_roles", fake_audio)
     monkeypatch.setattr(session, "probe_source_info", fake_probe)
 
     async def go():

@@ -170,7 +170,10 @@ def test_requirements_bundle_ejs_solver():
 
 
 def test_audio_ffmpeg_cmd_is_raw_pcm_mono():
-    cmd = transcoder._audio_ffmpeg_cmd(48000)            # default codec = PCM
+    # ffmpeg only ever DECODES audio (to the speaker-native u8 PCM); the wire
+    # codec (DFPWM when negotiated) is packed in Python per chunk (dfpwm.py),
+    # so each chunk is independently decodable as the spec requires (§4.6).
+    cmd = transcoder._audio_ffmpeg_cmd(48000)
     assert cmd[cmd.index("-c:a") + 1] == "pcm_u8"   # CC speaker's native format
     assert cmd[cmd.index("-f") + 1] == "u8"         # raw, no container
     assert cmd[cmd.index("-ac") + 1] == "1"
@@ -178,20 +181,13 @@ def test_audio_ffmpeg_cmd_is_raw_pcm_mono():
     assert "dfpwm" not in cmd
 
 
-def test_audio_ffmpeg_cmd_dfpwm_when_negotiated():
-    cmd = transcoder._audio_ffmpeg_cmd(48000, transcoder.DFPWM)
-    assert cmd[cmd.index("-c:a") + 1] == "dfpwm"
-    assert cmd[cmd.index("-f") + 1] == "dfpwm"
-    assert "pcm_u8" not in cmd
-
-
 def test_audio_codecs_share_chunk_duration():
-    # Both codecs read the same number of samples per chunk (~0.1 s), just packed
-    # into a different number of bytes — so A/V buffering stays codec-independent.
-    for codec in (transcoder.PCM, transcoder.DFPWM):
-        assert codec.read_bytes * codec.samples_per_byte == transcoder.AUDIO_CHUNK_SAMPLES
+    # Both codecs carry the same samples per chunk (~0.1 s); only the packing
+    # differs (PCM 1 sample/byte, DFPWM 8 samples/byte — so the chunk sample
+    # count must pack into whole DFPWM bytes).
     assert transcoder.PCM.samples_per_byte == 1
     assert transcoder.DFPWM.samples_per_byte == 8
+    assert transcoder.AUDIO_CHUNK_SAMPLES % 8 == 0
 
 
 def test_audio_ffmpeg_cmd_loops_a_file():
@@ -249,12 +245,17 @@ def test_audio_chunk_is_short_to_avoid_periodic_video_stall():
 
 
 def test_audio_ffmpeg_cmd_has_no_server_side_filtering():
-    # Server-side audio filtering was reported to make audio worse, so the source
-    # is fed straight into the PCM encoder — no -af chain on either path.
+    # Server-side audio *processing* was reported to make audio worse, so the
+    # -af chain may only inspect (ashowinfo: first-frame source PTS for
+    # SourceTimeline) or pick channels (pan) — never touch the signal.
     for cmd in (transcoder._audio_ffmpeg_cmd(48000),
-                transcoder._audio_ffmpeg_cmd(48000, source="/tmp/s.mkv")):
-        assert "-af" not in cmd
+                transcoder._audio_ffmpeg_cmd(48000, source="/tmp/s.mkv"),
+                transcoder._audio_ffmpeg_cmd(48000, source_channel=1),
+                transcoder._multichannel_pcm_cmd(48000, 2)):
         assert "-filter:a" not in cmd
+        af = cmd[cmd.index("-af") + 1] if "-af" in cmd else ""
+        for part in filter(None, af.split(",")):
+            assert part == "ashowinfo" or part.startswith("pan="), part
 
 
 def test_audio_ffmpeg_cmd_source_channel_extracts_discrete_channel():
@@ -262,8 +263,115 @@ def test_audio_ffmpeg_cmd_source_channel_extracts_discrete_channel():
     # source channel via `pan`, not downmix -- so it doesn't bleed into its
     # sibling channel (e.g. front_left picking up front_right's content).
     cmd = transcoder._audio_ffmpeg_cmd(48000, source_channel=1)
-    assert cmd[cmd.index("-af") + 1] == "pan=mono|c0=c1"
+    assert cmd[cmd.index("-af") + 1] == "ashowinfo,pan=mono|c0=c1"
     assert "-ac" not in cmd
+
+
+def test_video_ffmpeg_cmd_taps_first_frame_pts():
+    # showinfo sits LAST in the chain (after fps), so its first report is the
+    # source timestamp of output frame 0 exactly — the SourceTimeline base.
+    cmd = transcoder._video_ffmpeg_cmd(10, 8, 12)
+    vf = cmd[cmd.index("-vf") + 1]
+    assert vf.endswith("fps=12,showinfo")
+
+
+def test_first_pts_probe_captures_only_the_first_frame():
+    p = transcoder._FirstPtsProbe()
+    assert not p.feed("[vp9 @ 0x1] some decoder line")       # not showinfo: logged
+    assert p.feed("[Parsed_showinfo_0 @ 0x55e] n:   0 pts:  12345 pts_time:257.32 "
+                  "duration:512")
+    assert p.seen and p.value == pytest.approx(257.32)
+    # later frames must not overwrite: the base maps output 0, nothing else
+    assert p.feed("[Parsed_showinfo_0 @ 0x55e] n:   1 pts: 12857 pts_time:258.0")
+    assert p.value == pytest.approx(257.32)
+
+
+def test_first_pts_probe_nopts_first_frame_stays_unknown():
+    p = transcoder._FirstPtsProbe()
+    assert p.feed("[Parsed_ashowinfo_0 @ 0x1] n:0 pts:NOPTS pts_time:NOPTS")
+    assert p.seen and p.value is None
+    p.feed("[Parsed_ashowinfo_0 @ 0x1] n:1 pts:1024 pts_time:0.021")
+    assert p.value is None   # a later frame's pts would map the wrong position
+
+
+# --------------------------------------------------------------------------- #
+# SourceTimeline
+# --------------------------------------------------------------------------- #
+
+def test_source_timeline_aligns_two_pipelines():
+    # The live A/V case: video's fetch joined the stream 2.5 s after audio's.
+    # Audio (earliest base) becomes the zero; video is shifted +2.5 s.
+    async def go():
+        tl = transcoder.SourceTimeline(["video", "audio"], timeout=5)
+        audio, video = await asyncio.gather(
+            tl.offset_samples("audio", 97.0),
+            tl.offset_samples("video", 99.5))
+        assert audio == 0
+        assert video == round(2.5 * transcoder.SAMPLE_RATE)
+
+    asyncio.run(go())
+
+
+def test_source_timeline_falls_back_when_any_base_unknown():
+    # Half-corrections are worse than none: one unknown base disables both.
+    async def go():
+        tl = transcoder.SourceTimeline(["video", "audio"], timeout=5)
+        audio, video = await asyncio.gather(
+            tl.offset_samples("audio", None),
+            tl.offset_samples("video", 99.5))
+        assert (audio, video) == (0, 0)
+
+    asyncio.run(go())
+
+
+def test_source_timeline_falls_back_on_implausible_skew():
+    # Bases further apart than a plausible live-fetch skew are two different
+    # timestamp epochs (e.g. an HLS/DASH mix), not an offset to correct.
+    async def go():
+        tl = transcoder.SourceTimeline(["video", "audio"], timeout=5)
+        audio, video = await asyncio.gather(
+            tl.offset_samples("audio", 12.0),
+            tl.offset_samples("video", 5000.0))
+        assert (audio, video) == (0, 0)
+
+    asyncio.run(go())
+
+
+def test_source_timeline_single_pipeline_needs_no_offset():
+    async def go():
+        tl = transcoder.SourceTimeline(["audio"], timeout=5)
+        assert await tl.offset_samples("audio", 12345.6) == 0
+
+    asyncio.run(go())
+
+
+def test_source_timeline_timeout_releases_the_waiter():
+    # A pipeline that never produces (broken video) must not hold audio
+    # hostage: the waiter falls back to raw counters after the timeout.
+    async def go():
+        tl = transcoder.SourceTimeline(["video", "audio"], timeout=0.05)
+        assert await asyncio.wait_for(tl.offset_samples("audio", 97.0), 2) == 0
+        # the late reporter gets the same (already-frozen) decision
+        assert await tl.offset_samples("video", 99.5) == 0
+
+    asyncio.run(go())
+
+
+# --------------------------------------------------------------------------- #
+# mono downmix
+# --------------------------------------------------------------------------- #
+
+def test_mono_downmix_averages_channels():
+    import numpy as np
+    stereo = np.array([[10, 30], [20, 40]], np.uint8)
+    assert list(transcoder.mono_downmix(stereo)) == [20, 30]
+
+
+def test_mono_downmix_excludes_lfe():
+    import numpy as np
+    # 5.1 decode order FL FR FC LFE BL BR: index 3 (value 250) must not fold in.
+    six = np.tile(np.array([[10, 20, 30, 250, 40, 50]], np.uint8), (3, 1))
+    assert list(transcoder.mono_downmix(six)) == [30, 30, 30]
 
 
 def test_negotiate_channel_roles_falls_back_to_mono():
@@ -527,68 +635,126 @@ def test_decode_audio_from_generated_file(tmp_path):
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
-def test_iter_audio_channels_deinterleaves_stereo_without_crosstalk(tmp_path):
-    # Regression for the stereo-drift bug: two independent per-role pipelines
-    # each decode the source separately, which is fine for a seekable file but
-    # drifts on a live source (two fetches of "now" don't land on the same
-    # sample). iter_audio_channels instead decodes once and splits the
-    # interleaved PCM in Python. Verify the split actually lands each channel
-    # on the right role, using a synthetic source with a distinct constant
-    # level per channel (front_left ~0.25, front_right ~0.75) -- any channel
-    # swap or off-by-one in the de-interleave would show up as a wrong level.
+def test_iter_audio_roles_deinterleaves_stereo_without_crosstalk(tmp_path):
+    # Regression for the channel-drift bug class: independent per-role (or
+    # separate mono/positional) pipelines each fetch+decode the source
+    # separately, which is fine for a seekable file but skews on a live source
+    # (two fetches of "now" don't land on the same sample). iter_audio_roles
+    # decodes once and cuts every role — including the mono downmix — from the
+    # same frames. Verify with a distinct constant level per channel
+    # (front_left ~0.25, front_right ~0.75): any swap or off-by-one in the
+    # de-interleave would show up as a wrong level, and mono must sit between.
     path = tmp_path / "stereo.wav"
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
            "-f", "lavfi", "-i", "aevalsrc=0.25|0.75:c=stereo:s=48000:d=0.5", str(path)]
     if subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE).returncode != 0:
         pytest.skip("ffmpeg can't build a synthetic stereo source")
 
-    left_chunks, right_chunks = [], []
+    ptss, left_chunks, right_chunks, mono_chunks = [], [], [], []
 
     async def go():
-        agen = transcoder.iter_audio_channels(
-            "ignored", sample_rate=48000, codec=transcoder.PCM,
-            roles=[ccmf.CHANNEL_FRONT_LEFT, ccmf.CHANNEL_FRONT_RIGHT],
-            source_path=str(path))
+        agen = transcoder.iter_audio_roles(
+            "ignored", sample_rate=48000,
+            roles=[ccmf.CHANNEL_MONO, ccmf.CHANNEL_FRONT_LEFT,
+                   ccmf.CHANNEL_FRONT_RIGHT],
+            decode_channels=2, source_path=str(path))
         try:
-            async for chunks in agen:
+            async for pts, chunks in agen:
+                ptss.append((pts, len(chunks[ccmf.CHANNEL_FRONT_LEFT])))
                 left_chunks.append(chunks[ccmf.CHANNEL_FRONT_LEFT])
                 right_chunks.append(chunks[ccmf.CHANNEL_FRONT_RIGHT])
+                mono_chunks.append(chunks[ccmf.CHANNEL_MONO])
         finally:
             await agen.aclose()
 
     asyncio.run(go())
     left, right = b"".join(left_chunks), b"".join(right_chunks)
-    assert left and right
-    assert len(left) == len(right)          # sample-aligned: same length per role
+    mono = b"".join(mono_chunks)
+    assert left and right and mono
+    assert len(left) == len(right) == len(mono)   # sample-aligned per role
     avg_left = sum(left) / len(left)
     avg_right = sum(right) / len(right)
-    assert avg_left < 180 < avg_right        # 0.25 -> ~160, 0.75 -> ~224: not swapped/mixed
+    avg_mono = sum(mono) / len(mono)
+    assert avg_left < 180 < avg_right        # 0.25 -> ~160, 0.75 -> ~224: not swapped
+    assert avg_left < avg_mono < avg_right   # mono = downmix of the same frames
+    # PTS is contiguous: chunk N+1 starts exactly where chunk N ended.
+    for (p1, n1), (p2, _n2) in zip(ptss, ptss[1:]):
+        assert p2 == p1 + n1
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
-def test_iter_audio_channels_mono_delegates_to_iter_audio(tmp_path):
-    # len(roles) == 1 needs no split -- it's just the plain single-pipeline path.
+def test_iter_audio_roles_mono_uses_plain_downmix_pipeline(tmp_path):
+    # decode_channels == 1 (mono-only session) needs no de-interleave -- it's
+    # the plain single-pipeline downmix path, but with the same (pts, {role:
+    # chunk}) contract.
     path = tmp_path / "with_audio.mp4"
     if _ffmpeg_make(path, "mpeg4", acodec="aac").returncode != 0:
         pytest.skip("ffmpeg can't build mp4+aac")
 
-    chunks = []
+    got = []
 
     async def go():
-        agen = transcoder.iter_audio_channels(
-            "ignored", sample_rate=48000, codec=transcoder.PCM,
-            roles=[ccmf.CHANNEL_MONO], source_path=str(path))
+        agen = transcoder.iter_audio_roles(
+            "ignored", sample_rate=48000, roles=[ccmf.CHANNEL_MONO],
+            decode_channels=1, source_path=str(path))
         try:
-            async for chunk in agen:
-                chunks.append(chunk)
-                if chunks:
+            async for pts, chunks in agen:
+                got.append((pts, chunks))
+                if len(got) >= 2:
                     break
         finally:
             await agen.aclose()
 
     asyncio.run(go())
-    assert chunks and set(chunks[0]) == {ccmf.CHANNEL_MONO}
-    assert len(chunks[0][ccmf.CHANNEL_MONO]) > 0
+    assert got and set(got[0][1]) == {ccmf.CHANNEL_MONO}
+    assert got[0][0] == 0                                  # counts from zero
+    assert got[1][0] == len(got[0][1][ccmf.CHANNEL_MONO])  # contiguous PTS
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+def test_source_timeline_resolves_from_real_pipelines(tmp_path):
+    # End-to-end alignment plumbing: both pipelines must parse their first
+    # source PTS out of real ffmpeg showinfo/ashowinfo stderr and resolve the
+    # shared timeline from it — not via the None/timeout fallback.  Catches a
+    # showinfo tap missing from a command, the drain not feeding the probe,
+    # or the pts_time regex drifting from ffmpeg's actual output.
+    path = tmp_path / "clip.mkv"
+    if _ffmpeg_make(path, "mpeg4", acodec="aac").returncode != 0:
+        pytest.skip("ffmpeg can't build the clip")
+
+    async def go():
+        tl = transcoder.SourceTimeline(["video", "audio"], timeout=10)
+        video_pts, audio_pts = [], []
+
+        async def video():
+            agen = transcoder.iter_video("ignored", term_w=8, term_h=4, fps=5,
+                                         source_path=str(path), timeline=tl)
+            try:
+                async for pts, _chunk in agen:
+                    video_pts.append(pts)
+            finally:
+                await agen.aclose()
+
+        async def audio():
+            agen = transcoder.iter_audio_roles("ignored", 48000, roles=[0],
+                                               decode_channels=1,
+                                               source_path=str(path), timeline=tl)
+            try:
+                async for pts, _chunks in agen:
+                    audio_pts.append(pts)
+            finally:
+                await agen.aclose()
+
+        await asyncio.wait_for(asyncio.gather(video(), audio()), 30)
+        assert video_pts and audio_pts
+        # Both probes parsed a real base (no fallback): the timeline decided
+        # on an actual zero point.
+        assert tl._zero is not None
+        # Same file, same start: both streams begin within a frame of zero.
+        assert 0 <= video_pts[0] <= ccmf.SAMPLE_RATE // 5
+        assert 0 <= audio_pts[0] <= transcoder.AUDIO_CHUNK_SAMPLES
+
+    asyncio.run(go())
 
 
 # --------------------------------------------------------------------------- #

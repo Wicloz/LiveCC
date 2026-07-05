@@ -1,20 +1,30 @@
 """
-StreamSession — server-side buffering, A/V sync, and pacing.
+StreamSession — server-side buffering, pacing, and the playback clock.
 
-Two producers (video, audio) fill bounded TimedBuffers; each item is a finished
-CCMF chunk tagged with a media-time PTS derived from its output position (video
-GOP -> its first frame's index/fps; audio byte k -> k/rate) on one shared
-timeline.  A single scheduler advances a media clock and releases chunks whose
-PTS is due, writing them to one sink (the WebSocket, or a sync-group fanout):
+Producers fill bounded TimedBuffers; each item is a finished CCMF chunk whose
+PTS lives on ONE shared session timeline: transcoder.SourceTimeline reconciles
+the separately-fetched video and audio pipelines onto it, and every audio
+channel role is cut from a single decode pass (transcoder.iter_audio_roles),
+so nothing the server emits can be mutually skewed at the source.
+
+A single scheduler advances a media clock and releases chunks whose PTS is
+due, SEND_LEAD early, to one sink (the WebSocket, or a sync-group fanout):
 
     video chunk  -> binary message  CCMF chunk type 0 (one self-contained GOP)
     audio chunk  -> binary message  CCMF chunk type 1 (PCM or DFPWM samples)
     status       -> binary message  CCMF control frame STATUS / ERROR / END
 
-Because both streams are released against the same clock, they stay in sync.
-Audio is released AUDIO_LEAD early (keeps the CC speaker buffer full); video
-GOPs are released VIDEO_LEAD early (the client paces the frames inside each
-chunk by PTS, so the lead is jitter slack, not a sync shift).
+The lead is DELIVERY slack only (network/scheduler jitter): the client
+presents every chunk by PTS against the clock this server announces.  A
+`STATUS playing` carries the clock origin (spec §5.6) and is re-sent at every
+timeline discontinuity, so the client never has to infer the mapping from
+arrival times:
+
+  * playback start   -> playing(origin = primary stream's first PTS)
+  * VOD underrun     -> buffering; after re-prebuffering, playing(resume PTS)
+  * live-edge skip   -> playing(the new head PTS)
+  * live source gap  -> buffering once the gap exceeds LIVE_GAP_STATUS
+  * late room joiner -> main.py unicasts playing(playback_origin()) on join
 
 Underrun / hiccup policy:
   * VOD  — buffers backpressure the producer; on underrun the clock PAUSES and
@@ -33,14 +43,15 @@ import tempfile
 from typing import Optional
 
 import ccmf
+import dfpwm
 from transcoder import (
     AUDIO_CHUNK_SECONDS,
     GOP_SECONDS,
     PCM,
     ROLE_SOURCE_CHANNEL,
+    SourceTimeline,
     download_source,
-    iter_audio,
-    iter_audio_channels,
+    iter_audio_roles,
     iter_video,
     needs_download,
     needs_seekable_source,
@@ -60,18 +71,18 @@ log = logging.getLogger("livecc")
 # Buffering parameters (seconds of media).
 VOD_PREBUFFER = 2.0
 VOD_MAX_BUFFER = 15.0
-LIVE_PREBUFFER = 1.0
+LIVE_PREBUFFER = 1.5
 LIVE_MAX_BUFFER = 4.0
 
-# Release audio this far ahead of the playback clock so the CC speaker buffer
-# stays full (the speaker plays at 48 kHz, so playback stays at realtime — the
-# lead is pure jitter slack and does not desync from video).
-AUDIO_LEAD = 2.0
+# Release every chunk this far ahead of the playback clock.  Pure delivery
+# slack: the client buffers early chunks and presents them by PTS, so the lead
+# hides network/scheduler jitter without shifting anything.  One value for
+# both streams — the asymmetric audio-vs-video leads of the old design existed
+# only because the client used to play audio on arrival.
+SEND_LEAD = 1.5
 
-# Release video GOP chunks this far ahead of the clock.  The client renders each
-# frame at its own PTS, so an early chunk just sits in its queue — this only
-# hides network/scheduler jitter at GOP boundaries.
-VIDEO_LEAD = 0.5
+# Live: report buffering to the client once the source has been dry this long.
+LIVE_GAP_STATUS = 1.0
 
 _AUDIO_CHUNK_SECONDS = AUDIO_CHUNK_SECONDS   # ~0.1 s, same for both codecs
 
@@ -136,18 +147,18 @@ class StreamSession:
     caller converts).  `audio_codec` is the transcoder.AudioCodec negotiated
     from the client's CAPS (PCM preferred, DFPWM fallback).
 
-    `caps_channels` seeds `self.requested_channels` -- for a private session
-    that's simply the one client's CAPS `channels` bitmask and never changes;
+    Channel roles: ONE audio producer decodes the source once and cuts every
+    role the source could ever supply (self.producible_roles, incl. the mono
+    downmix) from that same pass — a role is "served" iff it has an open
+    buffer.  `caps_channels` seeds `self.requested_channels`: for a private
+    session that's the one client's CAPS `channels` bitmask, fixed for life;
     for a sync room (`dynamic_channels=True`) it's the union of every current
-    subscriber's request, which main._SyncGroup updates and re-applies (via
-    reconfigure_channels) each time a client joins or leaves. self.channel_roles
-    (the roles actually being produced right now) is derived from
-    self.requested_channels and the source's real channel count
-    (transcoder.negotiate_channel_roles) and can change over the session's
-    lifetime for a sync room -- newly-wanted roles start producing without
-    disturbing ones already flowing; roles nobody wants anymore stop being
-    served (their buffer closes) though their underlying decode pipeline (see
-    _produce_audio_positional) keeps running rather than restart later.
+    subscriber's request, which main._SyncGroup re-applies (via
+    reconfigure_channels) on every join/leave.  Adding or removing a served
+    role only opens/closes its buffer — the decode pipeline never restarts, so
+    a role that joins mid-stream continues the session timeline (its first
+    chunk's PTS is "now", not zero) and roles can never skew against each
+    other or against video.
     """
 
     def __init__(self, url: str, w: int, h: int, fps: int, want_audio: bool,
@@ -183,21 +194,29 @@ class StreamSession:
         self._buf_drop = False
 
         self.video_buf: TimedBuffer | None = None
-        self.channel_roles: list[int] = []               # populated by _apply_channel_target
+        self.producible_roles: list[int] = []            # set in run() after probing
+        self.channel_roles: list[int] = []               # roles currently SERVED
         self.audio_bufs: dict[int, TimedBuffer] = {}      # role -> buffer
+        self._timeline: Optional[SourceTimeline] = None
 
         self.video_done = asyncio.Event()
         self.audio_done: dict[int, asyncio.Event] = {}    # role -> done
         self.video_sent = 0
         self.audio_sent = 0
 
+        # Playback clock (media seconds); valid while _playing.  Exposed via
+        # playback_origin() so a sync room's late joiner can anchor (spec §5.6).
+        self._playing = False
+        self._clock_origin = 0.0
+        self._clock_t0: Optional[float] = None
+
         # Set once run()'s initial setup (probe + _apply_channel_target) has
         # happened, so a racing reconfigure_channels() call (a sync room's
         # second subscriber joining before the first's session finished
         # starting up) waits instead of touching half-initialised state.
         self._ready = asyncio.Event()
-        self._mono_task: Optional[asyncio.Task] = None
-        self._positional_task: Optional[asyncio.Task] = None
+        self._audio_task: Optional[asyncio.Task] = None
+        self._audio_dead = False                         # producer finished/failed
 
     # ----- setup -----------------------------------------------------------
 
@@ -214,12 +233,13 @@ class StreamSession:
 
     def _apply_channel_target(self) -> None:
         """Diff self.channel_roles against what self.requested_channels +
-        self.source_channels now call for, and apply the delta: create a
-        buffer for each newly-wanted role (starting the mono and/or positional
-        producer the first time either is needed), close the buffer for each
-        role nobody wants anymore. Synchronous and await-free by construction
-        (buffer/task creation and TimedBuffer.close()/Event.set() never
-        suspend), so concurrent callers can't interleave mid-update.
+        self.source_channels now call for, and apply the delta: open a buffer
+        for each newly-wanted role, close the buffer for each role nobody
+        wants anymore.  Buffers are the ONLY thing that changes — the single
+        audio producer keeps decoding every producible role regardless, and
+        simply drops chunks for roles without a buffer.  Synchronous and
+        await-free by construction, so concurrent callers can't interleave
+        mid-update.
 
         A no-op when audio is off for this session: a sync room's subscriber
         churn (main._SyncGroup) calls reconfigure_channels() unconditionally,
@@ -230,6 +250,8 @@ class StreamSession:
         target = set(negotiate_channel_roles(self.requested_channels, self.source_channels))
         current = set(self.channel_roles)
         added, removed = target - current, current - target
+        if self._audio_dead:
+            added = set()      # a new buffer would never fill or report done
         if not added and not removed:
             return
 
@@ -237,16 +259,12 @@ class StreamSession:
             self.audio_bufs[role] = TimedBuffer(int(self._buf_max_s / _AUDIO_CHUNK_SECONDS),
                                                 self._buf_drop)
             self.audio_done[role] = asyncio.Event()
-        if 0 in added and self._mono_task is None:
-            self._mono_task = asyncio.create_task(self._produce_audio_mono())
-        if (added - {0}) and self._positional_task is None:
-            self._positional_task = asyncio.create_task(self._produce_audio_positional())
 
         for role in removed:
             self.audio_bufs.pop(role).close()
             self.audio_done.pop(role).set()
 
-        self.channel_roles = sorted(target)
+        self.channel_roles = sorted((current | added) - removed)
         log.info("session: %s audio roles now %s (added=%s removed=%s)",
                  self.url, self.channel_roles, sorted(added), sorted(removed))
 
@@ -278,10 +296,12 @@ class StreamSession:
         try:
             agen = iter_video(self.url, self.w, self.h, self.fps,
                               start=self._start_eff, end=self._end_eff,
-                              source_path=self._source_path, loop=self.loop)
+                              source_path=self._source_path, loop=self.loop,
+                              timeline=self._timeline)
             # iter_video yields finished CCMF GOP chunks tagged with their first
-            # frame's PTS in samples; it may skip source frames to keep up
-            # (adaptive pacing) — so trust its pts, don't count.
+            # frame's PTS in samples (already on the shared timeline); it may
+            # skip source frames to keep up (adaptive pacing) — so trust its
+            # pts, don't count.
             async for pts, chunk in agen:
                 await self.video_buf.put(pts / ccmf.SAMPLE_RATE, chunk)
         except Exception:
@@ -292,83 +312,44 @@ class StreamSession:
             self.video_buf.close()
             self.video_done.set()
 
-    async def _produce_audio_mono(self) -> None:
-        # Role 0's independent downmix pipeline -- started the first time mono
-        # is wanted (_apply_channel_target), kept running for the rest of the
-        # session even if mono later becomes momentarily unwanted (a sync room
-        # might ask for it again; restarting a live decode mid-stream is worse
-        # than idling). A chunk is simply dropped (not buffered/sent) whenever
-        # role 0 currently has no buffer -- see the `buf is not None` check --
-        # which is exactly what "obsolete channels no longer served" means here.
+    async def _produce_audio(self) -> None:
+        # THE audio producer: one fetch, one decode, every producible role cut
+        # sample-aligned from it (iter_audio_roles).  Runs for the whole
+        # session; which roles actually reach the wire is decided purely by
+        # which buffers are open (see the `buf is not None` check), so a sync
+        # room's role churn never touches the pipeline.
         agen = None
-        samples = 0
+        ev_loop = asyncio.get_running_loop()
         try:
-            agen = iter_audio(self.url, self.rate, self.codec,
-                              start=self._start_eff, end=self._end_eff,
-                              source_path=self._source_path, loop=self.loop,
-                              source_channel=None)
-            async for data in agen:
-                buf = self.audio_bufs.get(0)
-                if buf is not None:
-                    chunk = ccmf.chunk(samples, ccmf.TYPE_AUDIO,
-                                       ccmf.audio_payload(self._codec_id, data, channel=0))
-                    await buf.put(samples / self.rate, chunk)
-                samples += len(data) * self.codec.samples_per_byte
-        except Exception:
-            log.exception("audio producer failed (role=mono)")
-        finally:
-            if agen is not None:
-                await agen.aclose()
-            # close()/set() only -- NOT pop(): self.channel_roles still lists
-            # role 0 (only _apply_channel_target's "removed" path retires a
-            # role from there), so the dict entry must stay for the scheduler's
-            # self.audio_done[r]/self.audio_bufs[r] lookups to keep working.
-            if 0 in self.audio_bufs:
-                self.audio_bufs[0].close()
-            if 0 in self.audio_done:
-                self.audio_done[0].set()
-            self._mono_task = None
-
-    async def _produce_audio_positional(self) -> None:
-        # One shared decode covers every positional role the source can
-        # possibly supply (spec §4.6), decoded once at full source width
-        # regardless of which subset is CURRENTLY wanted -- so a later-joining
-        # sync-room client asking for a not-yet-served channel doesn't need a
-        # pipeline restart (which would briefly hiccup a live source). Started
-        # the first time ANY positional role is wanted; like mono, kept running
-        # for the rest of the session once started. iter_audio_channels
-        # guarantees every role's sample 0 is the same source sample -- see its
-        # docstring for why independent per-role pipelines would let stereo
-        # drift apart on a live source.
-        agen = None
-        samples = 0
-        roles = sorted(r for r, idx in ROLE_SOURCE_CHANNEL.items() if idx < self.source_channels)
-        try:
-            agen = iter_audio_channels(self.url, self.rate, self.codec, roles,
-                                       start=self._start_eff, end=self._end_eff,
-                                       source_path=self._source_path, loop=self.loop)
-            async for chunks in agen:
-                pts = samples / self.rate
+            agen = iter_audio_roles(self.url, self.rate,
+                                    roles=self.producible_roles,
+                                    decode_channels=self.source_channels,
+                                    start=self._start_eff, end=self._end_eff,
+                                    source_path=self._source_path, loop=self.loop,
+                                    timeline=self._timeline)
+            async for pts, chunks in agen:
                 for role, data in chunks.items():
                     buf = self.audio_bufs.get(role)
-                    if buf is not None:
-                        chunk = ccmf.chunk(samples, ccmf.TYPE_AUDIO,
-                                           ccmf.audio_payload(self._codec_id, data, channel=role))
-                        await buf.put(pts, chunk)
-                samples += len(next(iter(chunks.values()))) * self.codec.samples_per_byte
+                    if buf is None:
+                        continue
+                    if self._codec_id == ccmf.CODEC_DFPWM:
+                        # Per-chunk encode with fresh state (spec §4.6); the
+                        # sequential bit-loop runs off the event loop.
+                        data = await ev_loop.run_in_executor(None, dfpwm.encode, data)
+                    chunk = ccmf.chunk(pts, ccmf.TYPE_AUDIO,
+                                       ccmf.audio_payload(self._codec_id, data,
+                                                          channel=role))
+                    await buf.put(pts / self.rate, chunk)
         except Exception:
-            log.exception("audio producer failed (positional, roles=%s)", roles)
+            log.exception("audio producer failed (roles=%s)", self.producible_roles)
         finally:
             if agen is not None:
                 await agen.aclose()
-            # close()/set() only -- see _produce_audio_mono's finally for why
-            # these dict entries must NOT be popped here.
-            for role in roles:
-                if role in self.audio_bufs:
-                    self.audio_bufs[role].close()
-                if role in self.audio_done:
-                    self.audio_done[role].set()
-            self._positional_task = None
+            self._audio_dead = True
+            for buf in self.audio_bufs.values():
+                buf.close()
+            for done in self.audio_done.values():
+                done.set()
 
     # ----- scheduler helpers ----------------------------------------------
 
@@ -381,12 +362,12 @@ class StreamSession:
     # The "primary" stream drives prebuffer/underrun gating: video when present,
     # else audio (audio-only / --no-video).  Both streams are still released by PTS
     # against the shared clock — this only picks what startup/underrun keys off.
-    # With multiple audio roles, the first one stands in for all of them (their
-    # buffers fill in lockstep, being fed by at most two shared pipelines --
-    # mono and positional). channel_roles[0] is always role 0 (mono) whenever
-    # want_audio and at least one subscriber is present: a client can only get
-    # want_audio=True with the mandatory mono bit set (main._negotiate), so the
-    # union driving negotiate_channel_roles always includes it.
+    # With multiple audio roles, the first one stands in for all of them (they
+    # fill in lockstep from the single producer).  channel_roles[0] is always
+    # role 0 (mono) whenever want_audio and at least one subscriber is present:
+    # a client can only get want_audio=True with the mandatory mono bit set
+    # (main._negotiate), so the union driving negotiate_channel_roles always
+    # includes it.
     def _primary_buf(self) -> TimedBuffer:
         return self.video_buf if self.want_video else self.audio_bufs[self.channel_roles[0]]
 
@@ -421,8 +402,28 @@ class StreamSession:
         while not done.is_set() and buf.seconds() < self.prebuffer:
             await asyncio.sleep(0.05)
 
-    async def _send_status(self, ws, status: int) -> None:
-        await ws.send_bytes(ccmf.control(ccmf.OP_STATUS, bytes([status])))
+    def playback_origin(self) -> Optional[int]:
+        """The clock's current position in samples, or None when not playing.
+        What a mid-stream sync-room joiner should anchor to (spec §5.6)."""
+        if not self._playing or self._clock_t0 is None:
+            return None
+        now = asyncio.get_running_loop().time()
+        media_now = (now - self._clock_t0) + self._clock_origin
+        return max(0, round(media_now * ccmf.SAMPLE_RATE))
+
+    async def _send_buffering(self, ws) -> None:
+        self._playing = False
+        await ws.send_bytes(ccmf.control(ccmf.OP_STATUS,
+                                         ccmf.status_body(ccmf.STATUS_BUFFERING)))
+
+    async def _mark_playing(self, ws, origin: float, t0: float) -> None:
+        """Announce (or re-announce) the playback clock: media time `origin`
+        is due for presentation now (spec §5.6).  Called at start and at every
+        discontinuity, so the client re-anchors instead of guessing."""
+        self._clock_origin, self._clock_t0 = origin, t0
+        self._playing = True
+        await ws.send_bytes(ccmf.control(ccmf.OP_STATUS, ccmf.status_body(
+            ccmf.STATUS_PLAYING, max(0, round(origin * ccmf.SAMPLE_RATE)))))
 
     async def _send_error(self, ws, message: str) -> None:
         # ERROR bodies are client-facing: keep them sanitized (no internal
@@ -431,17 +432,20 @@ class StreamSession:
 
     async def _release(self, ws, media_now: float) -> bool:
         sent = False
-        # All buffers hold wire-ready CCMF chunks; audio leads so the speaker
-        # stays buffered, video leads a little so the client-side PTS pacing
-        # never starves at a GOP boundary.  Each audio role is an independent
-        # buffer/pipeline, so they're drained in whatever order dict iteration
-        # gives -- release order across roles doesn't matter, only PTS does.
+        # All buffers hold wire-ready CCMF chunks released SEND_LEAD early; the
+        # client schedules them by PTS.  Chunks that are already entirely in
+        # the past (a live-edge skip, or backlog behind a late-set origin) are
+        # dropped here rather than shipped for the client to discard.
         for buf in self.audio_bufs.values():
-            for _pts, data in buf.pop_due(media_now + AUDIO_LEAD):
+            for pts, data in buf.pop_due(media_now + SEND_LEAD):
+                if pts + _AUDIO_CHUNK_SECONDS < media_now:
+                    continue
                 await ws.send_bytes(data)
                 self.audio_sent += 1
                 sent = True
-        for _pts, data in self.video_buf.pop_due(media_now + VIDEO_LEAD):
+        for pts, data in self.video_buf.pop_due(media_now + SEND_LEAD):
+            if pts + 2 * GOP_SECONDS < media_now:
+                continue
             await ws.send_bytes(data)
             self.video_sent += 1
             sent = True
@@ -469,6 +473,21 @@ class StreamSession:
                                 or self.requested_channels != ccmf.CAP_CHANNEL_MONO):
             self.source_channels = await probe_audio_channels(self.url)
 
+        # Everything the source could ever supply; the single audio producer
+        # decodes all of it for the whole session so that serving a new role
+        # later is just opening a buffer, never a pipeline restart.
+        self.producible_roles = [0] + [
+            r for r, idx in sorted(ROLE_SOURCE_CHANNEL.items())
+            if idx < self.source_channels]
+
+        # One timeline for however many pipelines this session runs; each
+        # producer reports its first source timestamp and gets the offset that
+        # places its counted PTS on the shared timeline (A/V alignment for
+        # separately-fetched live streams).
+        self._timeline = SourceTimeline(
+            [n for n, wanted in (("video", self.want_video),
+                                 ("audio", self.want_audio)) if wanted])
+
         self._setup_buffers()
 
         # Decide whether to decode from a downloaded file instead of the pipe (live
@@ -484,22 +503,21 @@ class StreamSession:
                 self._need_download = await probe_moov_at_end(self.url)
 
         log.info("session: %s is_live=%s ext=%s audio=%s "
-                 "start=%ss end=%s loop=%s download=%s",
+                 "start=%ss end=%s loop=%s download=%s channels=%d",
                  self.url, self.is_live, ext, self.want_audio,
                  self._start_eff, self._end_eff, self.loop and not self.is_live,
-                 self._need_download)
+                 self._need_download, self.source_channels)
 
         tasks: list[asyncio.Task] = []
         try:
-            await self._send_status(ws, ccmf.STATUS_BUFFERING)
+            await self._send_buffering(ws)
 
             # Download the [start,end] section to a temp file when we need to replay
             # it (--loop) or can't pipe-stream it (GIF / MP4 moov-at-end).  Then
             # ffmpeg decodes the seekable file; --loop also replays it.  This MUST
             # happen before starting anything that reads self._source_path (the
-            # video producer, and _apply_channel_target's audio pipelines just
-            # below) -- otherwise they'd start against the pipe/None and never
-            # pick up the downloaded file.
+            # producers below) -- otherwise they'd start against the pipe/None
+            # and never pick up the downloaded file.
             if (self.loop or self._need_download) and not self.is_live:
                 self._tmpdir = tempfile.mkdtemp(prefix="livecc_")
                 self._source_path = await download_source(
@@ -511,16 +529,23 @@ class StreamSession:
                     self._ready.set()   # unblock any racing reconfigure_channels() caller
                     return
 
+            self._apply_channel_target()   # open buffers; no-op if not want_audio
             if self.want_video:
                 tasks.append(asyncio.create_task(self._produce_video()))
-            self._apply_channel_target()   # no-op if not self.want_audio
+            if self.want_audio:
+                self._audio_task = asyncio.create_task(self._produce_audio())
             self._ready.set()
 
             await self._prebuffer()
-            await self._send_status(ws, ccmf.STATUS_PLAYING)
 
+            # Media time of the primary stream's first chunk is where playback
+            # begins; anything on other streams from before it is stale.
+            origin = self._primary_buf().head_pts() or 0.0
             t0 = loop.time()
-            origin = self._oldest_pts() or 0.0   # media time of the first item
+            await self._mark_playing(ws, origin, t0)
+
+            gap_since: Optional[float] = None      # live: source dry since
+            gap_reported = False
 
             while True:
                 media_now = (loop.time() - t0) + origin
@@ -532,8 +557,15 @@ class StreamSession:
                 if self.is_live:
                     head = self._oldest_pts()
                     if head is None:
+                        if gap_since is None:
+                            gap_since = loop.time()
+                        elif (not gap_reported
+                              and loop.time() - gap_since > LIVE_GAP_STATUS):
+                            await self._send_buffering(ws)
+                            gap_reported = True
                         await asyncio.sleep(0.02)          # gap: wait for data
-                    elif head - media_now > self.prebuffer + GOP_SECONDS:
+                        continue
+                    if head - media_now > self.prebuffer + GOP_SECONDS:
                         # Behind the live edge -> skip to head.  The GOP_SECONDS
                         # margin matters: a video chunk's PTS runs up to one GOP
                         # ahead of the moment it is produced (it flushes when
@@ -543,14 +575,21 @@ class StreamSession:
                         # the constant origin jumps made release timing (and
                         # the client's pacing) erratic.
                         origin, t0 = head, loop.time()
-                    elif not sent:
+                        await self._mark_playing(ws, origin, t0)
+                    elif gap_reported:
+                        # Source recovered without a skip: re-announce the
+                        # clock so the client leaves "Buffering" cleanly.
+                        origin, t0 = media_now, loop.time()
+                        await self._mark_playing(ws, origin, t0)
+                    gap_since, gap_reported = None, False
+                    if not sent:
                         await asyncio.sleep(0.005)
                 else:  # VOD
                     if self._primary_buf().empty() and self._primary_producing():
-                        await self._send_status(ws, ccmf.STATUS_BUFFERING)
+                        await self._send_buffering(ws)
                         await self._prebuffer()             # underrun -> pause
-                        await self._send_status(ws, ccmf.STATUS_PLAYING)
                         origin, t0 = media_now, loop.time()
+                        await self._mark_playing(ws, origin, t0)
                     elif not sent:
                         await asyncio.sleep(0.005)
 
@@ -571,12 +610,13 @@ class StreamSession:
             except Exception:
                 pass   # socket may already be gone; don't mask the original error
         finally:
+            self._playing = False
             self._ready.set()   # safety net: unblock a racing caller even on an
                                 # unexpected exception before the normal set() above
-            audio_tasks = [t for t in (self._mono_task, self._positional_task)
-                          if t is not None]
-            for t in tasks + audio_tasks:
+            if self._audio_task is not None:
+                tasks.append(self._audio_task)
+            for t in tasks:
                 t.cancel()
-            await asyncio.gather(*tasks, *audio_tasks, return_exceptions=True)
+            await asyncio.gather(*tasks, return_exceptions=True)
             if self._tmpdir:
                 shutil.rmtree(self._tmpdir, ignore_errors=True)

@@ -92,6 +92,16 @@ class _SyncGroup:
             self._subs.add(ws)
             self._sub_channels[ws] = caps_channels
         self._reconcile_channels()
+        # A mid-stream joiner has missed the room's STATUS playing, so it has
+        # no clock to present against — anchor it to the running clock now
+        # (spec §5.6).  Unicast: everyone else's anchor is already correct.
+        origin = self.session.playback_origin()
+        if origin is not None:
+            try:
+                await ws.send_bytes(ccmf.control(
+                    ccmf.OP_STATUS, ccmf.status_body(ccmf.STATUS_PLAYING, origin)))
+            except Exception:
+                pass   # joiner already gone; unsubscribe will clean up
 
     async def unsubscribe(self, ws: WebSocket) -> bool:
         async with self._subs_lock:
