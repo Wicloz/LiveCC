@@ -16,7 +16,7 @@ message is binary.  The client opens with a lock-step handshake —
 
 — after which it is a passive subscriber to the media hose: CCMF container
 chunks (video GOPs / audio) pass through verbatim as marker-led MEDIA messages,
-interleaved with STATUS (buffering/playing), ERROR and END control frames.
+interleaved with STATUS (buffering/playing/ended) and ERROR control frames.
 A client may send QUIT to leave cleanly.
 
 Rooms (spec §5.5): sync=0 gives the client a private production; sync=1 joins

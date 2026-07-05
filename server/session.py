@@ -12,7 +12,8 @@ due, SEND_LEAD early, to one sink (the WebSocket, or a sync-group fanout):
 
     video chunk  -> binary message  CCMF chunk type 0 (one self-contained GOP)
     audio chunk  -> binary message  CCMF chunk type 1 (PCM or DFPWM samples)
-    status       -> binary message  CCMF control frame STATUS / ERROR / END
+    status       -> binary message  CCMF control frame STATUS (buffering/
+                                     playing/ended) / ERROR
 
 The lead is DELIVERY slack only (network/scheduler jitter): the client
 presents every chunk by PTS against the clock this server announces.  A
@@ -597,7 +598,8 @@ class StreamSession:
                 what = "video" if self.want_video else "audio"
                 await self._send_error(ws, f"Failed to load {what}. Check the server logs.")
             else:
-                await ws.send_bytes(ccmf.control(ccmf.OP_END))
+                await ws.send_bytes(ccmf.control(
+                    ccmf.OP_STATUS, ccmf.status_body(ccmf.STATUS_ENDED)))
         except Exception:
             # Catch-all for anything not handled deeper (producers self-contain
             # their errors): log the traceback and tell the client something broke

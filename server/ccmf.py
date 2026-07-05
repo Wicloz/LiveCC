@@ -340,11 +340,12 @@ OP_QUIT = 4
 OP_ACK = 5
 OP_ERROR = 6
 OP_STATUS = 7
-OP_END = 8
 # MEDIA has no distinct opcode: its value IS the container marker (67).
+# (opcode 8 is free — the former OP_END is now the STATUS_ENDED state.)
 
 STATUS_BUFFERING = 0
 STATUS_PLAYING = 1
+STATUS_ENDED = 2                 # terminal: stream complete (former OP_END)
 
 
 def status_body(state: int, origin: Optional[int] = None) -> bytes:

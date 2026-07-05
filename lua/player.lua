@@ -8,7 +8,7 @@
 -- Format, docs/cc-media-format.md).  Every message is binary: a message whose
 -- first byte is the container marker (67, "C") is a media chunk — a video GOP
 -- (palette + raw/delta/repeat frame units) or ~0.1 s of audio — and anything
--- else is a control frame [opcode][len u16][body]: STATUS, ERROR, END.
+-- else is a control frame [opcode][len u16][body]: STATUS, ERROR.
 -- The client opens with ROOM -> ACK, CAPS -> ACK, START, then just consumes.
 --
 -- Synchronization (spec §5.6): ONE media clock, anchored by the server's
@@ -331,7 +331,7 @@ end
 local MARKER = 67                        -- "C": leads every media chunk
 local TYPE_VIDEO, TYPE_AUDIO = 0, 1
 local OP_ROOM, OP_CAPS, OP_START, OP_QUIT = 1, 2, 3, 4
-local OP_ACK, OP_ERROR, OP_STATUS, OP_END = 5, 6, 7, 8
+local OP_ACK, OP_ERROR, OP_STATUS = 5, 6, 7
 
 local function control_frame(opcode, body)
     body = body or ""
@@ -793,6 +793,8 @@ local function handle_control(opcode, body)
         local state = body:byte(1)
         if state == 0 then
             mon_print("Buffering...")
+        elseif state == 2 then
+            ended = true                         -- terminal: stream complete (spec §5.6)
         else
             -- playing: anchor to the origin PTS when present (spec §5.6); a
             -- draft-00 server sends none — first-chunk fallback covers that.
@@ -808,8 +810,6 @@ local function handle_control(opcode, body)
         errored = true
         console("LiveCC error: " .. body)
         mon_print("Error: " .. body)
-    elseif opcode == OP_END then
-        ended = true
     end
 end
 

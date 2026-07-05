@@ -204,6 +204,13 @@ def test_status_body_buffering_is_bare():
     assert ccmf.parse_status(body) == (ccmf.STATUS_BUFFERING, None)
 
 
+def test_status_body_ended_is_bare():
+    # END was merged into STATUS: ended is the bare state byte, no origin.
+    body = ccmf.status_body(ccmf.STATUS_ENDED)
+    assert body == b"\x02"
+    assert ccmf.parse_status(body) == (ccmf.STATUS_ENDED, None)
+
+
 def test_status_playing_requires_origin():
     with pytest.raises(ValueError):
         ccmf.status_body(ccmf.STATUS_PLAYING)

@@ -97,7 +97,8 @@ def _errors(bins):
 
 
 def _ended(bins):
-    return any(op == ccmf.OP_END for op, _ in _controls(bins))
+    return any(op == ccmf.OP_STATUS and body and body[0] == ccmf.STATUS_ENDED
+               for op, body in _controls(bins))
 
 
 def _patch(monkeypatch, n_video, n_audio, is_live, ext="webm", moov_at_end=True):
@@ -157,7 +158,7 @@ def test_vod_delivers_every_chunk_in_order(monkeypatch):
     assert len(auds) == 4
     assert _statuses(ws.bins)[0] == ccmf.STATUS_BUFFERING   # opens buffering
     assert ccmf.STATUS_PLAYING in _statuses(ws.bins)
-    assert _ended(ws.bins)                                   # END closes the stream
+    assert _ended(ws.bins)                                   # STATUS ended closes the stream
 
 
 def test_audio_chunks_carry_sample_pts_and_codec(monkeypatch):
@@ -357,7 +358,7 @@ def test_session_reports_error_when_no_video(monkeypatch):
     s = StreamSession("u", w=4, h=2, fps=50, want_audio=False)
     run(s.run(ws))
     assert _errors(ws.bins)
-    assert not _ended(ws.bins)          # a failed stream is not a clean END
+    assert not _ended(ws.bins)          # a failed stream is not a clean ended
 
 
 def test_failing_video_producer_reports_error_without_hanging(monkeypatch):

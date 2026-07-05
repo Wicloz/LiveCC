@@ -285,7 +285,6 @@ Control opcode values **MUST** differ from `marker`.
 | 5   | ACK    | S→C  | unicast  | empty                             |
 | 6   | ERROR  | S→C  | unicast  | UTF-8 message (sanitized)         |
 | 7   | STATUS | S→C  | multicast| Section 5.6                       |
-| 8   | END    | S→C  | multicast| empty                             |
 | 67  | MEDIA  | S→C  | multicast| = a container chunk (marker-led)  |
 
 `MEDIA` has no distinct opcode: its value **is** the container `marker` (67),
@@ -300,7 +299,7 @@ S→C  ACK  |  ERROR
 C→S  CAPS   (capabilities + preferences)
 S→C  ACK  |  ERROR          <- accept-or-drop decision
 C→S  START
-S→C  STATUS / MEDIA / ... / END
+S→C  STATUS / MEDIA / ...   (until STATUS state = ended)
 ```
 
 **Step 1 (ROOM)** determines routing. **Step 2 (CAPS)** is the first point the
@@ -351,7 +350,7 @@ the container `channel` field (Section 4.6). The other bitmasks advertise
 - `sync = 0`: the client always gets a **private** room (its own production,
   independently seekable). `sync = 1`: create or join the **shared** room keyed
   by `(url, start, end, loop)`.
-- Handshake and per-client `ERROR` are **unicast**; `MEDIA`, `STATUS`, `END` are
+- Handshake and per-client `ERROR` are **unicast**; `MEDIA` and `STATUS` are
   **multicast** — a streamer serializes each chunk once and writes identical
   bytes to every subscriber.
 - A server **MAY** drop a client with `ERROR` at CAPS or later. This is
@@ -371,9 +370,12 @@ the container `channel` field (Section 4.6). The other bitmasks advertise
 +-------+============================+
 ```
 
-`state`: `0` buffering · `1` playing.  A `playing` STATUS carries **origin**,
-the PTS (Section 4.2) that is *due for presentation now* — it maps the shared
-PTS timeline onto the receiver's local clock.
+`state`: `0` buffering · `1` playing · `2` ended.  Only `playing` carries a body
+(**origin**); `buffering` and `ended` are the `state` byte alone.  `ended` is
+terminal — the stream is complete; a receiver finishes any buffered media, then
+stops.  A `playing` STATUS carries **origin**, the PTS (Section 4.2) that is
+*due for presentation now* — it maps the shared PTS timeline onto the receiver's
+local clock.
 
 A streamer **MUST** send `playing` + origin:
 
