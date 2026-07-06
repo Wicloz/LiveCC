@@ -33,8 +33,9 @@ _HAVE_TOOLS = shutil.which("ffmpeg") is not None and shutil.which("yt-dlp") is n
 # helpers
 # --------------------------------------------------------------------------- #
 
-def _handshake(ws, url, channels=ccmf.CAP_CHANNEL_MONO, w=8, h=4, fps=5):
-    ws.send_bytes(ccmf.control(ccmf.OP_ROOM, ccmf.build_room(url)))
+def _handshake(ws, url, channels=ccmf.CAP_CHANNEL_MONO, w=8, h=4, fps=5,
+               start_ms=None):
+    ws.send_bytes(ccmf.control(ccmf.OP_ROOM, ccmf.build_room(url, start_ms=start_ms)))
     op, _ = ccmf.parse_message(ws.receive_bytes())
     assert op == ccmf.OP_ACK
     ws.send_bytes(ccmf.control(ccmf.OP_CAPS, ccmf.build_caps(
@@ -150,6 +151,62 @@ def test_vod_stereo_survives_unknown_channel_probe(tmp_path, media_server):
     assert statuses[0][0] == ccmf.STATUS_BUFFERING
     assert any(st == ccmf.STATUS_PLAYING and origin is not None
                for st, origin in statuses)
+
+
+@pytest.mark.skipif(not _HAVE_TOOLS, reason="needs ffmpeg and yt-dlp on PATH")
+def test_vod_start_flag_keeps_audio_and_alignment(tmp_path, media_server):
+    # The "--start VOD has no audio" regression, end to end.  Sections are
+    # cut by yt-dlp's ffmpeg downloader whose defaults vary per source
+    # (container, timestamp rebasing, keyframe quantisation); the fetch is
+    # now pinned to matroska + copyts (transcoder._sections_arg) so both
+    # pipelines see source-absolute timestamps and align exactly, and
+    # playback opens at the newest head instead of silent video pre-roll.
+    # The left channel's level RAMPS with source time, so it proves where
+    # the audio came from: a silent stream, an uncut (t=0) section, or a
+    # mis-anchored timeline all fail differently and visibly here.
+    clip = tmp_path / "ramp.mp4"
+    res = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", "testsrc=size=64x48:rate=10:duration=16",
+         "-f", "lavfi", "-i", "aevalsrc=0.0125*t|0.75:c=stereo:s=48000:d=16",
+         "-c:v", "libx264", "-pix_fmt", "yuv420p",
+         "-g", "10", "-keyint_min", "10",     # 1 s GOPs: the cut can land close
+         "-c:a", "aac", "-movflags", "+faststart", "-shortest", str(clip)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if res.returncode != 0:
+        pytest.skip("ffmpeg can't build the ramp clip (libx264 missing?)")
+    url = f"{media_server}/ramp.mp4"
+
+    client = TestClient(main.app)
+    stereo_caps = (ccmf.CAP_CHANNEL_MONO | ccmf.CAP_CHANNEL_FRONT_LEFT
+                   | ccmf.CAP_CHANNEL_FRONT_RIGHT)
+    with client.websocket_connect("/ws/play") as ws:
+        _handshake(ws, url, channels=stereo_caps, start_ms=10_000)
+        roles, statuses, n_video, errors = _collect_stream(ws)
+
+    assert not errors
+    assert n_video > 0
+    assert set(roles) == {ccmf.CHANNEL_MONO, ccmf.CHANNEL_FRONT_LEFT,
+                          ccmf.CHANNEL_FRONT_RIGHT}
+    # The first left-channel chunk's level identifies its source time:
+    # ramp(t) = 128 + 1.6*t, so 10 s in reads ~144; the keyframe cut may pull
+    # back ~1 s (~142), while an uncut section would read ~128.
+    first_pts, first_data = roles[ccmf.CHANNEL_FRONT_LEFT][0]
+    first_mean = np.frombuffer(first_data, np.uint8).mean()
+    assert first_mean > 139, f"audio did not start near --start (level {first_mean:.1f})"
+    # Stereo stayed distinct through the section path.
+    right = np.frombuffer(b"".join(d for _p, d in roles[ccmf.CHANNEL_FRONT_RIGHT]),
+                          np.uint8)
+    assert right.mean() > 215
+    # Alignment survived the section remux: SourceTimeline normalises session
+    # zero to the earliest cut, so the wire pts start near 0 — what matters is
+    # the RELATIONSHIP.  The first audio leaves the gate with the announced
+    # origin (an asymmetric-rebase poison would put them ~start apart, and
+    # its mirror image would stale-drop all video, failing n_video above).
+    playing = [o for st, o in statuses
+               if st == ccmf.STATUS_PLAYING and o is not None]
+    assert playing and playing[0] < 5 * ccmf.SAMPLE_RATE
+    assert abs(first_pts - playing[0]) < 3 * ccmf.SAMPLE_RATE
 
 
 @pytest.mark.skipif(not _HAVE_TOOLS, reason="needs ffmpeg and yt-dlp on PATH")

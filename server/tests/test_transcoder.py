@@ -110,6 +110,18 @@ def test_ytdlp_cmd_section_subsecond():
     assert cmd[cmd.index("--download-sections") + 1] == "*90.5-120.25"
 
 
+def test_ytdlp_cmd_sections_pin_the_remux():
+    # Sections are cut by yt-dlp's ffmpeg downloader; its DEFAULT remux is
+    # poison (container varies per source and can't hold every codec;
+    # timestamps are rebased per pipe, hiding the video-vs-audio cut skew
+    # from SourceTimeline).  The command must pin matroska + copyts — this
+    # is what keeps --start VODs audible AND lip-synced.
+    cmd = _ytdlp_cmd("https://x", transcoder._VIDEO_FMT, start=20)
+    assert cmd[cmd.index("--downloader-args") + 1] == "ffmpeg_o:-copyts -f matroska"
+    # Without sections the ffmpeg downloader isn't in play: no stray args.
+    assert "--downloader-args" not in _ytdlp_cmd("https://x", transcoder._VIDEO_FMT)
+
+
 def test_audio_fmt_prefers_best_source():
     # We resample to 8-bit PCM; feeding it the *worst* YouTube stream stacks a
     # second lossy pass on an already-crushed one (audible artifacts).  Pin

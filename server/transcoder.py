@@ -183,12 +183,30 @@ def negotiate_channel_roles(requested_channels: int) -> list[int]:
 # --------------------------------------------------------------------------- #
 
 def _sections_arg(start: float, end: Optional[float]) -> list[str]:
-    """yt-dlp --download-sections for a [start, end] window (seconds)."""
+    """yt-dlp --download-sections for a [start, end] window (seconds).
+
+    The section is cut by yt-dlp's ffmpeg downloader, whose defaults are
+    poison for a two-pipeline consumer, so we pin them down:
+
+      * `-f matroska` — the default remux container depends on the format
+        (mpegts for mp4 sources, webm for DASH, ...), and some codecs simply
+        cannot live in some containers (opus/vorbis/vp9 in mpegts) — the cut
+        then silently drops or breaks a stream.  Matroska holds anything.
+      * `-copyts` — by default each pipe's section is rebased to start at 0,
+        but the video cut lands on a keyframe/fragment boundary BEFORE the
+        requested start while audio cuts near-exactly: rebasing hides that
+        skew, so the two pipelines' counters disagree about what "0" means
+        by up to a source GOP (audible as A/V offset, or with enough skew as
+        one stream never coming due at all).  With source timestamps intact,
+        showinfo/ashowinfo report each pipe's true position and
+        SourceTimeline aligns them exactly.
+    """
     if start <= 0 and end is None:
         return []
     s = max(0, start)
     e = "inf" if end is None else format(max(s, end), "g")
-    return ["--download-sections", f"*{s:g}-{e}"]
+    return ["--download-sections", f"*{s:g}-{e}",
+            "--downloader-args", "ffmpeg_o:-copyts -f matroska"]
 
 
 # --------------------------------------------------------------------------- #

@@ -206,6 +206,77 @@ def test_stereo_map_produces_both_channel_roles(monkeypatch):
     assert channels_seen == {ccmf.CHANNEL_FRONT_LEFT, ccmf.CHANNEL_FRONT_RIGHT}
 
 
+def _patch_offset_audio(monkeypatch, video_secs, audio_start_s, audio_secs):
+    # Video from pts 0 (a --start section's keyframe pre-roll); audio content
+    # beginning `audio_start_s` later, chunks of 0.1 s.
+    async def fake_video(url, w, h, fps, start=0, end=None, source_path=None,
+                         loop=False, timeline=None):
+        for i in range(video_secs):
+            pts = i * ccmf.SAMPLE_RATE
+            yield pts, ccmf.chunk(pts, ccmf.TYPE_VIDEO, b"\x00" * 16)
+
+    async def fake_audio_roles(url, rate, roles, decode_channels=1, start=0,
+                               end=None, source_path=None, loop=False,
+                               timeline=None):
+        samples = audio_start_s * ccmf.SAMPLE_RATE
+        for _ in range(audio_secs * 10):
+            yield samples, {role: b"\x80" * 4800 for role in roles}
+            samples += 4800
+
+    async def fake_probe(url):
+        return False, "webm"
+
+    monkeypatch.setattr(session, "iter_video", fake_video)
+    monkeypatch.setattr(session, "iter_audio_roles", fake_audio_roles)
+    monkeypatch.setattr(session, "probe_source_info", fake_probe)
+
+
+def _playing_origins(bins):
+    return [origin for op, body in _controls(bins) if op == ccmf.OP_STATUS
+            for state, origin in [ccmf.parse_status(body)]
+            if state == ccmf.STATUS_PLAYING]
+
+
+def test_vod_origin_skips_to_the_newest_stream_head(monkeypatch):
+    # A --start section's video legitimately reaches back to the keyframe
+    # before the requested start while audio cuts near-exactly: playback must
+    # open where EVERY stream has content — not spend the pre-roll seconds
+    # playing silent video.
+    _patch_offset_audio(monkeypatch, video_secs=6, audio_start_s=4, audio_secs=1)
+    ws = FakeWS()
+    s = StreamSession("u", w=4, h=2, fps=50, want_audio=True)
+    run(asyncio.wait_for(s.run(ws), 10))
+
+    assert _playing_origins(ws.bins)[0] == 4 * ccmf.SAMPLE_RATE
+    assert len(_auds(ws.bins)) > 0                  # the audio actually played
+    # Deep pre-roll video was dropped at the gate, not shipped.
+    vid_pts = [ccmf.parse_chunk(c)[0] for c in _vids(ws.bins)]
+    assert vid_pts and min(vid_pts) >= 2 * ccmf.SAMPLE_RATE
+
+
+def test_vod_origin_preroll_cap_ignores_broken_heads(monkeypatch):
+    # A stream whose first pts is implausibly far ahead (broken timestamps,
+    # not pre-roll) must not drag playback away from the primary content.
+    _patch_offset_audio(monkeypatch, video_secs=6, audio_start_s=60, audio_secs=1)
+
+    async def go():
+        ws = FakeWS()
+        s = StreamSession("u", w=4, h=2, fps=50, want_audio=True)
+        task = asyncio.create_task(s.run(ws))
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            if _playing_origins(ws.bins):
+                break
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert _playing_origins(ws.bins) == [0]     # anchored to the video
+
+    run(go())
+
+
 def test_mono_source_still_serves_positional_roles(monkeypatch):
     # Channel mismatch is resolved with fallback mixes, not by dropping roles:
     # a stereo-mapped client on an honestly-mono source must get role 1/2
@@ -376,17 +447,23 @@ def test_live_audio_flows_despite_unaligned_skewed_pipelines(monkeypatch):
     #     this half ever starts flowing, the simulation has gone dull and the
     #     fixed half proves nothing, so revisit it;
     #   * live wall-time fallback (the fix): audio must flow.
+    # The control run's steady-state audio-head gap works out to
+    #   gap ≈ video_delay + prebuffer_fill(≈0.4) − audio_window
+    # and it must sit BETWEEN the send lead (or audio just flows) and the
+    # live-skip margin, prebuffer + GOP_SECONDS (or _oldest_pts — the AUDIO
+    # head once the video buffer drains to due — trips the skip, which drags
+    # origin to the audio head and "rescues" the control).  Chosen numbers
+    # put gap ≈ 0.7 with ≥0.45 s of slack to each cliff, so a loaded CI
+    # machine can't tip either half:
+    #   lead 0.25  «  gap 0.7  «  skip margin 1.5
+    # The fixed half's gap is video_backlog(≤0.6) − window(0.8) < 0 — audio
+    # is due immediately once the wall-time offsets align the counters.
     monkeypatch.setattr(session, "LIVE_PREBUFFER", 0.3)
-    monkeypatch.setattr(session, "SEND_LEAD", 0.2)
-    monkeypatch.setattr(session, "GOP_SECONDS", 0.7)       # skip margin: 1.0 s
-    # One constant sizes both buffers, so pick the pieces apart: video gets
-    # room for 3 GOPs (prebuffer needs a multi-item span), while the audio
-    # buffer caps at 5 items = 0.25 s of the 0.05 s fake chunks — the tight
-    # drop-oldest eviction that drives the starvation (head gap ≈ 0.75 s:
-    # above SEND_LEAD, below the 1.0 s skip margin, wide CI margins to both).
-    monkeypatch.setattr(session, "LIVE_MAX_BUFFER", 2.0)
-    monkeypatch.setattr(session, "_AUDIO_CHUNK_SECONDS", 0.4)
-    video_delay = 0.5          # audio's head start, well inside the skip margin
+    monkeypatch.setattr(session, "SEND_LEAD", 0.25)
+    monkeypatch.setattr(session, "GOP_SECONDS", 1.2)
+    monkeypatch.setattr(session, "LIVE_MAX_BUFFER", 4.0)   # video: 4 GOPs buffered
+    monkeypatch.setattr(session, "_AUDIO_CHUNK_SECONDS", 0.25)  # audio: 16 items
+    video_delay = 1.1          # audio's head start
     chunk = 2400               # 0.05 s of samples per fake audio chunk
 
     async def fake_probe(url):

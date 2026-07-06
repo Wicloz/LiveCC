@@ -85,6 +85,11 @@ SEND_LEAD = 1.5
 # Live: report buffering to the client once the source has been dry this long.
 LIVE_GAP_STATUS = 1.0
 
+# VOD: how far past the primary stream's head the playback origin may be
+# pulled by a later-starting stream (--start section pre-roll skip).  A head
+# beyond this is broken timestamps, not pre-roll.
+_START_PREROLL_CAP = 10.0
+
 _AUDIO_CHUNK_SECONDS = AUDIO_CHUNK_SECONDS   # ~0.1 s, same for both codecs
 
 
@@ -559,9 +564,25 @@ class StreamSession:
 
             await self._prebuffer()
 
-            # Media time of the primary stream's first chunk is where playback
-            # begins; anything on other streams from before it is stale.
+            # Playback begins at the NEWEST stream head (VOD): a --start
+            # section's video legitimately reaches back to the keyframe before
+            # the requested start while audio cuts near-exactly, so starting
+            # at the primary (video) head would play seconds of silent
+            # pre-roll.  Starting at the newest head instead skips straight to
+            # where every stream has content; whatever sits before it is
+            # stale by definition.  Capped: a stream claiming to start
+            # implausibly far ahead (broken timestamps) must not drag the
+            # session past the primary content.  Live keeps the primary head
+            # — its streams are already wall-aligned and the skip logic owns
+            # any catch-up.
             origin = self._primary_buf().head_pts() or 0.0
+            if not self.is_live:
+                heads = [b.head_pts() for b in self.audio_bufs.values()]
+                if self.want_video:
+                    heads.append(self.video_buf.head_pts())
+                newest = max((h for h in heads if h is not None), default=origin)
+                if origin < newest <= origin + _START_PREROLL_CAP:
+                    origin = newest
             t0 = loop.time()
             await self._mark_playing(ws, origin, t0)
 

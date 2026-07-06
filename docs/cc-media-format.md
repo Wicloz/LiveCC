@@ -407,6 +407,18 @@ small fixed startup delay of their choosing) and present *both* video frames
 and audio samples against that clock.  On a new origin, queued media behind it
 is stale and SHOULD be dropped (whole GOPs for video — resume at a keyframe).
 
+> Why origin exists: it is a *per-receiver* necessity, not a room-sync
+> nicety.  Because delivery leads presentation (below), the first chunk a
+> receiver sees may sit anywhere within the sender's delivery lead — so a
+> clock anchored on arrival times is wrong by up to that lead, and every
+> stream mis-schedules together: audio ahead of its due time gets discarded
+> as stale, video burst-renders.  Recovering the mapping by *heuristics*
+> (draft-00 behaviour: re-anchor when chunks run early/late) conflates
+> network jitter, rebuffering, and live-edge skips — three things that need
+> three different reactions.  origin is the one number that ties the PTS
+> timeline to "now", cheap to send and exact.  That it also lets a
+> mid-stream room joiner adopt the running clock is a side benefit.
+
 **Delivery is not presentation.**  A streamer MAY deliver chunks ahead of
 their PTS (jitter slack); a receiver MUST buffer early chunks and schedule
 them by PTS, never play them on arrival.  In particular, audio for a role
