@@ -209,6 +209,35 @@ def test_no_map_plays_mono_on_every_speaker():
         assert (n, mean) == (CHUNK, 192 - 128)
 
 
+def test_full_surround_map_routes_every_role_to_its_speaker():
+    # A 7.1 + mono map (nine speakers): CAPS must advertise all nine role
+    # bits, and each wire role must land on exactly its own speaker — no
+    # bleed, no substitution.  The server may well send byte-identical
+    # content on some roles (fallback mixes for a narrow source); routing
+    # must still be strictly by role id.
+    roles = {b"s_mono": (b"mono", 0), b"s_fl": (b"front_left", 1),
+             b"s_fr": (b"front_right", 2), b"s_c": (b"center", 3),
+             b"s_lfe": (b"lfe", 4), b"s_sl": (b"surround_left", 5),
+             b"s_sr": (b"surround_right", 6), b"s_rl": (b"rear_left", 7),
+             b"s_rr": (b"rear_right", 8)}
+    map_src = b"{ " + b", ".join(
+        name + b' = "' + role + b'"' for name, (role, _) in roles.items()) + b" }"
+    p = load_player(speakers=tuple(roles), speaker_map=map_src)
+
+    caps = ccmf.parse_caps(ccmf.parse_message(p.sent()[1])[1])
+    assert caps.channels == 0b111111111          # mono + all eight positional
+
+    p.anchor(0)
+    for _name, (_role, rid) in roles.items():
+        p.handle_message(audio_chunk(0, rid, 130 + rid * 10))
+    p.at_clock(0)
+    p.feed_roles()
+    for name, (_role, rid) in roles.items():
+        assert p.play_count(name) == 1, name
+        n, mean = p.stats(name, 1)
+        assert (n, mean) == (CHUNK, 130 + rid * 10 - 128), name
+
+
 def test_dfpwm_chunks_are_decoded_per_chunk():
     # Codec nibble 1 must route through a fresh DFPWM decode (the stub
     # decoder yields the recognisable constant 17) and derive the sample

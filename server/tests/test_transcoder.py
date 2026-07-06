@@ -434,6 +434,13 @@ def test_ffprobe_channels_reads_direct_media(tmp_path):
                       stderr=subprocess.PIPE).returncode != 0:
         pytest.skip("ffmpeg can't build a stereo source")
     assert transcoder._ffprobe_channels(str(path)) == 2
+    # Wider layouts report their real width too (drives the 5.1 decode).
+    six = tmp_path / "surround.wav"
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "lavfi", "-i", "aevalsrc=0.1|0.2|0.3|0.4|0.5|0.6:c=5.1:s=48000:d=0.2",
+                    str(six)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if six.exists():
+        assert transcoder._ffprobe_channels(str(six)) == 6
     # Non-media (an extractor page, a dead link): unknown, not an exception.
     assert transcoder._ffprobe_channels(str(tmp_path / "missing.wav")) is None
 
@@ -793,6 +800,69 @@ def test_iter_audio_roles_deinterleaves_stereo_without_crosstalk(tmp_path):
     # PTS is contiguous: chunk N+1 starts exactly where chunk N ended.
     for (p1, n1), (p2, _n2) in zip(ptss, ptss[1:]):
         assert p2 == p1 + n1
+
+
+# The user-visible mismatch matrix: SOURCE layout (rows below) x a full 7.1
+# speaker layout requesting every role.  Levels are distinct per source
+# channel, so each role's mean identifies exactly which mix it carries; the
+# identity groups pin the aliasing (mirrored roles share the same bytes).
+# u8 level for amplitude a is 128 + a*128.
+_LAYOUT_MATRIX = [
+    # mono source: every role of every rig plays THE mono.
+    ("mono", "aevalsrc=0.5:c=mono:s=48000:d=0.4", 1,
+     {r: 192.0 for r in range(9)},
+     [set(range(9))]),
+    # stereo source: fronts discrete, surrounds/rears mirror them,
+    # center/LFE/mono are the downmix.
+    ("stereo", "aevalsrc=0.25|0.75:c=stereo:s=48000:d=0.4", 2,
+     {0: 192.0, 1: 160.0, 2: 224.0, 3: 192.0, 4: 192.0,
+      5: 160.0, 6: 224.0, 7: 160.0, 8: 224.0},
+     [{1, 5, 7}, {2, 6, 8}, {0, 3, 4}]),
+    # 5.1 source: everything discrete except the rears, which mirror the
+    # surrounds; mono excludes the (loud, 0.9) LFE — its level proves it.
+    ("5.1", "aevalsrc=0.1|0.2|0.3|0.9|0.5|0.6:c=5.1:s=48000:d=0.4", 6,
+     {0: 171.5, 1: 140.8, 2: 153.6, 3: 166.4, 4: 243.2,
+      5: 192.0, 6: 204.8, 7: 192.0, 8: 204.8},
+     [{5, 7}, {6, 8}]),
+]
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+@pytest.mark.parametrize("name,src,channels,levels,identical",
+                         _LAYOUT_MATRIX, ids=[m[0] for m in _LAYOUT_MATRIX])
+def test_layout_matrix_every_role_from_every_source(tmp_path, name, src,
+                                                    channels, levels, identical):
+    path = tmp_path / f"{name.replace('.', '_')}.wav"
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+           "-f", "lavfi", "-i", src, str(path)]
+    if subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                      stderr=subprocess.PIPE).returncode != 0:
+        pytest.skip(f"ffmpeg can't build the {name} source")
+
+    got = {r: [] for r in range(9)}
+
+    async def go():
+        agen = transcoder.iter_audio_roles(
+            "ignored", sample_rate=48000, roles=list(range(9)),
+            decode_channels=channels, source_path=str(path))
+        try:
+            async for _pts, chunks in agen:
+                for r in range(9):
+                    got[r].append(chunks[r])
+        finally:
+            await agen.aclose()
+
+    asyncio.run(go())
+    joined = {r: b"".join(c) for r, c in got.items()}
+    assert all(len(v) > 9600 for v in joined.values())   # every role has audio
+    for role, want in levels.items():
+        mean = sum(joined[role]) / len(joined[role])
+        assert mean == pytest.approx(want, abs=3), \
+            f"{name}: role {role} carries the wrong mix ({mean:.1f} != {want})"
+    for group in identical:
+        first = joined[min(group)]
+        assert all(joined[r] == first for r in group), \
+            f"{name}: roles {sorted(group)} should alias the same bytes"
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
