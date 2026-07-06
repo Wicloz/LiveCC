@@ -46,10 +46,10 @@ from typing import Optional
 import ccmf
 import dfpwm
 from transcoder import (
+    ALL_CHANNEL_ROLES,
     AUDIO_CHUNK_SECONDS,
     GOP_SECONDS,
     PCM,
-    ROLE_SOURCE_CHANNEL,
     SourceTimeline,
     download_source,
     iter_audio_roles,
@@ -149,9 +149,11 @@ class StreamSession:
     from the client's CAPS (PCM preferred, DFPWM fallback).
 
     Channel roles: ONE audio producer decodes the source once and cuts every
-    role the source could ever supply (self.producible_roles, incl. the mono
-    downmix) from that same pass — a role is "served" iff it has an open
-    buffer.  `caps_channels` seeds `self.requested_channels`: for a private
+    role this session may ever serve (self.producible_roles) from that same
+    pass — a role the source has no discrete channel for carries its fallback
+    mix (nearer channels, ultimately the mono downmix), so ANY speaker layout
+    plays ANY source layout.  A role is "served" iff it has an open buffer.
+    `caps_channels` seeds `self.requested_channels`: for a private
     session that's the one client's CAPS `channels` bitmask, fixed for life;
     for a sync room (`dynamic_channels=True`) it's the union of every current
     subscriber's request, which main._SyncGroup re-applies (via
@@ -233,14 +235,15 @@ class StreamSession:
         self.video_buf = TimedBuffer(int(self._buf_max_s / GOP_SECONDS) + 1, self._buf_drop)
 
     def _apply_channel_target(self) -> None:
-        """Diff self.channel_roles against what self.requested_channels +
-        self.source_channels now call for, and apply the delta: open a buffer
-        for each newly-wanted role, close the buffer for each role nobody
-        wants anymore.  Buffers are the ONLY thing that changes — the single
-        audio producer keeps decoding every producible role regardless, and
-        simply drops chunks for roles without a buffer.  Synchronous and
-        await-free by construction, so concurrent callers can't interleave
-        mid-update.
+        """Diff self.channel_roles against what self.requested_channels now
+        calls for, and apply the delta: open a buffer for each newly-wanted
+        role, close the buffer for each role nobody wants anymore.  Every
+        requested role is served unconditionally — a role the source lacks
+        carries its fallback mix (transcoder._ROLE_FALLBACKS), never silence.
+        Buffers are the ONLY thing that changes — the single audio producer
+        keeps cutting every producible role regardless, and simply drops
+        chunks for roles without a buffer.  Synchronous and await-free by
+        construction, so concurrent callers can't interleave mid-update.
 
         A no-op when audio is off for this session: a sync room's subscriber
         churn (main._SyncGroup) calls reconfigure_channels() unconditionally,
@@ -248,7 +251,7 @@ class StreamSession:
         """
         if not self.want_audio:
             return
-        target = set(negotiate_channel_roles(self.requested_channels, self.source_channels))
+        target = set(negotiate_channel_roles(self.requested_channels))
         current = set(self.channel_roles)
         added, removed = target - current, current - target
         if self._audio_dead:
@@ -329,14 +332,22 @@ class StreamSession:
                                     source_path=self._source_path, loop=self.loop,
                                     timeline=self._timeline)
             async for pts, chunks in agen:
+                encoded: dict[bytes, bytes] = {}
                 for role, data in chunks.items():
                     buf = self.audio_bufs.get(role)
                     if buf is None:
                         continue
                     if self._codec_id == ccmf.CODEC_DFPWM:
                         # Per-chunk encode with fresh state (spec §4.6); the
-                        # sequential bit-loop runs off the event loop.
-                        data = await ev_loop.run_in_executor(None, dfpwm.encode, data)
+                        # sequential bit-loop runs off the event loop.  Roles
+                        # aliasing the same mix (fallback duplicates) encode
+                        # once per batch.
+                        wire = encoded.get(data)
+                        if wire is None:
+                            wire = await ev_loop.run_in_executor(
+                                None, dfpwm.encode, data)
+                            encoded[data] = wire
+                        data = wire
                     chunk = ccmf.chunk(pts, ccmf.TYPE_AUDIO,
                                        ccmf.audio_payload(self._codec_id, data,
                                                           channel=role))
@@ -476,12 +487,16 @@ class StreamSession:
                                 or self.requested_channels != ccmf.CAP_CHANNEL_MONO):
             self.source_channels = await probe_audio_channels(self.url)
 
-        # Everything the source could ever supply; the single audio producer
-        # decodes all of it for the whole session so that serving a new role
-        # later is just opening a buffer, never a pipeline restart.
-        self.producible_roles = [0] + [
-            r for r, idx in sorted(ROLE_SOURCE_CHANNEL.items())
-            if idx < self.source_channels]
+        # Every role this session may ever have to serve — ANY role can be
+        # produced from ANY source (fallback mixes), so this is bounded by who
+        # might ask, not by the source: a sync room's future subscribers are
+        # unpredictable (cut everything), a private client's request is fixed
+        # for life.  The single producer cuts all of these for the whole
+        # session, so serving a new role later is just opening a buffer,
+        # never a pipeline restart.
+        self.producible_roles = (
+            list(ALL_CHANNEL_ROLES) if self.dynamic_channels
+            else negotiate_channel_roles(self.requested_channels))
 
         # One timeline for however many pipelines this session runs; each
         # producer reports its first source timestamp and gets the offset that

@@ -348,10 +348,11 @@ local function room_body()
 end
 
 -- channels: bit0 (mono) is always advertised — it's the mandatory fallback
--- (spec §5.4) — plus one bit per positional role a speaker map assigns.  The
--- server picks the best group it can actually produce from these bits (source
--- channel count permitting; docs/cc-media-format.md §4.6) and may end up
--- sending mono anyway if the source or a stereo/5.1/7.1 match isn't there.
+-- (spec §5.4) — plus one bit per positional role a speaker map assigns.  This
+-- mask declares the SPEAKER LAYOUT, not a wish list: the server serves every
+-- advertised role whatever the source's own layout is, deriving roles the
+-- source lacks from the nearest mix (ultimately mono, spec §5.4) — so a
+-- mapped speaker always plays, it just may carry a downmix/duplicate.
 local function channels_mask()
     local mask = 1
     for role in pairs(speakers_by_role) do

@@ -353,6 +353,14 @@ change the set mid-stream like the codec. `channels` shares its numbering with
 the container `channel` field (Section 4.6). The other bitmasks advertise
 *optional/future* features.
 
+A role's samples need not originate in a discrete source channel: `channels`
+declares the receiver's speaker layout, and the producer SHOULD resolve any
+mismatch with the source's layout by *deriving* the role — a nearby channel,
+a downmix, ultimately the mono mix — rather than omitting it.  Duplicated
+content across roles is the correct rendering of a mismatch (a mono source on
+a stereo layout plays the mono on both sides); a silent, never-delivered role
+is not.  How a producer mixes is implementation-defined.
+
 ### 5.5. Rooms, Cast, and Dropping
 
 - `sync = 0`: the client always gets a **private** room (its own production,
@@ -488,3 +496,8 @@ counts, and `start`/`length` against `W·H` before allocating or drawing.
 - Section 5.6 defines the delivery-vs-presentation contract: receivers
   schedule media by PTS against the STATUS-anchored clock; early delivery is
   buffered, stale media is dropped, and channel roles are aligned by PTS.
+- The former `END` opcode (8) is folded into STATUS as the terminal state
+  `2` (ended); opcode 8 is free again.
+- Section 5.4 now frames `channels` as the receiver's speaker layout and has
+  producers resolve source-layout mismatches by deriving roles (nearest mix,
+  ultimately mono) instead of omitting them — a mapped speaker always plays.

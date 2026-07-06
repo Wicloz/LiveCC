@@ -12,9 +12,11 @@
 --                   surround_left, surround_right, rear_left, rear_right
 -- (docs/cc-media-format.md section 4.6 has the full channel-role reference.)
 --
--- This example wires up a stereo pair. Positional roles only produce sound
--- once the source audio actually has that many channels and the server
--- negotiates them -- otherwise the server falls back to mono.
+-- This example wires up a stereo pair. Every mapped speaker always plays,
+-- whatever the source's channel layout: a role the source has no discrete
+-- channel for carries the nearest available mix instead (surrounds mirror
+-- the fronts, center/LFE get the mono downmix, a mono source plays
+-- everywhere) -- so a 7.1 map is fine for stereo sources and vice versa.
 
 {
     left = "front_left",

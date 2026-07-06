@@ -206,6 +206,30 @@ def test_stereo_map_produces_both_channel_roles(monkeypatch):
     assert channels_seen == {ccmf.CHANNEL_FRONT_LEFT, ccmf.CHANNEL_FRONT_RIGHT}
 
 
+def test_mono_source_still_serves_positional_roles(monkeypatch):
+    # Channel mismatch is resolved with fallback mixes, not by dropping roles:
+    # a stereo-mapped client on an honestly-mono source must get role 1/2
+    # chunks (carrying the mono content), not six... er, two dead speakers.
+    _patch(monkeypatch, n_video=0, n_audio=3, is_live=False)
+
+    async def fake_channels(url):
+        return 1                              # the source really is mono
+
+    monkeypatch.setattr(session, "probe_audio_channels", fake_channels)
+    caps = (ccmf.CAP_CHANNEL_MONO | ccmf.CAP_CHANNEL_FRONT_LEFT
+            | ccmf.CAP_CHANNEL_FRONT_RIGHT)
+    ws = FakeWS()
+    s = StreamSession("u", w=4, h=2, fps=50, want_audio=True, want_video=False,
+                      caps_channels=caps)
+    run(s.run(ws))
+    assert s.channel_roles == [0, 1, 2]
+    channels_seen = set()
+    for chunk in _auds(ws.bins):
+        _pts, _t, payload, _ = ccmf.parse_chunk(chunk)
+        channels_seen.add(ccmf.parse_audio_payload(payload)[1])
+    assert channels_seen == {0, 1, 2}
+
+
 def test_reconfigure_channels_adds_and_removes_roles_live(monkeypatch):
     # The sync-room scenario: a subscriber union that grows (another client
     # joins wanting front_left+front_right) and later shrinks (that client
@@ -245,7 +269,9 @@ def test_reconfigure_channels_adds_and_removes_roles_live(monkeypatch):
         task = asyncio.create_task(s.run(ws))
         await asyncio.sleep(0.05)
         assert s.channel_roles == [0]              # only mono served so far
-        assert s.producible_roles == [0, 1, 2]     # but everything is produced
+        # …but the producer cuts every role a future subscriber could ask
+        # for (any role is producible from any source via fallback mixes).
+        assert s.producible_roles == list(range(9))
         audio_task_before = s._audio_task
 
         # A second subscriber joins wanting front_left+front_right too.

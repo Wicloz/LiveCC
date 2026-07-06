@@ -114,10 +114,9 @@ def test_vod_stereo_survives_unknown_channel_probe(tmp_path, media_server):
         pytest.skip("ffmpeg can't build the stereo clip")
     url = f"{media_server}/stereo.mp4"
 
-    # Precondition for the regression: the probe really can't tell here.  If
-    # yt-dlp ever starts reporting a count for generic URLs, this test loses
-    # its point and should move to a source that still probes unknown.
-    assert transcoder._probe_audio_channels_blocking(url) == transcoder._ASSUMED_CHANNELS
+    # The yt-dlp metadata for a generic URL is "NA"; the layered probe must
+    # resolve the real count via ffprobe on the URL itself, not guess.
+    assert transcoder._probe_audio_channels_blocking(url) == 2
 
     client = TestClient(main.app)
     stereo_caps = (ccmf.CAP_CHANNEL_MONO | ccmf.CAP_CHANNEL_FRONT_LEFT
@@ -151,6 +150,43 @@ def test_vod_stereo_survives_unknown_channel_probe(tmp_path, media_server):
     assert statuses[0][0] == ccmf.STATUS_BUFFERING
     assert any(st == ccmf.STATUS_PLAYING and origin is not None
                for st, origin in statuses)
+
+
+@pytest.mark.skipif(not _HAVE_TOOLS, reason="needs ffmpeg and yt-dlp on PATH")
+def test_mono_source_fills_stereo_setup(tmp_path, media_server):
+    # The other direction of channel mismatch: a MONO source on a stereo rig
+    # must play the mono content on both mapped roles — before the fallback
+    # mixes, those speakers were simply silent.
+    clip = tmp_path / "mono.mp4"
+    res = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", "testsrc=size=64x48:rate=10:duration=2",
+         "-f", "lavfi", "-i", "aevalsrc=0.5:c=mono:s=48000:d=2",
+         "-c:v", "mpeg4", "-c:a", "aac", "-movflags", "+faststart",
+         "-shortest", str(clip)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    if res.returncode != 0:
+        pytest.skip("ffmpeg can't build the mono clip")
+    url = f"{media_server}/mono.mp4"
+
+    client = TestClient(main.app)
+    stereo_caps = (ccmf.CAP_CHANNEL_MONO | ccmf.CAP_CHANNEL_FRONT_LEFT
+                   | ccmf.CAP_CHANNEL_FRONT_RIGHT)
+    with client.websocket_connect("/ws/play") as ws:
+        _handshake(ws, url, channels=stereo_caps)
+        roles, _statuses, _n_video, errors = _collect_stream(ws)
+
+    assert not errors
+    assert set(roles) == {ccmf.CHANNEL_MONO, ccmf.CHANNEL_FRONT_LEFT,
+                          ccmf.CHANNEL_FRONT_RIGHT}
+    levels = {}
+    for role, chunks in roles.items():
+        data = b"".join(d for _p, d in chunks)
+        assert len(data) > 24000
+        levels[role] = np.frombuffer(data, np.uint8).mean()
+    # All three roles carry the same mono signal (0.5 -> ~192), aliased.
+    assert max(levels.values()) - min(levels.values()) < 2
+    assert 185 < levels[ccmf.CHANNEL_MONO] < 200
 
 
 # --------------------------------------------------------------------------- #

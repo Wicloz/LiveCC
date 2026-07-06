@@ -247,24 +247,34 @@ def test_audio_chunk_is_short_to_avoid_periodic_video_stall():
 def test_audio_ffmpeg_cmd_has_no_server_side_filtering():
     # Server-side audio *processing* was reported to make audio worse, so the
     # -af chain may only inspect (ashowinfo: first-frame source PTS for
-    # SourceTimeline) or pick channels (pan) — never touch the signal.
+    # SourceTimeline) — never touch the signal.  Channel work is -ac plus
+    # Python-side cutting (role_source_channel / mono_downmix), not filters.
     for cmd in (transcoder._audio_ffmpeg_cmd(48000),
                 transcoder._audio_ffmpeg_cmd(48000, source="/tmp/s.mkv"),
-                transcoder._audio_ffmpeg_cmd(48000, source_channel=1),
                 transcoder._multichannel_pcm_cmd(48000, 2)):
         assert "-filter:a" not in cmd
         af = cmd[cmd.index("-af") + 1] if "-af" in cmd else ""
         for part in filter(None, af.split(",")):
-            assert part == "ashowinfo" or part.startswith("pan="), part
+            assert part == "ashowinfo", part
 
 
-def test_audio_ffmpeg_cmd_source_channel_extracts_discrete_channel():
-    # A positional role (source_channel set) must pick exactly one discrete
-    # source channel via `pan`, not downmix -- so it doesn't bleed into its
-    # sibling channel (e.g. front_left picking up front_right's content).
-    cmd = transcoder._audio_ffmpeg_cmd(48000, source_channel=1)
-    assert cmd[cmd.index("-af") + 1] == "ashowinfo,pan=mono|c0=c1"
-    assert "-ac" not in cmd
+@pytest.mark.parametrize("role,source_channels,expected", [
+    (1, 2, 0), (2, 2, 1),           # fronts: discrete whenever there are two
+    (1, 6, 0), (2, 8, 1),
+    (3, 2, None), (3, 6, 2),        # center: phantom (mono) on stereo
+    (4, 2, None), (4, 6, 3),        # lfe: mono on sources without one
+    (5, 2, 0), (6, 2, 1),           # surrounds mirror the fronts on stereo
+    (5, 6, 4), (6, 6, 5),           # …and are discrete on 5.1
+    (7, 2, 0), (8, 2, 1),           # rears mirror the fronts on stereo
+    (7, 6, 4), (8, 6, 5),           # …the surrounds on 5.1
+    (7, 8, 6), (8, 8, 7),           # …and are discrete on 7.1
+    (1, 1, 0),                      # 1-channel decode: channel 0 IS the mono
+])
+def test_role_source_channel_fallback_chains(role, source_channels, expected):
+    # The channel-mismatch table: every role resolves to the best available
+    # source channel, or to the mono downmix (None) — never to nothing.  This
+    # is what lets any speaker layout play any source layout.
+    assert transcoder.role_source_channel(role, source_channels) == expected
 
 
 def test_video_ffmpeg_cmd_taps_first_frame_pts():
@@ -375,24 +385,57 @@ def test_mono_downmix_excludes_lfe():
 
 
 @pytest.mark.parametrize("stdout,expected", [
-    ("2\n", 2),          # normal YouTube VOD
-    ("6\n", 6),          # 5.1 source
-    ("1\n", 1),          # honestly mono: trusted
-    ("NA\n", 2),         # generic extractor (direct URL) / most live streams
-    ("", 2),             # no output at all (extraction failed)
-    ("none\n", 2),       # junk
-    ("0\n", 2),          # zero channels is not a real answer
-    ("-1\n", 2),
+    ("2\n", 2),           # normal YouTube VOD
+    ("6\n", 6),           # 5.1 source
+    ("1\n", 1),           # honestly mono: trusted
+    ("NA\n", None),       # generic extractor (direct URL) / most live streams
+    ("", None),           # no output at all (extraction failed)
+    ("none\n", None),     # junk
+    ("0\n", None),        # zero channels is not a real answer
+    ("-1\n", None),
 ])
-def test_parse_audio_channels_assumes_stereo_when_unsure(stdout, expected):
-    # THE regression that silenced stereo setups: yt-dlp reports audio_channels
-    # as "NA" for every direct-URL source and for most live streams, and the
-    # old code took that as mono — which produces ONLY role 0, so a
-    # speaker-mapped client (no speaker on mono) heard nothing and stereo
-    # sources got downmixed.  Unknown must assume stereo: a truly-mono source
-    # then decodes as dual-mono (audible, correct); the reverse silences
-    # every positional role.
+def test_parse_audio_channels_trusts_only_positive_integers(stdout, expected):
+    # yt-dlp reports audio_channels as "NA" for every direct-URL source and
+    # for most live streams.  The parser must say "unknown", not guess — the
+    # layered probe then asks ffprobe, and only assumes as a last resort.
     assert transcoder.parse_audio_channels(stdout) == expected
+
+
+def test_probe_layers_metadata_then_ffprobe_then_assumption(monkeypatch):
+    # The channel probe is layered: yt-dlp format metadata first, ffprobe on
+    # the URL itself second (exactly the direct-URL class whose metadata is
+    # "NA"), and only then the stereo assumption.  A wrong guess no longer
+    # silences roles (fallback mixes) — but the direction still matters:
+    # assuming stereo of a mono source is dual-mono; assuming mono of a
+    # stereo source throws real channels away.
+    class _NoMetadata:
+        stdout = "NA\n"
+        returncode = 0
+
+    monkeypatch.setattr(transcoder.subprocess, "run",
+                        lambda *a, **k: _NoMetadata())
+    monkeypatch.setattr(transcoder, "_ffprobe_channels", lambda url: 6)
+    assert transcoder._probe_audio_channels_blocking("u") == 6
+
+    monkeypatch.setattr(transcoder, "_ffprobe_channels", lambda url: None)
+    assert (transcoder._probe_audio_channels_blocking("u")
+            == transcoder._ASSUMED_CHANNELS)
+    assert transcoder._ASSUMED_CHANNELS == 2   # never mono; see the constant
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
+                    reason="ffmpeg/ffprobe not installed")
+def test_ffprobe_channels_reads_direct_media(tmp_path):
+    path = tmp_path / "stereo.wav"
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+           "-f", "lavfi", "-i", "aevalsrc=0.25|0.75:c=stereo:s=48000:d=0.2",
+           str(path)]
+    if subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                      stderr=subprocess.PIPE).returncode != 0:
+        pytest.skip("ffmpeg can't build a stereo source")
+    assert transcoder._ffprobe_channels(str(path)) == 2
+    # Non-media (an extractor page, a dead link): unknown, not an exception.
+    assert transcoder._ffprobe_channels(str(tmp_path / "missing.wav")) is None
 
 
 def test_source_timeline_live_falls_back_to_wall_alignment():
@@ -456,50 +499,34 @@ def test_source_timeline_vod_fallback_stays_raw_counters():
     asyncio.run(go())
 
 
-def test_negotiate_channel_roles_falls_back_to_mono():
-    # Mono-only request -> just mono, regardless of source width.
-    assert transcoder.negotiate_channel_roles(ccmf.CAP_CHANNEL_MONO, 2) == [0]
-    # No mono bit and a source too thin for front_right -> only front_left
-    # survives (dropped, not rounded down to mono -- there's no bundling or
-    # mono/positional exclusivity in this model, see the tests below).
-    assert transcoder.negotiate_channel_roles(
-        ccmf.CAP_CHANNEL_FRONT_LEFT | ccmf.CAP_CHANNEL_FRONT_RIGHT, 1) == [1]
-
-
-def test_negotiate_channel_roles_picks_stereo():
-    # mono and positional roles aren't mutually exclusive: a client asking for
-    # both gets both (mono downmix AND the discrete stereo pair), unlike the
-    # old canonical-group model which picked the larger tier over mono.
+def test_negotiate_channel_roles_serves_every_requested_role():
+    # Negotiation is purely "what did the client(s) ask for" — never "what
+    # does the source have".  Any role can be produced from any source via
+    # the fallback table, so filtering here could only silence a mapped
+    # speaker (the old behaviour: a stereo rig on a mono-probed source heard
+    # NOTHING; a 7.1 rig on a stereo source had six dead speakers).
     caps = ccmf.CAP_CHANNEL_MONO | ccmf.CAP_CHANNEL_FRONT_LEFT | ccmf.CAP_CHANNEL_FRONT_RIGHT
-    assert transcoder.negotiate_channel_roles(caps, source_channels=2) == [0, 1, 2]
+    assert transcoder.negotiate_channel_roles(caps) == [0, 1, 2]
+    everything = sum(1 << r for r in range(9))
+    assert transcoder.negotiate_channel_roles(everything) == list(range(9))
 
 
 def test_negotiate_channel_roles_has_no_bundling_requirement():
     # Only front_left requested (not front_right) -> that role alone is
-    # produced, not bundled up to a full stereo pair or dropped to mono. This
+    # served, not bundled up to a full stereo pair or dropped to mono. This
     # matters for a sync room's union: one client's mono+lfe combined with
     # another's front_left+front_right must yield exactly those four roles,
     # not get rounded up/down to a canonical stereo/5.1/7.1 group.
-    caps = ccmf.CAP_CHANNEL_FRONT_LEFT
-    assert transcoder.negotiate_channel_roles(caps, source_channels=2) == [1]
+    assert transcoder.negotiate_channel_roles(ccmf.CAP_CHANNEL_FRONT_LEFT) == [1]
+    union = (ccmf.CAP_CHANNEL_MONO | ccmf.CAP_CHANNEL_LFE
+             | ccmf.CAP_CHANNEL_FRONT_LEFT | ccmf.CAP_CHANNEL_FRONT_RIGHT)
+    assert transcoder.negotiate_channel_roles(union) == [0, 1, 2, 4]
 
 
-def test_negotiate_channel_roles_union_combines_unrelated_roles():
-    # e.g. one subscriber's mono+lfe OR'd with another's front_left+front_right.
-    caps = ccmf.CAP_CHANNEL_MONO | ccmf.CAP_CHANNEL_LFE \
-        | ccmf.CAP_CHANNEL_FRONT_LEFT | ccmf.CAP_CHANNEL_FRONT_RIGHT
-    assert transcoder.negotiate_channel_roles(caps, source_channels=6) == [0, 1, 2, 4]
-
-
-def test_negotiate_channel_roles_drops_roles_the_source_cant_supply():
-    roles = (1, 2, 3, 4, 5, 6)
-    caps = ccmf.CAP_CHANNEL_MONO
-    for r in roles:
-        caps |= 1 << r
-    assert transcoder.negotiate_channel_roles(caps, source_channels=6) == [0] + list(roles)
-    # A stereo source can only ever supply front_left/front_right -- the rest
-    # of the 5.1 request is simply dropped (not rounded down to plain mono).
-    assert transcoder.negotiate_channel_roles(caps, source_channels=2) == [0, 1, 2]
+def test_negotiate_channel_roles_empty_request_falls_back_to_mono():
+    assert transcoder.negotiate_channel_roles(0) == [0]
+    # reserved bits above the defined roles are ignored, not served
+    assert transcoder.negotiate_channel_roles(1 << 12) == [0]
 
 
 # --------------------------------------------------------------------------- #
@@ -732,52 +759,58 @@ def test_iter_audio_roles_deinterleaves_stereo_without_crosstalk(tmp_path):
     if subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE).returncode != 0:
         pytest.skip("ffmpeg can't build a synthetic stereo source")
 
-    ptss, left_chunks, right_chunks, mono_chunks = [], [], [], []
+    roles = [ccmf.CHANNEL_MONO, ccmf.CHANNEL_FRONT_LEFT, ccmf.CHANNEL_FRONT_RIGHT,
+             ccmf.CHANNEL_CENTER, ccmf.CHANNEL_SURROUND_LEFT,
+             ccmf.CHANNEL_REAR_RIGHT]
+    ptss = []
+    got = {r: [] for r in roles}
 
     async def go():
         agen = transcoder.iter_audio_roles(
-            "ignored", sample_rate=48000,
-            roles=[ccmf.CHANNEL_MONO, ccmf.CHANNEL_FRONT_LEFT,
-                   ccmf.CHANNEL_FRONT_RIGHT],
+            "ignored", sample_rate=48000, roles=roles,
             decode_channels=2, source_path=str(path))
         try:
             async for pts, chunks in agen:
                 ptss.append((pts, len(chunks[ccmf.CHANNEL_FRONT_LEFT])))
-                left_chunks.append(chunks[ccmf.CHANNEL_FRONT_LEFT])
-                right_chunks.append(chunks[ccmf.CHANNEL_FRONT_RIGHT])
-                mono_chunks.append(chunks[ccmf.CHANNEL_MONO])
+                for r in roles:
+                    got[r].append(chunks[r])
         finally:
             await agen.aclose()
 
     asyncio.run(go())
-    left, right = b"".join(left_chunks), b"".join(right_chunks)
-    mono = b"".join(mono_chunks)
-    assert left and right and mono
-    assert len(left) == len(right) == len(mono)   # sample-aligned per role
-    avg_left = sum(left) / len(left)
-    avg_right = sum(right) / len(right)
-    avg_mono = sum(mono) / len(mono)
-    assert avg_left < 180 < avg_right        # 0.25 -> ~160, 0.75 -> ~224: not swapped
-    assert avg_left < avg_mono < avg_right   # mono = downmix of the same frames
+    joined = {r: b"".join(c) for r, c in got.items()}
+    assert all(joined.values())
+    assert len({len(v) for v in joined.values()}) == 1   # sample-aligned per role
+    avg = {r: sum(v) / len(v) for r, v in joined.items()}
+    left, right = avg[ccmf.CHANNEL_FRONT_LEFT], avg[ccmf.CHANNEL_FRONT_RIGHT]
+    assert left < 180 < right                    # 0.25 -> ~160, 0.75 -> ~224: not swapped
+    assert left < avg[ccmf.CHANNEL_MONO] < right  # mono = downmix of the same frames
+    # Mismatch resolution on a stereo source: surrounds/rears mirror the
+    # fronts, center gets the (phantom) mono — byte-identical, not silent.
+    assert joined[ccmf.CHANNEL_SURROUND_LEFT] == joined[ccmf.CHANNEL_FRONT_LEFT]
+    assert joined[ccmf.CHANNEL_REAR_RIGHT] == joined[ccmf.CHANNEL_FRONT_RIGHT]
+    assert joined[ccmf.CHANNEL_CENTER] == joined[ccmf.CHANNEL_MONO]
     # PTS is contiguous: chunk N+1 starts exactly where chunk N ended.
     for (p1, n1), (p2, _n2) in zip(ptss, ptss[1:]):
         assert p2 == p1 + n1
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
-def test_iter_audio_roles_mono_uses_plain_downmix_pipeline(tmp_path):
-    # decode_channels == 1 (mono-only session) needs no de-interleave -- it's
-    # the plain single-pipeline downmix path, but with the same (pts, {role:
-    # chunk}) contract.
+def test_iter_audio_roles_mono_source_aliases_every_role(tmp_path):
+    # decode_channels == 1 (mono or mono-treated source) needs no
+    # de-interleave: the plain downmix pipeline feeds EVERY requested role the
+    # same samples — a stereo/7.1 rig on a mono source plays the mono
+    # everywhere instead of going silent.
     path = tmp_path / "with_audio.mp4"
     if _ffmpeg_make(path, "mpeg4", acodec="aac").returncode != 0:
         pytest.skip("ffmpeg can't build mp4+aac")
 
+    roles = [ccmf.CHANNEL_MONO, ccmf.CHANNEL_FRONT_LEFT, ccmf.CHANNEL_FRONT_RIGHT]
     got = []
 
     async def go():
         agen = transcoder.iter_audio_roles(
-            "ignored", sample_rate=48000, roles=[ccmf.CHANNEL_MONO],
+            "ignored", sample_rate=48000, roles=roles,
             decode_channels=1, source_path=str(path))
         try:
             async for pts, chunks in agen:
@@ -788,9 +821,12 @@ def test_iter_audio_roles_mono_uses_plain_downmix_pipeline(tmp_path):
             await agen.aclose()
 
     asyncio.run(go())
-    assert got and set(got[0][1]) == {ccmf.CHANNEL_MONO}
+    assert got and set(got[0][1]) == set(roles)
     assert got[0][0] == 0                                  # counts from zero
-    assert got[1][0] == len(got[0][1][ccmf.CHANNEL_MONO])  # contiguous PTS
+    first = got[0][1]
+    assert first[ccmf.CHANNEL_FRONT_LEFT] == first[ccmf.CHANNEL_MONO]
+    assert first[ccmf.CHANNEL_FRONT_RIGHT] == first[ccmf.CHANNEL_MONO]
+    assert got[1][0] == len(first[ccmf.CHANNEL_MONO])      # contiguous PTS
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
