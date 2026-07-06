@@ -237,23 +237,45 @@ class SourceTimeline:
     earliest reported base becomes the session's zero and each pipeline gets
     the sample offset that places its counter on the shared timeline.
 
-    Fallback is deliberate and total: if ANY pipeline couldn't read a source
-    timestamp, or the bases are implausibly far apart (different timestamp
-    epochs, e.g. an HLS/DASH mix), every offset is 0 — identical behaviour to
-    plain counting, which is already correct for whole-file VOD.  A partial
-    correction could be worse than none.
+    Fallback is deliberate and total — a partial correction could be worse
+    than none — but its SHAPE depends on the source, because the failure mode
+    differs:
+
+    * VOD: raw counters (all offsets 0).  Both pipelines decode the same file
+      from position zero, so counters are already aligned; wall times would
+      be wrong (decode runs faster than realtime).
+    * LIVE: first-output WALL-TIME alignment.  Raw counters would pin each
+      pipeline's zero to whenever its fetch+decode produced first output —
+      several seconds apart (video decode starts far slower than audio).
+      That skew is FATAL here, not cosmetic: live buffers evict oldest, so
+      the early stream's buffered head advances in lockstep with the clock
+      and stays permanently outside the release window — zero audio forever,
+      not just bad lipsync.  Wall-clock deltas between first outputs are an
+      approximation of the same skew, good enough to land every stream
+      inside the release window.
     """
 
     # A live fetch pair should land within a few segments of each other; bases
     # further apart than this are two different clocks, not a fetch skew.
     MAX_SKEW = 30.0
 
-    def __init__(self, expected: Iterable[str], timeout: float = 20.0) -> None:
+    def __init__(self, expected: Iterable[str], timeout: float = 20.0,
+                 live: bool = False) -> None:
         self._expected = set(expected)
         self._timeout = timeout
+        self._live = live
         self._bases: dict[str, Optional[float]] = {}
+        self._walls: dict[str, float] = {}      # first-report wall time (loop.time)
         self._decided = asyncio.Event()
-        self._zero: Optional[float] = None
+        self._zero: Optional[float] = None      # source-seconds zero (aligned mode)
+        self._wall_zero: Optional[float] = None  # wall-seconds zero (live fallback)
+
+    def _offset_for(self, name: str, base: Optional[float]) -> int:
+        if self._zero is not None and base is not None:
+            return max(0, round((base - self._zero) * SAMPLE_RATE))
+        if self._wall_zero is not None and name in self._walls:
+            return max(0, round((self._walls[name] - self._wall_zero) * SAMPLE_RATE))
+        return 0
 
     async def offset_samples(self, name: str, base: Optional[float]) -> int:
         """Report `base` (source seconds of this pipeline's output 0, or None
@@ -261,6 +283,7 @@ class SourceTimeline:
         pipeline's counted PTS."""
         if not self._decided.is_set():
             self._bases[name] = base
+            self._walls.setdefault(name, asyncio.get_running_loop().time())
             if set(self._bases) >= self._expected:
                 self._decide()
             else:
@@ -268,14 +291,16 @@ class SourceTimeline:
                     await asyncio.wait_for(self._decided.wait(), self._timeout)
                 except asyncio.TimeoutError:
                     log.warning("timeline: %s reported, still missing %s after "
-                                "%.0fs — falling back to raw counters",
+                                "%.0fs — falling back",
                                 sorted(self._bases),
                                 sorted(self._expected - set(self._bases)),
                                 self._timeout)
                     self._decide()
-        if self._zero is None or base is None:
-            return 0
-        return max(0, round((base - self._zero) * SAMPLE_RATE))
+        elif name not in self._walls:
+            # Late reporter (after a timeout decision): record its wall time
+            # now so the live fallback still places it sensibly.
+            self._walls[name] = asyncio.get_running_loop().time()
+        return self._offset_for(name, base)
 
     def report(self, name: str, base: Optional[float]) -> None:
         """Non-blocking offset_samples for a pipeline that is going away: it
@@ -284,6 +309,7 @@ class SourceTimeline:
         stall generator close until the timeout on a cancelled session."""
         if not self._decided.is_set():
             self._bases[name] = base
+            self._walls.setdefault(name, asyncio.get_event_loop().time())
             if set(self._bases) >= self._expected:
                 self._decide()
 
@@ -301,6 +327,13 @@ class SourceTimeline:
                 log.info("timeline: aligned %s (zero=%.3fs, spread=%.3fs)",
                          {k: round(v, 3) for k, v in self._bases.items()},
                          self._zero, max(vals) - min(vals))
+        elif self._live:
+            # Live fallback: align by first-output wall times (see class doc —
+            # raw counters would starve the earlier pipeline, not just skew it).
+            self._wall_zero = min(self._walls.values()) if self._walls else None
+            if len(self._expected) > 1:
+                log.warning("timeline: cannot align %s — live fallback to "
+                            "first-output wall times", self._bases)
         elif len(self._expected) > 1:
             log.warning("timeline: cannot align %s — falling back to raw "
                         "counters", self._bases)
@@ -574,23 +607,44 @@ async def probe_is_live(url: str) -> bool:
     return is_live
 
 
-def _probe_audio_channels_blocking(url: str) -> int:
-    """Discrete channel count of the selected audio format (best-effort).
+# Channel count assumed when the probe can't tell.  MUST err toward stereo,
+# never mono: yt-dlp reports audio_channels as "NA" for every generic-extractor
+# (direct-URL) source and for most live streams, and the probe subprocess can
+# fail outright on a flaky extraction — none of which says anything about the
+# actual audio.  Assuming mono silences every positional role (a speaker-mapped
+# stereo client hears NOTHING); assuming stereo merely decodes a truly-mono
+# source as dual-mono via `-ac 2` — audible and correct.  This asymmetry is the
+# root of a real regression ("stereo went mono / live went silent"): do not
+# "simplify" this back to 1.
+_ASSUMED_CHANNELS = 2
 
-    Defaults to 1 (mono) on any uncertainty -- the previously-only behaviour --
-    so a probe failure just means no positional audio, not a broken stream.
+
+def parse_audio_channels(stdout: str) -> int:
+    """yt-dlp `--print %(audio_channels)s` output -> channel count.
+
+    Only a positive integer is trusted; "NA" (generic extractor, most live
+    streams), empty output, junk, or zero all mean "unknown" -> assume stereo
+    (see _ASSUMED_CHANNELS for why the fallback direction matters).
     """
+    line = stdout.strip().splitlines()[0].strip() if stdout.strip() else ""
+    if line.isdigit() and int(line) >= 1:
+        return int(line)
+    return _ASSUMED_CHANNELS
+
+
+def _probe_audio_channels_blocking(url: str) -> int:
+    """Discrete channel count of the selected audio format (best-effort)."""
     try:
         out = subprocess.run(
             ["yt-dlp", "--no-warnings", "--quiet", "--no-playlist",
              "-f", _AUDIO_FMT, "--print", "%(audio_channels)s", url],
             capture_output=True, text=True, timeout=40,
         )
-        line = out.stdout.strip().splitlines()[0] if out.stdout.strip() else ""
-        return int(line) if line.isdigit() else 1
+        return parse_audio_channels(out.stdout)
     except Exception:
-        log.exception("audio channel probe failed; assuming mono")
-        return 1
+        log.exception("audio channel probe failed; assuming %d channels",
+                      _ASSUMED_CHANNELS)
+        return _ASSUMED_CHANNELS
 
 
 async def probe_audio_channels(url: str) -> int:

@@ -486,10 +486,13 @@ class StreamSession:
         # One timeline for however many pipelines this session runs; each
         # producer reports its first source timestamp and gets the offset that
         # places its counted PTS on the shared timeline (A/V alignment for
-        # separately-fetched live streams).
+        # separately-fetched live streams).  live matters: it selects the
+        # fallback shape when timestamps can't align (wall times for live —
+        # raw counters there would starve the earlier pipeline entirely).
         self._timeline = SourceTimeline(
             [n for n, wanted in (("video", self.want_video),
-                                 ("audio", self.want_audio)) if wanted])
+                                 ("audio", self.want_audio)) if wanted],
+            live=self.is_live)
 
         self._setup_buffers()
 

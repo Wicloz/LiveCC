@@ -336,6 +336,96 @@ def test_live_skip_reannounces_clock(monkeypatch):
     run(go())
 
 
+def test_live_audio_flows_despite_unaligned_skewed_pipelines(monkeypatch):
+    # THE live-silence regression, reproduced mechanically.  On a live source
+    # the audio pipeline produces output almost immediately while video's
+    # first frame lands seconds later (decode + encoder warm-up).  With raw
+    # 0-based counters the clock anchors to video's first chunk, and the
+    # audio buffer — drop-oldest, fed at realtime — keeps its head a CONSTANT
+    # distance beyond the release window: every chunk is evicted before it
+    # ever comes due.  Not bad lipsync; zero audio, forever.
+    #
+    # Both halves run REAL wall-clock pacing through the real scheduler:
+    #   * control (raw counters, the old fallback): audio must starve — if
+    #     this half ever starts flowing, the simulation has gone dull and the
+    #     fixed half proves nothing, so revisit it;
+    #   * live wall-time fallback (the fix): audio must flow.
+    monkeypatch.setattr(session, "LIVE_PREBUFFER", 0.3)
+    monkeypatch.setattr(session, "SEND_LEAD", 0.2)
+    monkeypatch.setattr(session, "GOP_SECONDS", 0.7)       # skip margin: 1.0 s
+    # One constant sizes both buffers, so pick the pieces apart: video gets
+    # room for 3 GOPs (prebuffer needs a multi-item span), while the audio
+    # buffer caps at 5 items = 0.25 s of the 0.05 s fake chunks — the tight
+    # drop-oldest eviction that drives the starvation (head gap ≈ 0.75 s:
+    # above SEND_LEAD, below the 1.0 s skip margin, wide CI margins to both).
+    monkeypatch.setattr(session, "LIVE_MAX_BUFFER", 2.0)
+    monkeypatch.setattr(session, "_AUDIO_CHUNK_SECONDS", 0.4)
+    video_delay = 0.5          # audio's head start, well inside the skip margin
+    chunk = 2400               # 0.05 s of samples per fake audio chunk
+
+    async def fake_probe(url):
+        return True, "webm"
+
+    def make_fakes(use_timeline):
+        async def fake_video(url, w, h, fps, start=0, end=None, source_path=None,
+                             loop=False, timeline=None):
+            ev = asyncio.get_running_loop()
+            await asyncio.sleep(video_delay)
+            off = (await timeline.offset_samples("video", None)) if use_timeline else 0
+            start_t, n = ev.time(), 0
+            while True:
+                pts = n * 9600 + off                       # 0.2 s per "GOP"
+                yield pts, ccmf.chunk(pts, ccmf.TYPE_VIDEO, b"\x00" * 16)
+                n += 1
+                delay = start_t + n * 0.2 - ev.time()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
+        async def fake_audio_roles(url, rate, roles, decode_channels=1, start=0,
+                                   end=None, source_path=None, loop=False,
+                                   timeline=None):
+            # Realtime pacing with catch-up, like a real pipe: while the
+            # rendezvous blocks, output backs up, then bursts through.
+            ev = asyncio.get_running_loop()
+            start_t = ev.time()
+            off = (await timeline.offset_samples("audio", None)) if use_timeline else 0
+            n = 0
+            while True:
+                yield n * chunk + off, {role: b"\x80" * chunk for role in roles}
+                n += 1
+                delay = start_t + n * 0.05 - ev.time()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
+        return fake_video, fake_audio_roles
+
+    async def run_once(use_timeline):
+        fake_video, fake_audio_roles = make_fakes(use_timeline)
+        monkeypatch.setattr(session, "iter_video", fake_video)
+        monkeypatch.setattr(session, "iter_audio_roles", fake_audio_roles)
+        monkeypatch.setattr(session, "probe_source_info", fake_probe)
+        ws = FakeWS()
+        s = StreamSession("u", w=2, h=2, fps=50, want_audio=True)
+        task = asyncio.create_task(s.run(ws))
+        await asyncio.sleep(video_delay + 1.6)     # prebuffer + a steady stretch
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return len(_vids(ws.bins)), len(_auds(ws.bins))
+
+    async def go():
+        vids, auds = await run_once(use_timeline=False)
+        assert vids > 0
+        assert auds == 0, "control run flowed — the starvation simulation went dull"
+        vids, auds = await run_once(use_timeline=True)
+        assert vids > 0
+        assert auds > 0, "live wall-time fallback failed to unstarve audio"
+
+    run(go())
+
+
 def test_mono_only_caps_never_probes_channel_count(monkeypatch):
     # The common case (no speaker map -> CAPS channels is just the mandatory
     # mono bit) must not pay for the extra channel-count probe at all.

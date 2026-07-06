@@ -980,4 +980,34 @@ tasks[#tasks + 1] = function()
     end
 end
 
+-- Test hook: the server repo's Lua suite (server/tests/test_player_lua.py +
+-- cc_stubs.lua) loads this script with _LIVECC_TEST set and every CC API
+-- stubbed, then drives these internals directly instead of entering the event
+-- loop.  Production CC never defines _LIVECC_TEST, so this block is inert
+-- there.  Keep additions here in sync with what the suite actually covers.
+if _LIVECC_TEST then
+    return {
+        -- media clock
+        clock_now = clock_now,
+        set_anchor = set_anchor,
+        get_anchor = function() return anchor_pts, anchor_ms end,
+        -- wire handling
+        handle_message = handle_message,
+        -- audio engine
+        feed_roles = feed_roles,
+        audio_pending = audio_pending,
+        flush_speakers = flush_speakers,
+        audio_queues = audio_queues,
+        role_state = role_state,
+        speakers_by_role = speakers_by_role,
+        -- video engine (vqueue is reassigned on prune, so expose a getter)
+        drain_due = drain_due,
+        get_vqueue = function() return vqueue end,
+        -- negotiated state
+        channels_mask = channels_mask,
+        is_ended = function() return ended end,
+        wants = function() return WANT_VIDEO, WANT_AUDIO end,
+    }
+end
+
 parallel.waitForAny(table.unpack(tasks))

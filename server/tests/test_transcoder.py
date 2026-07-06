@@ -374,6 +374,88 @@ def test_mono_downmix_excludes_lfe():
     assert list(transcoder.mono_downmix(six)) == [30, 30, 30]
 
 
+@pytest.mark.parametrize("stdout,expected", [
+    ("2\n", 2),          # normal YouTube VOD
+    ("6\n", 6),          # 5.1 source
+    ("1\n", 1),          # honestly mono: trusted
+    ("NA\n", 2),         # generic extractor (direct URL) / most live streams
+    ("", 2),             # no output at all (extraction failed)
+    ("none\n", 2),       # junk
+    ("0\n", 2),          # zero channels is not a real answer
+    ("-1\n", 2),
+])
+def test_parse_audio_channels_assumes_stereo_when_unsure(stdout, expected):
+    # THE regression that silenced stereo setups: yt-dlp reports audio_channels
+    # as "NA" for every direct-URL source and for most live streams, and the
+    # old code took that as mono — which produces ONLY role 0, so a
+    # speaker-mapped client (no speaker on mono) heard nothing and stereo
+    # sources got downmixed.  Unknown must assume stereo: a truly-mono source
+    # then decodes as dual-mono (audible, correct); the reverse silences
+    # every positional role.
+    assert transcoder.parse_audio_channels(stdout) == expected
+
+
+def test_source_timeline_live_falls_back_to_wall_alignment():
+    # LIVE + unalignable timestamps: raw counters would pin each pipeline's
+    # zero to its own first output — with drop-oldest buffers that STARVES the
+    # earlier stream (see test_session.test_live_audio_flows_despite_
+    # unaligned_skewed_pipelines for the end-to-end proof).  The fallback must
+    # instead approximate the skew with first-output wall times.
+    async def go():
+        tl = transcoder.SourceTimeline(["video", "audio"], timeout=5, live=True)
+
+        async def audio():
+            return await tl.offset_samples("audio", None)
+
+        async def video():
+            await asyncio.sleep(0.3)               # video decode starts later
+            return await tl.offset_samples("video", None)
+
+        audio_off, video_off = await asyncio.gather(audio(), video())
+        assert audio_off == 0                       # earliest output = zero
+        # video is placed ~0.3 s later on the timeline (generous CI margins)
+        assert 0.2 * transcoder.SAMPLE_RATE <= video_off <= 0.8 * transcoder.SAMPLE_RATE
+
+    asyncio.run(go())
+
+
+def test_source_timeline_live_prefers_real_timestamps_over_wall():
+    # The wall fallback must NOT kick in when source timestamps align fine.
+    async def go():
+        tl = transcoder.SourceTimeline(["video", "audio"], timeout=5, live=True)
+
+        async def audio():
+            return await tl.offset_samples("audio", 100.0)
+
+        async def video():
+            await asyncio.sleep(0.2)               # wall skew that must be ignored
+            return await tl.offset_samples("video", 102.5)
+
+        audio_off, video_off = await asyncio.gather(audio(), video())
+        assert audio_off == 0
+        assert video_off == round(2.5 * transcoder.SAMPLE_RATE)   # from bases
+
+    asyncio.run(go())
+
+
+def test_source_timeline_vod_fallback_stays_raw_counters():
+    # VOD pipelines decode the same file from zero, faster than realtime —
+    # wall times would be wrong there; unknown bases must mean offsets 0.
+    async def go():
+        tl = transcoder.SourceTimeline(["video", "audio"], timeout=5, live=False)
+
+        async def audio():
+            return await tl.offset_samples("audio", None)
+
+        async def video():
+            await asyncio.sleep(0.2)
+            return await tl.offset_samples("video", None)
+
+        assert await asyncio.gather(audio(), video()) == [0, 0]
+
+    asyncio.run(go())
+
+
 def test_negotiate_channel_roles_falls_back_to_mono():
     # Mono-only request -> just mono, regardless of source width.
     assert transcoder.negotiate_channel_roles(ccmf.CAP_CHANNEL_MONO, 2) == [0]
