@@ -59,6 +59,9 @@ class Player:
     def sent(self):
         return [v for v in self._stub[b"ws_sent"].values()]
 
+    def console_lines(self):
+        return [v.decode() for v in self._stub[b"console"].values()]
+
     def stats(self, speaker, i):
         """(sample count, mean) of `speaker`'s i-th played buffer."""
         return self._stub[b"stats"](speaker, i)
@@ -92,11 +95,12 @@ class Player:
 
 
 def load_player(speakers=(b"left", b"right"), speaker_map=_STEREO_MAP,
-                args=(b"http://media.test/v",)):
+                args=(b"http://media.test/v",), monitor_present=True):
     lua = lupa.LuaRuntime(encoding=None)
     lua.execute(_STUBS)
     g = lua.globals()
     stub = g[b"stub"]
+    stub[b"monitor"][b"present"] = monitor_present
     for name in speakers:
         stub[b"add_speaker"](name)
     if speaker_map is not None:
@@ -431,3 +435,59 @@ def test_video_units_render_only_when_due():
     p.drain_due()
     assert len(blits) == 2
     assert len(blits[2][b"text"]) == 1         # the single changed cell
+
+
+# --------------------------------------------------------------------------- #
+# --verbose: chunk header logging
+# --------------------------------------------------------------------------- #
+
+def test_verbose_prints_video_and_audio_chunk_headers():
+    p = load_player(args=(b"http://media.test/v", b"--verbose"))
+    p.handle_message(video_gop(1234))
+    p.handle_message(audio_chunk(1234, ccmf.CHANNEL_FRONT_LEFT, 160))
+    lines = p.console_lines()
+
+    video_lines = [l for l in lines if l.startswith("LiveCC: [video]")]
+    assert len(video_lines) == 1
+    assert "pts=1234" in video_lines[0]
+    assert "2x1" in video_lines[0]
+    assert "compression=none" in video_lines[0]
+
+    audio_lines = [l for l in lines if l.startswith("LiveCC: [audio]")]
+    assert len(audio_lines) == 1
+    assert "pts=1234" in audio_lines[0]
+    assert "codec=pcm8" in audio_lines[0]
+    assert "role=front_left" in audio_lines[0]
+    assert f"samples={CHUNK}" in audio_lines[0]
+
+
+def test_verbose_reports_dfpwm_codec_and_role_by_name():
+    p = load_player(args=(b"http://media.test/v", b"--verbose"))
+    p.handle_message(audio_chunk(0, ccmf.CHANNEL_SURROUND_LEFT, 0,
+                                 codec=ccmf.CODEC_DFPWM))
+    audio_lines = [l for l in p.console_lines() if l.startswith("LiveCC: [audio]")]
+    assert len(audio_lines) == 1
+    assert "codec=dfpwm" in audio_lines[0]
+    assert "role=surround_left" in audio_lines[0]
+    assert f"samples={CHUNK}" in audio_lines[0]     # 8 samples/byte, CHUNK//8 bytes
+
+
+def test_without_verbose_no_chunk_headers_are_logged():
+    p = load_player()                          # no --verbose
+    p.handle_message(video_gop(0))
+    p.handle_message(audio_chunk(0, ccmf.CHANNEL_FRONT_LEFT, 160))
+    lines = p.console_lines()
+    assert not any(l.startswith("LiveCC: [video]") or l.startswith("LiveCC: [audio]")
+                   for l in lines)
+
+
+def test_verbose_is_silenced_when_terminal_is_the_display():
+    # No monitor: the terminal itself is the video surface, so verbose (like
+    # every other status line) is routed through console() and silenced —
+    # printing there would just be overwritten by the next frame render.
+    p = load_player(monitor_present=False, args=(b"http://media.test/v", b"--verbose"))
+    p.handle_message(video_gop(0))
+    p.handle_message(audio_chunk(0, ccmf.CHANNEL_FRONT_LEFT, 160))
+    lines = p.console_lines()
+    assert not any(l.startswith("LiveCC: [video]") or l.startswith("LiveCC: [audio]")
+                   for l in lines)

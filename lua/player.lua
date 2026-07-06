@@ -50,6 +50,7 @@ local function print_usage()
     print("  --sync        Sync playback with other --sync clients on this URL")
     print("  --no-audio    Don't stream audio (also implied when no speakers)")
     print("  --no-video    Don't stream video (audio only)")
+    print("  --verbose     Print each chunk's header as it arrives")
     print("  -h, --help    Show this help and exit")
     print("")
     print("Timestamps (TS): 90, 90s, 1m30s, 3h2m  (default unit: seconds)")
@@ -71,7 +72,7 @@ end
 -- Parse: one positional (url) plus optional flags.
 local positional = {}
 local START_TS, END_TS, LOOP, HELP, SYNC = nil, nil, false, false, false
-local NO_AUDIO, NO_VIDEO = false, false
+local NO_AUDIO, NO_VIDEO, VERBOSE = false, false, false
 local WANTED_FPS = DEFAULT_FPS
 do
     local i = 1
@@ -93,6 +94,8 @@ do
             NO_AUDIO = true
         elseif a == "--no-video" then
             NO_VIDEO = true
+        elseif a == "--verbose" then
+            VERBOSE = true
         else
             positional[#positional + 1] = a
         end
@@ -178,6 +181,8 @@ local ROLE_IDS = {
     mono = 0, front_left = 1, front_right = 2, center = 3, lfe = 4,
     surround_left = 5, surround_right = 6, rear_left = 7, rear_right = 8,
 }
+local ROLE_NAMES = {}
+for name, id in pairs(ROLE_IDS) do ROLE_NAMES[id] = name end
 
 local function load_speaker_map()
     if not fs.exists(SPEAKER_MAP_FILE) then return nil end
@@ -799,6 +804,34 @@ local function printable(s)
     end))
 end
 
+-- --verbose: print every chunk's header (container header + payload header,
+-- spec §4.1/§4.4/§4.6) as it's received.  Routed through console() like every
+-- other status line, so it's silenced when the terminal itself is the display
+-- (it would otherwise scribble over the video, same reasoning as elsewhere).
+local COMPRESSION_NAMES = { [0] = "none", [1] = "deflate", [2] = "lz4", [3] = "zstd" }
+local CODEC_NAMES = { [0] = "pcm8", [1] = "dfpwm" }
+
+local function verbose_chunk(pts, length, ctype, payload)
+    local seconds = pts / 48000
+    if ctype == TYPE_VIDEO then
+        local w, h = u16(payload, 1), u16(payload, 3)
+        local compression = payload:byte(5)
+        console(string.format(
+            "LiveCC: [video] pts=%d (%.2fs) len=%d %dx%d compression=%s",
+            pts, seconds, length, w, h, COMPRESSION_NAMES[compression] or tostring(compression)))
+    elseif ctype == TYPE_AUDIO then
+        local hdr = payload:byte(1)
+        local codec, role = floor(hdr / 16), hdr % 16
+        local samples = codec == 1 and (#payload - 1) * 8 or (#payload - 1)
+        console(string.format(
+            "LiveCC: [audio] pts=%d (%.2fs) len=%d codec=%s role=%s samples=%d",
+            pts, seconds, length, CODEC_NAMES[codec] or tostring(codec),
+            ROLE_NAMES[role] or tostring(role), samples))
+    else
+        console(string.format("LiveCC: [type %d] pts=%d (%.2fs) len=%d", ctype, pts, seconds, length))
+    end
+end
+
 local errored = false   -- an ERROR was shown; don't overwrite it with "Stream ended"
 local ended = false
 
@@ -833,7 +866,9 @@ local function handle_message(msg)
     if msg:byte(1) == MARKER then
         -- chunk: [marker][pts u48][length u24][type u8][payload]
         local pts = u48(msg, 2)
+        local length = u24(msg, 8)
         local ctype = msg:byte(11)
+        if VERBOSE then verbose_chunk(pts, length, ctype, msg:sub(12)) end
         if ctype == TYPE_VIDEO and WANT_VIDEO then
             if not anchor_pts then set_anchor(pts) end   -- draft-00 fallback
             queue_video(pts, msg:sub(12))
