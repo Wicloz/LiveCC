@@ -90,13 +90,17 @@ _DOWNLOAD_TIMEOUT = 1800   # full section download for --loop
 # decodable — a continuous ffmpeg DFPWM stream sliced into chunks would leave
 # the client's per-chunk decoder resyncing at every boundary.
 #
-# Chunks stay short (~0.1 s): the client processes each chunk inline on the same
-# coroutine that renders video, so a large chunk would stall rendering for the
-# whole decode/unpack.  Sample count per chunk is the same for both codecs, so the
-# A/V buffering downstream is codec-independent.
+# Chunks match the video GOP (1.0 s): shorter chunks (previously 0.1 s, see
+# a5a67ef) avoided stalling the client's render coroutine during inline decode,
+# but a fresh DFPWM predictor per chunk (spec Sec4.6) is also an audible
+# discontinuity at every chunk boundary -- at 0.1 s that's 10/s.  1.0 s chunks
+# cut that 10x and match audio delivery to video's per-GOP cadence, at the cost
+# of re-risking the per-second decode stall the client was built to avoid;
+# verify on real hardware after changing this.  Sample count per chunk is the
+# same for both codecs, so the A/V buffering downstream is codec-independent.
 SAMPLE_RATE = 48000
-AUDIO_CHUNK_SECONDS = 0.1
-AUDIO_CHUNK_SAMPLES = int(SAMPLE_RATE * AUDIO_CHUNK_SECONDS)   # 4800
+AUDIO_CHUNK_SECONDS = 1.0
+AUDIO_CHUNK_SAMPLES = int(SAMPLE_RATE * AUDIO_CHUNK_SECONDS)   # 48000
 
 # Target span of one video GOP chunk (a palette + keyframe + delta/repeat units).
 # Longer GOPs amortise the keyframe better but add that much latency to a live
@@ -923,7 +927,7 @@ async def iter_audio(youtube_url: str, sample_rate: int = 48000,
                      loop: bool = False,
                      probe: Optional[_FirstPtsProbe] = None,
                      ) -> AsyncGenerator[bytes, None]:
-    """Yield ~0.1 s chunks of raw u8 PCM: the full mono downmix.  Codec
+    """Yield ~1.0 s chunks of raw u8 PCM: the full mono downmix.  Codec
     packing and PTS live in iter_audio_roles — this is just the decode tap
     for mono(-treated) sources.
 

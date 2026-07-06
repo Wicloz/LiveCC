@@ -332,6 +332,11 @@ def test_reconfigure_channels_adds_and_removes_roles_live(monkeypatch):
     monkeypatch.setattr(session, "iter_audio_roles", fake_audio_roles)
     monkeypatch.setattr(session, "probe_source_info", fake_probe)
     monkeypatch.setattr(session, "probe_audio_channels", fake_channels)
+    # Buffer depth (in items) scales with 1/_AUDIO_CHUNK_SECONDS; match it to
+    # this fake's actual per-chunk span (4096 samples) rather than the real
+    # producer's 1.0 s chunks, so the live buffer can still hold enough TIME
+    # to fill the prebuffer.
+    monkeypatch.setattr(session, "_AUDIO_CHUNK_SECONDS", 4096 / ccmf.SAMPLE_RATE)
 
     async def go():
         ws = FakeWS()
@@ -412,6 +417,9 @@ def test_live_skip_reannounces_clock(monkeypatch):
     monkeypatch.setattr(session, "iter_video", fake_video)
     monkeypatch.setattr(session, "iter_audio_roles", fake_audio_roles)
     monkeypatch.setattr(session, "probe_source_info", fake_probe)
+    # See test_reconfigure_channels_adds_and_removes_roles_live: match the
+    # live buffer's item depth to this fake's 4096-sample chunks.
+    monkeypatch.setattr(session, "_AUDIO_CHUNK_SECONDS", 4096 / ccmf.SAMPLE_RATE)
 
     async def go():
         ws = FakeWS()

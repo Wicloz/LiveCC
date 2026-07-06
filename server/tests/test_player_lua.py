@@ -452,6 +452,9 @@ def test_verbose_prints_video_and_audio_chunk_headers():
     assert "pts=1234" in video_lines[0]
     assert "2x1" in video_lines[0]
     assert "compression=none" in video_lines[0]
+    # video_gop() emits palette + raw(2000) + delta(2000, 1 changed cell)
+    assert "units=1(palette)+1(raw)+1(delta,1 spans)+0(repeat)" in video_lines[0]
+    assert "gop_dur=0.08s" in video_lines[0]        # 4000 samples / 48000
 
     audio_lines = [l for l in lines if l.startswith("LiveCC: [audio]")]
     assert len(audio_lines) == 1

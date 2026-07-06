@@ -90,7 +90,7 @@ LIVE_GAP_STATUS = 1.0
 # beyond this is broken timestamps, not pre-roll.
 _START_PREROLL_CAP = 10.0
 
-_AUDIO_CHUNK_SECONDS = AUDIO_CHUNK_SECONDS   # ~0.1 s, same for both codecs
+_AUDIO_CHUNK_SECONDS = AUDIO_CHUNK_SECONDS   # ~1.0 s, same for both codecs
 
 
 class TimedBuffer:
@@ -236,7 +236,7 @@ class StreamSession:
             self.prebuffer = VOD_PREBUFFER
             self._buf_max_s, self._buf_drop = VOD_MAX_BUFFER, False
         # Video items are whole GOPs (~GOP_SECONDS each); audio buffers are
-        # created on demand in _apply_channel_target (audio items ~0.1 s).
+        # created on demand in _apply_channel_target (audio items ~1.0 s).
         self.video_buf = TimedBuffer(int(self._buf_max_s / GOP_SECONDS) + 1, self._buf_drop)
 
     def _apply_channel_target(self) -> None:

@@ -7,7 +7,7 @@
 -- One WebSocket carries everything, speaking CCMF (the ComputerCraft Media
 -- Format, docs/cc-media-format.md).  Every message is binary: a message whose
 -- first byte is the container marker (67, "C") is a media chunk — a video GOP
--- (palette + raw/delta/repeat frame units) or ~0.1 s of audio — and anything
+-- (palette + raw/delta/repeat frame units) or ~1 s of audio — and anything
 -- else is a control frame [opcode][len u16][body]: STATUS, ERROR.
 -- The client opens with ROOM -> ACK, CAPS -> ACK, START, then just consumes.
 --
@@ -427,7 +427,7 @@ end
 -- chunk — its state MUST reset per chunk, spec §4.6): queued chunks stay as
 -- compact strings instead of huge Lua number tables.
 
-local MAX_AUDIO_CHUNKS = 60            -- ~6 s of raw strings per role (safety cap)
+local MAX_AUDIO_CHUNKS = 6              -- ~6 s of raw strings per role (safety cap)
 local SPK_AHEAD = 38400                -- feed ≤0.8 s ahead once a role is rolling
 local PTS_SLOP = 240                   -- 5 ms: chunks this close count as contiguous
 
@@ -572,7 +572,7 @@ local function flush_speakers()
 end
 
 -- ── Video: unit queue + PTS pacing ──────────────────────────────────────────────
--- A video chunk is a self-contained GOP: [w u16][h u16][compression u8] then a
+-- A video chunk is a self-contained GOP: [w u16][h u16] then a
 -- unit stream — a 48-byte palette unit, a raw keyframe, and delta/repeat units,
 -- each frame carrying its hold duration in 48 kHz samples.  Arriving units land
 -- in `vqueue` with an absolute PTS, and the player coroutine renders whatever
@@ -675,11 +675,9 @@ end
 -- pops palette + keyframe together and flushes them in one redraw.
 local function queue_video(chunk_pts, payload)
     local W, H = u16(payload, 1), u16(payload, 3)
-    local compression = payload:byte(5)
-    if compression ~= 0 then return end  -- only "none" is decodable (deferred)
     local n = W * H
     local raw_bytes = math.ceil(n / 8) * 5 + math.ceil(n / 2) * 2
-    local pos, cur = 6, chunk_pts
+    local pos, cur = 5, chunk_pts
     while pos <= #payload do
         local flags = payload:byte(pos)
         pos = pos + 1
@@ -811,14 +809,58 @@ end
 local COMPRESSION_NAMES = { [0] = "none", [1] = "deflate", [2] = "lz4", [3] = "zstd" }
 local CODEC_NAMES = { [0] = "pcm8", [1] = "dfpwm" }
 
-local function verbose_chunk(pts, length, ctype, payload)
+-- Walk a GOP's unit stream (spec §4.5) just to tally it for --verbose — same
+-- traversal as queue_video, but nothing is queued/rendered here.
+local function scan_video_units(payload, n)
+    local raw_bytes = math.ceil(n / 8) * 5 + math.ceil(n / 2) * 2
+    local pos = 5
+    local palettes, raws, deltas, repeats, spans, duration = 0, 0, 0, 0, 0, 0
+    while pos <= #payload do
+        local flags = payload:byte(pos)
+        pos = pos + 1
+        if flags < 128 then                  -- palette unit: fixed 48-byte body
+            palettes = palettes + 1
+            pos = pos + 48
+        else
+            local enc = floor(flags / 16) % 8
+            duration = duration + u16(payload, pos)
+            pos = pos + 2
+            if enc == 0 then                  -- raw keyframe
+                raws = raws + 1
+                pos = pos + raw_bytes
+            elseif enc == 1 then               -- delta: walk spans to find its end
+                deltas = deltas + 1
+                local count = u16(payload, pos)
+                spans = spans + count
+                pos = pos + 2
+                for _ = 1, count do
+                    pos = pos + 3 + payload:byte(pos + 2) * 2
+                end
+            elseif enc == 2 then                -- repeat: no body
+                repeats = repeats + 1
+            else
+                break                            -- unknown encoding: stop the tally
+            end
+        end
+    end
+    return palettes, raws, deltas, repeats, spans, duration
+end
+
+local function verbose_chunk(pts, length, ctype, compression, payload)
     local seconds = pts / 48000
     if ctype == TYPE_VIDEO then
         local w, h = u16(payload, 1), u16(payload, 3)
-        local compression = payload:byte(5)
-        console(string.format(
+        local line = string.format(
             "LiveCC: [video] pts=%d (%.2fs) len=%d %dx%d compression=%s",
-            pts, seconds, length, w, h, COMPRESSION_NAMES[compression] or tostring(compression)))
+            pts, seconds, length, w, h, COMPRESSION_NAMES[compression] or tostring(compression))
+        if compression == 0 then                     -- only "none" is decodable (spec §4.1.2)
+            local palettes, raws, deltas, repeats, spans, duration =
+                scan_video_units(payload, w * h)
+            line = line .. string.format(
+                " units=%d(palette)+%d(raw)+%d(delta,%d spans)+%d(repeat) gop_dur=%.2fs",
+                palettes, raws, deltas, spans, repeats, duration / 48000)
+        end
+        console(line)
     elseif ctype == TYPE_AUDIO then
         local hdr = payload:byte(1)
         local codec, role = floor(hdr / 16), hdr % 16
@@ -864,17 +906,20 @@ end
 -- Dispatch one binary message: a marker-led media chunk, or a control frame.
 local function handle_message(msg)
     if msg:byte(1) == MARKER then
-        -- chunk: [marker][pts u48][length u24][type u8][payload]
+        -- chunk: [marker][pts u48][length u24][type u8][compression u8][payload]
         local pts = u48(msg, 2)
         local length = u24(msg, 8)
         local ctype = msg:byte(11)
-        if VERBOSE then verbose_chunk(pts, length, ctype, msg:sub(12)) end
+        local compression = msg:byte(12)
+        local payload = msg:sub(13)
+        if VERBOSE then verbose_chunk(pts, length, ctype, compression, payload) end
+        if compression ~= 0 then return end                    -- compressed payloads deferred (CC = none)
         if ctype == TYPE_VIDEO and WANT_VIDEO then
             if not anchor_pts then set_anchor(pts) end   -- draft-00 fallback
-            queue_video(pts, msg:sub(12))
+            queue_video(pts, payload)
         elseif ctype == TYPE_AUDIO and WANT_AUDIO then
             if not anchor_pts then set_anchor(pts) end   -- draft-00 fallback
-            handle_audio(pts, msg:sub(12))
+            handle_audio(pts, payload)
         end
         -- unknown chunk types: skip (self-describing stream, spec §6)
     else

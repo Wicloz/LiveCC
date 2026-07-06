@@ -249,11 +249,15 @@ def test_scan_moov_position():
     assert transcoder._scan_moov_position(b"\x00\x00\x00") is None
 
 
-def test_audio_chunk_is_short_to_avoid_periodic_video_stall():
+def test_audio_chunk_matches_gop_duration():
     # The CC client decodes each audio chunk inline on the coroutine that also
-    # renders video.  A ~1 s chunk blocked rendering for the whole decode once per
-    # second (visible stutter), so chunks must stay short enough to interleave.
-    assert transcoder.AUDIO_CHUNK_SECONDS <= 0.2
+    # renders video, so a ~1 s chunk risks blocking rendering for the whole
+    # decode once per second (this previously caused visible stutter at 1.0 s,
+    # see a5a67ef, before chunks were shrunk to 0.1 s). Chunks were widened
+    # back to match the GOP -- fewer, larger DFPWM predictor resets sound much
+    # better -- on the tradeoff that this reintroduces that stall risk; verify
+    # on real hardware if this regresses.
+    assert transcoder.AUDIO_CHUNK_SECONDS == transcoder.GOP_SECONDS
 
 
 def test_audio_ffmpeg_cmd_has_no_server_side_filtering():

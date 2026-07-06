@@ -7,10 +7,11 @@ Python-side reference decoder (tests / preview tooling).  The Lua client mirrors
 the decode side.
 
 1. Container Format — self-describing chunks:
-       [marker 1B][PTS u48][length u24][type u8][payload]
-   PTS is absolute in 48 kHz samples.  A video payload is a self-contained GOP
-   ([w u16][h u16][compression u8] + a unit stream); an audio payload is
-   [a-hdr u8] + samples.  Compression 0 (none) only — the rest is deferred.
+       [marker 1B][PTS u48][length u24][type u8][compression u8][payload]
+   PTS is absolute in 48 kHz samples; `compression` compresses the whole payload of
+   any type (0 = none only; deflate/lz4/zstd deferred).  A video payload is a
+   self-contained GOP ([w u16][h u16] + a unit stream); an audio payload is
+   [a-hdr u8] + samples.
 
 2. Stream Format — every transport message starts with one byte: the container
    marker means "this message IS a chunk" (MEDIA); anything else is a control
@@ -59,15 +60,17 @@ CHANNEL_REAR_LEFT = 7
 CHANNEL_REAR_RIGHT = 8
 
 MAX_DURATION = 0xFFFF            # u16 samples (~1.36 s); longer holds use repeats
-_CHUNK_HEADER = 11               # marker + PTS + length + type
+_CHUNK_HEADER = 12               # marker + PTS + length + type + compression
 
 
 # --------------------------------------------------------------------------- #
 # Chunk framing
 # --------------------------------------------------------------------------- #
 
-def chunk(pts: int, ctype: int, payload: bytes) -> bytes:
-    """One container chunk.  `pts` is absolute 48 kHz samples (u48)."""
+def chunk(pts: int, ctype: int, payload: bytes,
+          compression: int = COMPRESSION_NONE) -> bytes:
+    """One container chunk.  `pts` is absolute 48 kHz samples (u48).  `compression`
+    (spec §4.1.2) applies to the whole payload; only COMPRESSION_NONE is built."""
     if not 0 <= pts < 1 << 48:
         raise ValueError(f"PTS out of u48 range: {pts}")
     if len(payload) >= 1 << 24:
@@ -76,7 +79,7 @@ def chunk(pts: int, ctype: int, payload: bytes) -> bytes:
     return (bytes([MARKER])
             + pts.to_bytes(6, "little")
             + len(payload).to_bytes(3, "little")
-            + bytes([ctype])
+            + bytes([ctype, compression])
             + payload)
 
 
@@ -90,6 +93,9 @@ def parse_chunk(buf: bytes, offset: int = 0) -> tuple[int, int, bytes, int]:
     pts = int.from_bytes(buf[offset + 1:offset + 7], "little")
     length = int.from_bytes(buf[offset + 7:offset + 10], "little")
     ctype = buf[offset + 10]
+    compression = buf[offset + 11]
+    if compression != COMPRESSION_NONE:
+        raise ValueError(f"unsupported compression {compression}")
     end = offset + _CHUNK_HEADER + length
     if end > len(buf):
         raise ValueError("truncated chunk payload")
@@ -229,9 +235,9 @@ def delta_frame_unit(duration: int, body: bytes) -> bytes:
 
 
 def video_payload(w: int, h: int, units: bytes) -> bytes:
-    """A video chunk payload: [w u16][h u16][compression u8] + unit stream.
-    Only COMPRESSION_NONE is implemented (the rest is deferred)."""
-    return struct.pack("<HHB", w, h, COMPRESSION_NONE) + units
+    """A video chunk payload: [w u16][h u16] + unit stream.  Compression is a
+    chunk-header concern now (spec §4.1.2), not a video field."""
+    return struct.pack("<HH", w, h) + units
 
 
 def audio_payload(codec: int, data: bytes, channel: int = CHANNEL_MONO) -> bytes:
@@ -261,12 +267,10 @@ def parse_video_payload(payload: bytes) -> tuple[int, int, list[DecodedFrame]]:
     """Decode a video chunk payload -> (w, h, frames).  Applies palette units and
     materialises delta/repeat frames against the running state, exactly as a
     client would; every chunk is a RAP so no prior state is needed."""
-    if len(payload) < 5:
+    if len(payload) < 4:
         raise ValueError("truncated video payload header")
-    w, h, compression = struct.unpack_from("<HHB", payload)
-    if compression != COMPRESSION_NONE:
-        raise ValueError(f"unsupported compression {compression}")
-    pos = 5
+    w, h = struct.unpack_from("<HH", payload)
+    pos = 4
     n = w * h
     palette: Optional[np.ndarray] = None
     glyph = fg = bg = None

@@ -36,7 +36,8 @@ def test_chunk_header_layout():
     assert c[1:7] == (0x0123456789AB).to_bytes(6, "little")
     assert c[7:10] == (20).to_bytes(3, "little")         # u24 payload length
     assert c[10] == ccmf.TYPE_AUDIO
-    assert c[11:] == payload                             # header is exactly 11 B
+    assert c[11] == ccmf.COMPRESSION_NONE
+    assert c[12:] == payload                             # header is exactly 12 B
 
     pts, ctype, body, end = ccmf.parse_chunk(c)
     assert (pts, ctype, body, end) == (0x0123456789AB, ccmf.TYPE_AUDIO, payload, len(c))
@@ -55,7 +56,7 @@ def test_chunk_rejects_out_of_range_fields():
     with pytest.raises(ValueError):
         ccmf.chunk(1 << 48, ccmf.TYPE_VIDEO, b"")        # PTS is u48
     with pytest.raises(ValueError):
-        ccmf.parse_chunk(b"X" + bytes(10) + b"")         # bad marker
+        ccmf.parse_chunk(b"X" + bytes(11))               # bad marker (12 B, marker != C)
 
 
 # --------------------------------------------------------------------------- #

@@ -93,10 +93,10 @@ as in RFC 2119.
 ### 4.1. Chunk
 
 ```
-+--------+------------+----------+--------+===============+
-| marker |    PTS     |  length  |  type  |    payload    |
-|  1 B   |    6 B      |   3 B    |  1 B   |  length bytes |
-+--------+------------+----------+--------+===============+
++--------+------------+----------+--------+-------------+===============+
+| marker |    PTS     |  length  |  type  | compression |    payload    |
+|  1 B   |    6 B      |   3 B    |  1 B   |     1 B     |  length bytes |
++--------+------------+----------+--------+-------------+===============+
 ```
 
 | Field  | Size | Description                                              |
@@ -105,10 +105,12 @@ as in RFC 2119.
 | PTS    | 6 B  | Absolute presentation timestamp (Section 4.2).           |
 | length | 3 B  | Payload byte count, `u24` (≤ 16 MiB).                    |
 | type   | 1 B  | `0` = video, `1` = audio. Others reserved.               |
+| compression | 1 B | Payload compression (Section 4.1.2). `0` = none.        |
 
-A reader locates chunk N+1 at `offset(N) + 11 + length`. The 11-byte header is
+A reader locates chunk N+1 at `offset(N) + 12 + length`. The 12-byte header is
 fixed; a decoder encountering an unknown `type` MUST skip `length` bytes and
-continue.
+continue. `length` counts the **on-wire (compressed) payload**; a consumer
+inflates it per `compression` (Section 4.1.2) *before* interpreting it per `type`.
 
 #### 4.1.1. Marker, length, and seeking
 
@@ -118,9 +120,24 @@ false hits do not chain). Correctness comes from chaining, so a 1-byte marker
 suffices — `P(random byte) = 1/256`, and the CC client never scans (WebSocket
 delivers one chunk per binary message; file reading chains from offset 0).
 
-`length` is a fixed `u24` (≤ 16 MiB) counting the **payload only**; chunk N+1
-begins at `offset(N) + 11 + length`. This covers a busy 1–2 s chunk (~1 MB) with
-wide margin.
+`length` is a fixed `u24` (≤ 16 MiB) counting the **on-wire payload only**; chunk
+N+1 begins at `offset(N) + 12 + length`. This covers a busy 1–2 s chunk (~1 MB)
+with wide margin.
+
+#### 4.1.2. Compression
+
+`compression` selects a payload-wide compression applied uniformly to **any** chunk
+type: `0` none · `1` deflate · `2` lz4 · `3` zstd. `[ED: deferred — CC decodes
+`0` only for now.]` The whole payload is compressed as one blob; the consumer
+inflates it before dispatching by `type`, so type-specific decoders never handle
+compression.
+
+It is chosen **per chunk**, so a producer compresses what benefits (a video
+GOP's redundant `delta` frames, PCM8 audio, subtitle text) and leaves the rest
+`none`. Per-frame/per-unit compression is deliberately not offered — small deltas
+compress poorly in isolation, and the chunk is already the random-access unit. A
+client advertises what it can inflate via the CAPS `compress` bitmask
+(Section 5.4); a server **MUST** use only advertised algorithms.
 
 ### 4.2. Timestamps
 
@@ -152,19 +169,16 @@ Common frame intervals are exact: 24 fps = 2000, 30 = 1600, 25 = 1920 samples.
 A video chunk is a **self-contained GOP** and thus a RAP.
 
 ```
-+---------+---------+-------------+========================+
-|  width  | height  | compression |     unit stream        |
-|  u16    |  u16    |    u8       |  (compression applied) |
-+---------+---------+-------------+========================+
++---------+---------+========================+
+|  width  | height  |     unit stream        |
+|  u16    |  u16    |                        |
++---------+---------+========================+
 ```
 
-- `compression`: `0` none, `1` deflate, `2` lz4, `3` zstd `[ED: deferred; CC
-  decodes `0` only for now]`. It covers the **entire unit stream as one blob**,
-  not individual frames; the 5-byte head stays uncompressed. Whole-payload is
-  chosen because consecutive `delta` frames are highly redundant (one blob
-  compresses far better than isolated frames), the client decompresses once per
-  chunk, and per-frame random access is unnecessary — the chunk is the
-  random-access unit.
+- Compression is **not** a video field — the whole payload (this `width`/`height`
+  head plus the unit stream) is compressed via the chunk header's `compression`
+  (Section 4.1.2). A decoder inflates the payload first, then parses it; a GOP's
+  redundant `delta` frames still compress together as one blob.
 - The unit stream is decoded until `length` is consumed (no unit count).
 - The stream **MUST** begin with a `palette` unit followed by a `raw` frame
   (the keyframe), and **MUST NOT** end with a `palette` unit.
@@ -250,7 +264,8 @@ Section 5.4): `0` mono · `1` front-left · `2` front-right · `3` center · `4`
   at the start of every chunk (so each chunk is independently decodable /
   seekable).
 
-Chunk PTS is the first sample's index; sample count is derived from `length`.
+Chunk PTS is the first sample's index; sample count is derived from the
+decompressed payload size (after any `compression`, Section 4.1.2).
 Stereo is two audio chunks (roles front-left + front-right) sharing PTS; a
 client advertises which roles it accepts via the CAPS `channels` bitmask
 (Section 5.4).
@@ -493,7 +508,8 @@ counts, and `start`/`length` against `W·H` before allocating or drawing.
 2. ~~opcode values~~ — resolved (Section 5.2).
 3. ~~length width~~ — resolved: `u24`, payload-only (Section 4.1).
 4. ~~Versioning~~ — resolved: none; capability-driven and additive (Section 6).
-5. **Compression** (4.4) and **subtitles** (4.3) — deferred.
+5. **Compression** — placement decided (chunk-header `compression`, generic across all
+   types, §4.1.2); algorithms deferred. **Subtitles** (§4.3) — deferred.
 6. ~~Endianness~~ — resolved: little-endian (§3), verified against the current
    decoder ([player.lua](../lua/player.lua)).
 
