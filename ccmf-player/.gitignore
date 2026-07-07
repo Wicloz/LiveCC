@@ -1,0 +1,12 @@
+build/
+build-*/
+.cache/
+compile_commands.json
+sample.ccmf
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
