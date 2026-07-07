@@ -12,13 +12,13 @@ Pure stdlib + numpy (already a server dependency). No extra installs.
 # from the server/ directory
 python benchmarks/run_all.py              # everything
 python benchmarks/run_all.py encoder      # one or more sections
-python benchmarks/run_all.py --profile    # add the encoder cProfile dump
+python benchmarks/run_all.py --profile    # add the encoder + gop cProfile dumps
 
 # or a single module directly
 python benchmarks/bench_encoder.py
 ```
 
-Sections: `encoder` (primary), `quality`, `samples`, `splitter`, `buffer`,
+Sections: `encoder` (primary), `gop`, `quality`, `samples`, `splitter`, `buffer`,
 `startup`. The `samples` section uses developer clips in the repo-root `media/`
 folder and self-skips when it's empty.
 
@@ -31,6 +31,7 @@ folder and self-skips when it's empty.
 | Module | Measures |
 | --- | --- |
 | `bench_encoder.py` | `encode_frame` cost vs **grid size** (pocket→max monitor) and vs **content** (flat/gradient/edges/photo/random), plus a per-primitive breakdown of where the time goes. Reports the fps ceiling, the adaptive pacer's steady fps, and concurrent-streams-per-core. |
+| `bench_gop.py` | `cc_encoder.GopEncoder` — the CCMF container layer (05fdf41) that wraps `encode_frame` in production: `add()` amortised over realistic streaming sequences (static/motion/scene-cuts, by grid), plus the raw `ccmf` pack/unpack + `delta_spans` primitives it calls every frame. |
 | `bench_quality.py` | Transcoder **fidelity**: decodes the blit wire format back to pixels and reports PSNR (raw and after a 2×2 box blur, which approximates the eye integrating dithered sub-pixels) plus % cells dithered — for synthetic content **and** for any real `media/` samples. |
 | `bench_samples.py` | `encode_frame` on **real decoded frames** from `media/` clips — by grid and by clip. Needs ffmpeg + samples; self-skips otherwise. |
 | `bench_splitter.py` | `_FrameSplitter` throughput (whole-frame and 64 KiB-chunked) — the read path before the encode offload. |

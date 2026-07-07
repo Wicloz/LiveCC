@@ -951,6 +951,7 @@ class GopEncoder:
         self._pal_bytes = None                  # last emitted palette, to skip resends
         self._prev = None                       # (glyph, fg, bg) of the last frame
         self._prev_rgb = None                   # subsampled pixels of the last frame
+        self._prev_frame = None                 # full pixels of the last frame
 
     @staticmethod
     def _subsample(frame_rgb: np.ndarray) -> np.ndarray:
@@ -976,6 +977,7 @@ class GopEncoder:
         self._tables = _palette_tables(pal_rgb)
         self._pal_bytes = pal_rgb.tobytes()
         self._prev = self._encode(frame_rgb, self._tables)
+        self._prev_frame = np.asarray(frame_rgb)
         self._gop_pts = pts
         self._entries = [("pal", self._pal_bytes),
                          (ccmf.ENC_RAW, pts, self._prev)]   # planes packed at flush
@@ -990,12 +992,28 @@ class GopEncoder:
         done = None
         if self._entries and pts - self._gop_pts >= self.gop_samples:
             done = self._flush(next_pts=pts)
-        rgb_sub = self._subsample(frame_rgb)
         if not self._entries:
             self._open_gop(pts, frame_rgb)
-            self._prev_rgb = rgb_sub
+            self._prev_rgb = self._subsample(frame_rgb)
             return done
 
+        if self._prev_frame is not None and np.array_equal(frame_rgb, self._prev_frame):
+            # Pixel-identical to the previous frame (a paused/static source, or a
+            # duplicate frame the decoder emitted) -> skip the encode and the
+            # delta diff entirely; a `repeat` unit is correct and free.  Cheap to
+            # check (one array comparison) next to what it saves (a full
+            # quantiser pass).  self._prev_rgb / self._prev stay as they were —
+            # nothing changed for the next frame to compare against either.
+            size = self._FRAME_OVERHEAD
+            if self._bytes + size > self.max_chunk_bytes:
+                done = self._flush(next_pts=pts)
+                self._open_gop(pts, frame_rgb)
+                return done
+            self._entries.append((ccmf.ENC_REPEAT, pts, b""))
+            self._bytes += size
+            return done
+
+        rgb_sub = self._subsample(frame_rgb)
         cut = (self._prev_rgb is None or rgb_sub.shape != self._prev_rgb.shape
                or np.abs(rgb_sub - self._prev_rgb).mean() > self._SCENE_CUT_DIFF)
         self._prev_rgb = rgb_sub
@@ -1048,6 +1066,7 @@ class GopEncoder:
             self._entries.append((ccmf.ENC_DELTA, pts, body))
         self._bytes += size
         self._prev = grids if grids is not None else self._prev
+        self._prev_frame = np.asarray(frame_rgb)
         return done
 
     def flush(self, next_pts: Optional[int] = None) -> Optional[tuple[int, bytes]]:

@@ -163,6 +163,23 @@ def test_unchanged_frame_becomes_a_repeat_unit():
     assert [f.encoding for f in frames] == [ccmf.ENC_RAW, ccmf.ENC_REPEAT]
 
 
+def test_unchanged_frame_skips_the_re_encode(monkeypatch):
+    # The repeat-unit *output* above doesn't prove the cheap path was taken --
+    # add() could reach the same result by re-encoding and then diffing to a
+    # no-op delta.  Assert the actual point of the pixel-identity check: a
+    # byte-identical frame must never re-enter the quantiser at all.
+    rng = np.random.default_rng(0)
+    frame = rng.integers(0, 256, size=(20 * 3, 10 * 2, 3), dtype=np.uint8)
+    gop = _gop()
+    gop.add(0, frame)                 # opening keyframe: encode is expected here
+
+    calls = []
+    monkeypatch.setattr(GopEncoder, "_encode",
+                        lambda self, *a, **kw: calls.append(1) or (None, None, None))
+    gop.add(2000, frame)              # byte-identical: must not call _encode
+    assert calls == []
+
+
 def test_scene_cut_appends_a_rekey_without_flushing_the_chunk():
     # A big scene cut mid-GOP must land as another palette+raw pair in the
     # SAME chunk, not force a new one -- the point of the spec's "any order
