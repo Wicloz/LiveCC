@@ -427,7 +427,11 @@ end
 -- chunk — its state MUST reset per chunk, spec §4.6): queued chunks stay as
 -- compact strings instead of huge Lua number tables.
 
-local MAX_AUDIO_CHUNKS = 6              -- ~6 s of raw strings per role (safety cap)
+-- Safety cap against a stalled/refusing role, not a latency knob: comfortably
+-- above the server's worst-case VOD catch-up burst (VOD_MAX_BUFFER 15 s /
+-- AUDIO_CHUNK_SECONDS 1.0 s = 15 chunks backpressured, then flushed at once
+-- on resume), so normal bursty delivery never legitimately overflows it.
+local MAX_AUDIO_CHUNKS = 16
 local SPK_AHEAD = 38400                -- feed ≤0.8 s ahead once a role is rolling
 local PTS_SLOP = 240                   -- 5 ms: chunks this close count as contiguous
 
