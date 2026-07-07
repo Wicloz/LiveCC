@@ -7,7 +7,7 @@
 -- One WebSocket carries everything, speaking CCMF (the ComputerCraft Media
 -- Format, docs/cc-media-format.md).  Every message is binary: a message whose
 -- first byte is the container marker (67, "C") is a media chunk — a video GOP
--- (palette + raw/delta/repeat frame units) or ~1 s of audio — and anything
+-- (palette + raw/delta/repeat frame units) or a span of audio — and anything
 -- else is a control frame [opcode][len u16][body]: STATUS, ERROR.
 -- The client opens with ROOM -> ACK, CAPS -> ACK, START, then just consumes.
 --
@@ -423,20 +423,33 @@ end
 -- about one role's delivery, drops, or stalls can shift another role, and
 -- none of them can walk away from video.
 --
--- Decoding happens at feed time (pcm8 unpack, or a fresh DFPWM decoder per
--- chunk — its state MUST reset per chunk, spec §4.6): queued chunks stay as
--- compact strings instead of huge Lua number tables.
+-- Decoding happens at feed time (pcm8 unpack, or DFPWM via cc.audio.dfpwm),
+-- SLICED into AUDIO_SLICE_SAMPLES-sized steps rather than the whole chunk at
+-- once: decoding a full multi-second chunk in one Lua call blocks this
+-- coroutine for the whole decode — and since CC's task scheduler is
+-- cooperative (one Lua VM, no real concurrency), that blocks the video
+-- render task too until this call returns.  Slicing bounds that stall to one
+-- slice regardless of how long the wire chunk is: after each slice,
+-- feed_roles() returns and the engine loop's normal os.pullEvent() gives
+-- rendering (and everything else) a turn before the next slice runs.
+-- A chunk still opens only ONE DFPWM decoder (spec §4.6 — fresh state per
+-- CHUNK, not per slice): cc.audio.dfpwm's decoder is built to be called
+-- repeatedly on successive byte ranges of the same stream, carrying its
+-- predictor state forward, so slicing doesn't touch the one-reset-per-chunk
+-- contract. Queued chunks stay as compact strings instead of huge Lua number
+-- tables until their turn to be sliced.
 
 -- Safety cap against a stalled/refusing role, not a latency knob: comfortably
--- above the server's worst-case VOD catch-up burst (VOD_MAX_BUFFER 15 s /
--- AUDIO_CHUNK_SECONDS 1.0 s = 15 chunks backpressured, then flushed at once
--- on resume), so normal bursty delivery never legitimately overflows it.
+-- above the server's worst-case VOD catch-up burst (VOD_MAX_BUFFER seconds of
+-- chunks backpressured, then flushed at once on resume), so normal bursty
+-- delivery never legitimately overflows it.
 local MAX_AUDIO_CHUNKS = 16
 local SPK_AHEAD = 38400                -- feed ≤0.8 s ahead once a role is rolling
 local PTS_SLOP = 240                   -- 5 ms: chunks this close count as contiguous
+local AUDIO_SLICE_SAMPLES = 4800       -- ~0.1 s per decode/feed step (caps the render stall)
 
 local audio_queues = {}                -- role -> { {pts, n, data, codec}, ... }
-local role_state = {}                  -- role -> { fed_until, pending }
+local role_state = {}                  -- role -> { fed_until, pending, active }
 for role in pairs(speakers_by_role) do
     audio_queues[role] = {}
     role_state[role] = {}
@@ -454,13 +467,6 @@ local function decode_pcm8(data)
         end
     end
     return out
-end
-
-local function decode_samples(head)
-    if head.codec == 0 then
-        return decode_pcm8(head.data)
-    end
-    return dfpwm.make_decoder()(head.data)   -- fresh state per chunk (spec §4.6)
 end
 
 local function trim_front(samples, skip)
@@ -488,8 +494,9 @@ local function handle_audio(pts, payload)
     os.queueEvent("livecc_audio")        -- wake the audio engine
 end
 
--- One pass over every role: retry refused feeds, drop stale, feed what the
--- gates allow.  Returns how many ms until the next scheduled feed (for a
+-- One pass over every role: retry refused feeds, drop stale, admit at most
+-- one due chunk (never more than one slice of ACTUAL decode work), feed what
+-- the gates allow.  Returns how many ms until the next scheduled feed (for a
 -- wake-up timer), or nil to sleep until an event.
 local function feed_roles()
     local now = clock_now()
@@ -515,42 +522,73 @@ local function feed_roles()
                 st.pending = nil
             end
         end
+
+        -- Admit at most one due chunk into st.active (cheap bookkeeping only —
+        -- no decode happens here).  Purely-stale entries are dropped in a
+        -- loop first since that's O(1) per item, not a decode.
         local q = audio_queues[role]
-        while not st.pending and q[1] do
-            now = clock_now()
-            local head = q[1]
-            if head.pts + head.n <= now then
+        if not st.pending and not st.active then
+            while q[1] and q[1].pts + q[1].n <= now do
                 table.remove(q, 1)       -- stale: its whole span already passed
-            else
+            end
+            local head = q[1]
+            if head then
                 local live = st.fed_until ~= nil and st.fed_until > now
                 if live and head.pts > st.fed_until + PTS_SLOP then
                     -- Hole in this role's stream: let the device drain, then
                     -- the due-gate below restarts exactly on the clock.
                     sooner((st.fed_until - now) / 48)
-                    break
                 elseif live and head.pts > now + SPK_AHEAD then
                     sooner((head.pts - SPK_AHEAD - now) / 48)     -- budget gate
-                    break
                 elseif not live and head.pts > now then
                     sooner((head.pts - now) / 48)                 -- due gate
-                    break
+                else
+                    table.remove(q, 1)
+                    st.active = {
+                        head = head,
+                        pos = 1,          -- next unread byte offset in head.data
+                        decoder = head.codec == 1 and dfpwm.make_decoder() or nil,
+                        trim = (not live and head.pts < now) and floor(now - head.pts) or 0,
+                    }
                 end
-                table.remove(q, 1)
-                local samples = decode_samples(head)
-                if not live and head.pts < now then
-                    samples = trim_front(samples, floor(now - head.pts))
+            end
+        end
+
+        -- Decode+feed exactly one slice of the active chunk, if any.  This is
+        -- the only place actual decode work happens, so it's the only place
+        -- that can stall — bounded to AUDIO_SLICE_SAMPLES regardless of the
+        -- chunk's real size.
+        if not st.pending and st.active then
+            local a = st.active
+            local nbytes = a.head.codec == 1 and floor(AUDIO_SLICE_SAMPLES / 8)
+                                              or AUDIO_SLICE_SAMPLES
+            local last = math.min(a.pos + nbytes - 1, #a.head.data)
+            local piece = a.head.data:sub(a.pos, last)
+            local finished = last >= #a.head.data
+            a.pos = last + 1
+
+            local samples = a.head.codec == 0 and decode_pcm8(piece) or a.decoder(piece)
+            if a.trim > 0 then
+                local drop = math.min(a.trim, #samples)
+                samples = trim_front(samples, drop)
+                a.trim = a.trim - drop
+            end
+            if #samples > 0 then
+                local refused = {}
+                for _, d in ipairs(devs) do
+                    if not d.playAudio(samples) then refused[#refused + 1] = d end
                 end
-                if #samples > 0 then
-                    local refused = {}
-                    for _, d in ipairs(devs) do
-                        if not d.playAudio(samples) then refused[#refused + 1] = d end
-                    end
-                    if #refused > 0 then
-                        st.pending = { samples = samples, devs = refused }
-                        sooner(100)
-                    end
+                if #refused > 0 then
+                    st.pending = { samples = samples, devs = refused }
+                    sooner(100)
                 end
-                st.fed_until = head.pts + head.n
+            end
+
+            if finished then
+                st.fed_until = a.head.pts + a.head.n
+                st.active = nil
+            else
+                sooner(0)                -- more of this chunk to decode: come straight back
             end
         end
     end
@@ -560,7 +598,8 @@ end
 local function audio_pending()
     for role, q in pairs(audio_queues) do
         if #q > 0 then return true end
-        if role_state[role].pending then return true end
+        local st = role_state[role]
+        if st.pending or st.active then return true end
     end
     return false
 end
@@ -572,6 +611,7 @@ local function flush_speakers()
         for _, d in ipairs(devs) do pcall(d.stop) end
         role_state[role].pending = nil
         role_state[role].fed_until = nil
+        role_state[role].active = nil
     end
 end
 

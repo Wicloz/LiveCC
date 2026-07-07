@@ -290,18 +290,67 @@ def test_stale_audio_is_dropped_and_straddler_trimmed():
 def test_budget_gate_stops_feeding_past_spk_ahead():
     # Once rolling, the speaker may hold at most SPK_AHEAD of future audio —
     # more would turn delivery lead back into audible lead.
+    # feed_roles() admits/decodes at most one due chunk's worth of work per
+    # call now (each CHUNK-sized message here fits in one decode slice), so
+    # draining a backlog of already-admissible chunks takes one call each.
     p = load_player()
     p.anchor(0)
     for i in range(12):
         p.handle_message(audio_chunk(i * CHUNK, ccmf.CHANNEL_FRONT_LEFT, 160))
     p.at_clock(0)
-    wait = p.feed_roles()
+    wait = None
+    for _ in range(12):
+        wait = p.feed_roles()
     # pts 0..SPK_AHEAD inclusive = 9 chunks; the 10th (43200) is over budget
     assert p.play_count(b"left") == 9
     assert wait == pytest.approx(100)          # budget frees up in 0.1 s
     p.at_clock(4800)
     p.feed_roles()
     assert p.play_count(b"left") == 10
+
+
+def test_big_chunk_is_sliced_across_multiple_feed_calls():
+    # A chunk bigger than one decode slice (AUDIO_SLICE_SAMPLES, == CHUNK here)
+    # must not be decoded/fed in one feed_roles() call -- that's the whole
+    # point of slicing: bound the per-call decode/render-stall to one slice
+    # regardless of how big the wire chunk is.
+    p = load_player()
+    p.anchor(0)
+    p.handle_message(audio_chunk(0, ccmf.CHANNEL_FRONT_LEFT, 160, n=CHUNK * 3))
+    p.at_clock(0)
+
+    wait = p.feed_roles()
+    assert p.play_count(b"left") == 1          # only the first slice fed so far
+    assert wait == pytest.approx(0)             # more of this chunk: come straight back
+    n, mean = p.stats(b"left", 1)
+    assert (n, mean) == (CHUNK, 160 - 128)
+
+    p.feed_roles()
+    assert p.play_count(b"left") == 2
+    wait = p.feed_roles()
+    assert p.play_count(b"left") == 3           # fully drained
+    assert wait is None or wait != pytest.approx(0)
+    total = sum(p.stats(b"left", i)[0] for i in range(1, 4))
+    assert total == CHUNK * 3
+
+
+def test_dfpwm_big_chunk_reuses_one_decoder_across_slices():
+    # spec §4.6: DFPWM state resets per CHUNK, not per slice -- a chunk that
+    # takes several feed_roles() calls to drain must still share ONE decoder
+    # instance across all of them (cc.audio.dfpwm's decoder is built to be
+    # called repeatedly on successive byte ranges of the same stream).
+    p = load_player()
+    p.anchor(0)
+    p.handle_message(audio_chunk(0, ccmf.CHANNEL_FRONT_LEFT, 0,
+                                 n=CHUNK * 3, codec=ccmf.CODEC_DFPWM))
+    p.at_clock(0)
+    for _ in range(3):
+        p.feed_roles()
+
+    assert p.play_count(b"left") == 3
+    assert p.stub[b"dfpwm_decoders"] == 1        # one decoder for the whole chunk
+    calls = list(p.stub[b"dfpwm_decode_calls"].values())
+    assert calls == [1, 1, 1]                    # every slice decoded by it
 
 
 def test_hole_in_role_stream_waits_for_drain_then_due():

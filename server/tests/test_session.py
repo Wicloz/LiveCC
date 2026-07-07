@@ -242,16 +242,24 @@ def test_vod_origin_skips_to_the_newest_stream_head(monkeypatch):
     # before the requested start while audio cuts near-exactly: playback must
     # open where EVERY stream has content — not spend the pre-roll seconds
     # playing silent video.
-    _patch_offset_audio(monkeypatch, video_secs=6, audio_start_s=4, audio_secs=1)
+    # The video drop-gate margin (_release) is 2*GOP_SECONDS; give the pre-roll
+    # gap enough room past that (and within _START_PREROLL_CAP) to still
+    # exercise "some dropped, some kept" regardless of how GOP_SECONDS is tuned.
+    margin = 2 * session.GOP_SECONDS
+    audio_start_s = int(margin) + 2
+    video_secs = audio_start_s + 3
+    _patch_offset_audio(monkeypatch, video_secs=video_secs,
+                        audio_start_s=audio_start_s, audio_secs=1)
     ws = FakeWS()
     s = StreamSession("u", w=4, h=2, fps=50, want_audio=True)
     run(asyncio.wait_for(s.run(ws), 10))
 
-    assert _playing_origins(ws.bins)[0] == 4 * ccmf.SAMPLE_RATE
+    assert _playing_origins(ws.bins)[0] == audio_start_s * ccmf.SAMPLE_RATE
     assert len(_auds(ws.bins)) > 0                  # the audio actually played
-    # Deep pre-roll video was dropped at the gate, not shipped.
+    # Deep pre-roll video was dropped at the gate (pts + margin < origin kept
+    # nothing before origin - margin), not shipped.
     vid_pts = [ccmf.parse_chunk(c)[0] for c in _vids(ws.bins)]
-    assert vid_pts and min(vid_pts) >= 2 * ccmf.SAMPLE_RATE
+    assert vid_pts and min(vid_pts) >= (audio_start_s - margin) * ccmf.SAMPLE_RATE
 
 
 def test_vod_origin_preroll_cap_ignores_broken_heads(monkeypatch):

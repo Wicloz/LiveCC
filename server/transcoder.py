@@ -90,22 +90,25 @@ _DOWNLOAD_TIMEOUT = 1800   # full section download for --loop
 # decodable — a continuous ffmpeg DFPWM stream sliced into chunks would leave
 # the client's per-chunk decoder resyncing at every boundary.
 #
-# Chunks match the video GOP (1.0 s): shorter chunks (previously 0.1 s, see
-# a5a67ef) avoided stalling the client's render coroutine during inline decode,
-# but a fresh DFPWM predictor per chunk (spec Sec4.6) is also an audible
-# discontinuity at every chunk boundary -- at 0.1 s that's 10/s.  1.0 s chunks
-# cut that 10x and match audio delivery to video's per-GOP cadence, at the cost
-# of re-risking the per-second decode stall the client was built to avoid;
-# verify on real hardware after changing this.  Sample count per chunk is the
-# same for both codecs, so the A/V buffering downstream is codec-independent.
+# Chunks match the video GOP: shorter chunks (previously 0.1 s, see a5a67ef)
+# avoided stalling the client's render coroutine during inline decode, but a
+# fresh DFPWM predictor per chunk (spec Sec4.6) is also an audible
+# discontinuity at every chunk boundary -- at 0.1 s that's 10/s.  Longer chunks
+# cut that and match audio delivery to video's per-GOP cadence.  The render
+# stall this reintroduced is now fixed client-side (player.lua slices decode
+# into AUDIO_SLICE_SAMPLES-sized steps instead of decoding a whole chunk in one
+# Lua call), so chunk duration is no longer bounded by that risk -- it now
+# trades off DFPWM-reset frequency and live-edge latency against burst size.
+# Sample count per chunk is the same for both codecs, so the A/V buffering
+# downstream is codec-independent.
 SAMPLE_RATE = 48000
-AUDIO_CHUNK_SECONDS = 1.0
-AUDIO_CHUNK_SAMPLES = int(SAMPLE_RATE * AUDIO_CHUNK_SECONDS)   # 48000
+AUDIO_CHUNK_SECONDS = 2.0
+AUDIO_CHUNK_SAMPLES = int(SAMPLE_RATE * AUDIO_CHUNK_SECONDS)   # 96000
 
 # Target span of one video GOP chunk (a palette + keyframe + delta/repeat units).
 # Longer GOPs amortise the keyframe better but add that much latency to a live
 # stream (frames are batched per GOP) and make each chunk a bigger burst.
-GOP_SECONDS = 1.0
+GOP_SECONDS = 2.0
 GOP_SAMPLES = int(SAMPLE_RATE * GOP_SECONDS)
 
 # samples_per_byte describes the WIRE format (what the client unpacks);
@@ -927,7 +930,7 @@ async def iter_audio(youtube_url: str, sample_rate: int = 48000,
                      loop: bool = False,
                      probe: Optional[_FirstPtsProbe] = None,
                      ) -> AsyncGenerator[bytes, None]:
-    """Yield ~1.0 s chunks of raw u8 PCM: the full mono downmix.  Codec
+    """Yield ~AUDIO_CHUNK_SECONDS chunks of raw u8 PCM: the full mono downmix.  Codec
     packing and PTS live in iter_audio_roles — this is just the decode tap
     for mono(-treated) sources.
 

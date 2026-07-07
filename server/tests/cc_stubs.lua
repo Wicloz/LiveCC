@@ -184,11 +184,22 @@ printError = print
 -- The player only requires cc.audio.dfpwm.  The fake decoder is deliberately
 -- recognisable: every decoded sample is 17, and the count is 8 per input byte
 -- — tests use both to prove dfpwm chunks were routed through a decode.
+-- Each make_decoder() call gets a distinct id, and every decode call records
+-- which id served it (stub.dfpwm_decoders / stub.dfpwm_decode_calls) — tests
+-- use this to prove a chunk sliced across multiple feed_roles() calls still
+-- shares ONE decoder instance (spec §4.6: fresh state per CHUNK, not per
+-- slice), not a fresh one per slice.
+stub.dfpwm_decoders = 0
+stub.dfpwm_decode_calls = {}
+
 function require(mod)
     if mod == "cc.audio.dfpwm" then
         return {
             make_decoder = function()
+                stub.dfpwm_decoders = stub.dfpwm_decoders + 1
+                local id = stub.dfpwm_decoders
                 return function(data)
+                    stub.dfpwm_decode_calls[#stub.dfpwm_decode_calls + 1] = id
                     local out = {}
                     for i = 1, #data * 8 do out[i] = 17 end
                     return out

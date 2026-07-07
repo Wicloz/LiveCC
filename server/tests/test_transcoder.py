@@ -611,12 +611,14 @@ def test_raw_pcm_output_is_one_byte_per_sample():
 # plain MP4s (moov-at-end) are routed through, across several containers.
 # --------------------------------------------------------------------------- #
 
-def _ffmpeg_make(path, vcodec, *, acodec=None, extra=()):
-    """Generate a 1 s test clip in whatever container `path`'s suffix implies."""
+def _ffmpeg_make(path, vcodec, *, acodec=None, extra=(), duration=1):
+    """Generate a `duration`-second test clip in whatever container `path`'s
+    suffix implies (default 1 s)."""
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-           "-f", "lavfi", "-i", "testsrc=size=64x48:rate=10:duration=1"]
+           "-f", "lavfi", "-i", f"testsrc=size=64x48:rate=10:duration={duration}"]
     if acodec:
-        cmd += ["-f", "lavfi", "-i", "sine=frequency=440:duration=1:sample_rate=48000"]
+        cmd += ["-f", "lavfi",
+                "-i", f"sine=frequency=440:duration={duration}:sample_rate=48000"]
     cmd += ["-c:v", vcodec]
     if acodec:
         cmd += ["-c:a", acodec]
@@ -888,7 +890,10 @@ def test_iter_audio_roles_mono_source_aliases_every_role(tmp_path):
     # same samples — a stereo/7.1 rig on a mono source plays the mono
     # everywhere instead of going silent.
     path = tmp_path / "with_audio.mp4"
-    if _ffmpeg_make(path, "mpeg4", acodec="aac").returncode != 0:
+    # Needs enough source audio for at least two full AUDIO_CHUNK_SAMPLES reads
+    # (plus a remainder) regardless of how long a chunk currently is.
+    duration = int(2 * transcoder.AUDIO_CHUNK_SECONDS) + 2
+    if _ffmpeg_make(path, "mpeg4", acodec="aac", duration=duration).returncode != 0:
         pytest.skip("ffmpeg can't build mp4+aac")
 
     roles = [ccmf.CHANNEL_MONO, ccmf.CHANNEL_FRONT_LEFT, ccmf.CHANNEL_FRONT_RIGHT]
