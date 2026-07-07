@@ -464,7 +464,8 @@ def _ytdlp_cmd(youtube_url: str, fmt: str, start: float = 0,
 
 def _video_ffmpeg_cmd(px_w: int, px_h: int, fps: int,
                       source: Optional[str] = None, loop: bool = False,
-                      start: float = 0, duration: Optional[float] = None) -> list[str]:
+                      start: float = 0, duration: Optional[float] = None,
+                      letterbox: bool = True) -> list[str]:
     # Letterbox aligned to the 2x3 character grid: snap the scaled content to
     # even width / multiple-of-3 height and pad at even-x / multiple-of-3-y
     # offsets.  Otherwise the content edge lands mid-cell, so boundary cells mix
@@ -476,12 +477,24 @@ def _video_ffmpeg_cmd(px_w: int, px_h: int, fps: int,
     # showinfo last (after fps): its first report is the source timestamp of
     # output frame 0 exactly — the SourceTimeline base (captured off stderr by
     # _FirstPtsProbe; rawvideo itself carries no timestamps).
-    scale = (
-        f"scale={px_w}:{px_h}:force_original_aspect_ratio=decrease:flags=area,"
-        f"scale=trunc(iw/2)*2:trunc(ih/3)*3:flags=area,"
-        f"pad={px_w}:{px_h}:trunc((ow-iw)/4)*2:trunc((oh-ih)/6)*3:black,"
-        f"fps={fps},showinfo"
-    )
+    #
+    # letterbox=False (render_cc.py's standalone-file path only; every live
+    # session needs the fixed grid a real CC monitor requires) skips the pad
+    # step entirely.  It also skips the fit-then-snap two-step: px_w/px_h are
+    # then expected to already be the exact, aspect-correct target the caller
+    # computed from the source's own dimensions (tools/render_cc.py's
+    # _compute_output_grid), so a single direct scale is both simpler and
+    # safer than re-deriving that fit here — it can't land a pixel off from
+    # what the caller (and thus the frame splitter downstream) expects.
+    if letterbox:
+        scale = (
+            f"scale={px_w}:{px_h}:force_original_aspect_ratio=decrease:flags=area,"
+            f"scale=trunc(iw/2)*2:trunc(ih/3)*3:flags=area,"
+            f"pad={px_w}:{px_h}:trunc((ow-iw)/4)*2:trunc((oh-ih)/6)*3:black,"
+            f"fps={fps},showinfo"
+        )
+    else:
+        scale = f"scale={px_w}:{px_h}:flags=area,fps={fps},showinfo"
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "info", "-nostats"]
     if source:                                   # decode a local (seekable) file
         if loop:                                 # --loop: replay the section forever
@@ -834,6 +847,7 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
                      trim_start: float = 0,
                      trim_duration: Optional[float] = None,
                      gop_samples: Optional[int] = None,
+                     letterbox: bool = True,
                      ) -> AsyncGenerator[tuple[int, bytes], None]:
     """Yield (pts_samples, CCMF video chunk) pairs — each chunk one self-contained
     GOP (~GOP_SECONDS of palette + raw/delta/repeat units, see cc_encoder.GopEncoder).
@@ -858,6 +872,12 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
 
     gop_samples overrides the module's GOP_SAMPLES target when set (None keeps
     the default).
+
+    letterbox=False skips padding to term_w x term_h (see
+    _video_ffmpeg_cmd's doc) -- term_w/term_h must then already be the exact
+    output grid the caller wants, not a bounding box; every live-session
+    caller needs letterbox=True (the default), since a real CC monitor's
+    fixed grid has nothing else to show in the unpadded area.
     """
     px_w, px_h = term_w * 2, term_h * 3
     ytdlp: subprocess.Popen | None = None
@@ -878,7 +898,8 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
         if source_path:
             ffmpeg = subprocess.Popen(
                 _video_ffmpeg_cmd(px_w, px_h, fps, source=source_path, loop=loop,
-                                  start=trim_start, duration=trim_duration),
+                                  start=trim_start, duration=trim_duration,
+                                  letterbox=letterbox),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             _spawn_stderr_drain(ffmpeg, "ffmpeg", probe=probe)
@@ -888,7 +909,7 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             ffmpeg = subprocess.Popen(
-                _video_ffmpeg_cmd(px_w, px_h, fps),
+                _video_ffmpeg_cmd(px_w, px_h, fps, letterbox=letterbox),
                 stdin=ytdlp.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             ytdlp.stdout.close()

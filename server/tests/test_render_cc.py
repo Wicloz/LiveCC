@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import shutil
 from pathlib import Path
 
 import pytest
@@ -20,28 +21,125 @@ render_cc = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(render_cc)
 
 import ccmf  # noqa: E402  (server dir already on sys.path via render_cc's import)
+from cc_media import find_media  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _stub_probe_source_stats(monkeypatch):
+    """_render() probes the source's dimensions/duration before producing
+    (for the bounding-box grid computation and the progress bars' totals);
+    stub it so every test in this file stays hermetic (no real ffprobe/
+    yt-dlp call) regardless of whether it happens to reach that code path."""
+    async def _fake(*_a, **_kw):
+        return (64, 48), 10.0
+    monkeypatch.setattr(render_cc, "_probe_source_stats", _fake)
 
 
 # --------------------------------------------------------------------------- #
 # Pure helpers
 # --------------------------------------------------------------------------- #
 
-def test_resolve_grid_preset():
-    assert render_cc._resolve_grid("pocket", None, None) == (26, 20)
+def test_resolve_grid_bound_preset():
+    args = render_cc.build_argparser().parse_args(["clip.mp4", "--grid", "pocket"])
+    assert render_cc._resolve_grid_bound(args) == (26, 20)
 
 
-def test_resolve_grid_wxh():
-    assert render_cc._resolve_grid("40x15", None, None) == (40, 15)
+def test_resolve_grid_bound_wxh():
+    args = render_cc.build_argparser().parse_args(["clip.mp4", "--grid", "40x15"])
+    assert render_cc._resolve_grid_bound(args) == (40, 15)
 
 
-def test_resolve_grid_width_height_override():
-    assert render_cc._resolve_grid("pocket", 10, None) == (10, 20)
-    assert render_cc._resolve_grid("pocket", 10, 5) == (10, 5)
+def test_resolve_grid_bound_width_only_has_no_height_bound():
+    # Giving --width alone means "derive height from aspect ratio", NOT
+    # "keep --grid's default height" -- see _resolve_grid_bound's doc.
+    args = render_cc.build_argparser().parse_args(["clip.mp4", "--width", "100"])
+    assert render_cc._resolve_grid_bound(args) == (100, None)
 
 
-def test_resolve_grid_bad_spec():
+def test_resolve_grid_bound_height_only():
+    args = render_cc.build_argparser().parse_args(["clip.mp4", "--height", "40"])
+    assert render_cc._resolve_grid_bound(args) == (None, 40)
+
+
+def test_resolve_grid_bound_width_and_height_ignores_grid():
+    args = render_cc.build_argparser().parse_args(
+        ["clip.mp4", "--grid", "pocket", "--width", "10", "--height", "5"])
+    assert render_cc._resolve_grid_bound(args) == (10, 5)
+
+
+def test_resolve_grid_bound_bad_spec():
+    args = render_cc.build_argparser().parse_args(["clip.mp4", "--grid", "bogus"])
     with pytest.raises(SystemExit):
-        render_cc._resolve_grid("bogus", None, None)
+        render_cc._resolve_grid_bound(args)
+
+
+# --------------------------------------------------------------------------- #
+# _compute_output_grid: aspect-preserving, no letterboxing
+# --------------------------------------------------------------------------- #
+
+def test_compute_output_grid_both_bounds_fits_inside_landscape():
+    # A 16:9 source is narrower (per cell aspect) than a 51x19 bound, so
+    # height is the constraining dimension and width comes out under 51.
+    assert render_cc._compute_output_grid(1920, 1080, 51, 19) == (50, 19)
+
+
+def test_compute_output_grid_both_bounds_fits_inside_portrait():
+    assert render_cc._compute_output_grid(1080, 1920, 51, 19) == (16, 19)
+
+
+def test_compute_output_grid_width_only_derives_height():
+    assert render_cc._compute_output_grid(1920, 1080, 100, None) == (100, 38)
+
+
+def test_compute_output_grid_height_only_derives_width():
+    assert render_cc._compute_output_grid(1920, 1080, None, 40) == (107, 40)
+
+
+def test_compute_output_grid_square_source_and_bound():
+    # Cells are 2x3 px (not square), so a square source doesn't map to a
+    # square cell grid: width is the constraining bound here (scale=0.4 from
+    # width; 0.6 from height), landing exactly on it while height comes out
+    # under its own bound.
+    assert render_cc._compute_output_grid(100, 100, 20, 20) == (20, 13)
+
+
+def test_compute_output_grid_rejects_no_bounds():
+    with pytest.raises(ValueError):
+        render_cc._compute_output_grid(1920, 1080, None, None)
+
+
+def test_compute_output_grid_rejects_bad_source_dims():
+    with pytest.raises(ValueError):
+        render_cc._compute_output_grid(0, 1080, 51, 19)
+
+
+# --------------------------------------------------------------------------- #
+# _probe_source_stats_blocking: real ffprobe, over whatever media/ samples are
+# present (self-skips otherwise, matching test_media_samples.py's convention).
+# --------------------------------------------------------------------------- #
+
+_HAS_FFPROBE = shutil.which("ffprobe") is not None
+_VIDEO_SAMPLES = find_media("video") if _HAS_FFPROBE else []
+
+
+@pytest.mark.skipif(not _VIDEO_SAMPLES, reason="no media/ video samples or ffprobe not installed")
+def test_probe_source_stats_blocking_reads_real_dimensions_and_duration():
+    sample = _VIDEO_SAMPLES[0]
+    dims, duration = render_cc._probe_source_stats_blocking(str(sample), is_url=False)
+
+    assert dims is not None
+    w, h = dims
+    assert w > 0 and h > 0
+
+    assert duration is not None
+    assert duration > 0
+
+
+def test_probe_source_stats_blocking_missing_file_returns_none_none():
+    dims, duration = render_cc._probe_source_stats_blocking(
+        "definitely_not_a_real_file.mp4", is_url=False)
+    assert dims is None
+    assert duration is None
 
 
 def test_parse_channels_presets():

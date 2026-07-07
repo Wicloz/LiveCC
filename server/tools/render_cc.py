@@ -6,7 +6,7 @@ cc_encoder.GopEncoder, ccmf.py, dfpwm.py): the same GOP encoding, palette
 generation, and audio-role/codec packing a live LiveCC session uses, just run
 to completion against a file instead of a WebSocket.
 
-Two differences from the live path:
+Three differences from the live path:
 
   * No adaptive pacing. A live session skips source frames when the encoder
     can't keep up with real time (transcoder._encode_stride); a render has no
@@ -17,6 +17,13 @@ Two differences from the live path:
     clock exist to pace delivery to a live client; here video GOPs and audio
     chunks are produced concurrently and simply merged into the output file
     in ascending PTS order as they complete.
+  * No letterboxing. A live session pads to a FIXED grid because a real CC
+    monitor has nothing else to show in the unpadded area; a stored file is
+    watched back by a player that letterboxes to its own window instead (see
+    ccmf-player/), so baking black bars into the pixel data here would just
+    waste cells. --grid (or --width/--height) is a BOUND the output fits
+    inside preserving the source's own aspect ratio, not an exact target —
+    see _compute_output_grid.
 
 Source can be a local file (any container ffmpeg can open) or a yt-dlp URL;
 the same source-selection logic the server uses picks a streaming pipe vs. a
@@ -27,6 +34,7 @@ unbounded stream has no natural file length.
 Examples:
   python tools/render_cc.py clip.mp4
   python tools/render_cc.py clip.mp4 --grid mon7x4 --fps 30 --channels stereo
+  python tools/render_cc.py clip.mp4 --width 200                    # auto height
   python tools/render_cc.py https://youtu.be/XXXXXXXXXXX --start 30 --duration 20
   python tools/render_cc.py clip.mkv --audio-codec dfpwm --channels 5.1 -o out.ccmf
 """
@@ -45,6 +53,9 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from tqdm import tqdm
+from tqdm.contrib.logging import logging_redirect_tqdm
+
 # Make the server modules importable when run as a standalone script.
 _SERVER_DIR = Path(__file__).resolve().parent.parent
 if str(_SERVER_DIR) not in sys.path:
@@ -58,6 +69,7 @@ from transcoder import (  # noqa: E402
     GOP_SECONDS,
     SourceTimeline,
     _ASSUMED_CHANNELS,
+    _VIDEO_FMT,
     _ffprobe_channels,
     download_source,
     iter_audio_roles,
@@ -105,19 +117,121 @@ _CHANNEL_PRESETS = {
 }
 
 
-def _resolve_grid(spec: str, width: Optional[int], height: Optional[int]) -> tuple[int, int]:
-    if width and height:
-        return width, height
-    key = spec.strip().lower()
+def _resolve_grid_bound(args: argparse.Namespace) -> tuple[Optional[int], Optional[int]]:
+    """The (width, height) bound in cells, from --width/--height/--grid.
+
+    Either component may be None, meaning "derive this dimension from the
+    source's aspect ratio" (see _compute_output_grid) rather than bound it.
+    Giving --width and/or --height at all REPLACES --grid entirely, rather
+    than layering on top of its default: otherwise "just --width" would
+    unexpectedly still be constrained by --grid's default height.
+    """
+    if args.width is not None or args.height is not None:
+        return args.width, args.height
+    key = args.grid.strip().lower()
     if key in _GRID_PRESETS:
-        w, h = _GRID_PRESETS[key]
-    elif "x" in key:
+        return _GRID_PRESETS[key]
+    if "x" in key:
         wt, ht = key.split("x", 1)
-        w, h = int(wt), int(ht)
+        return int(wt), int(ht)
+    raise SystemExit(f"render_cc: bad --grid '{args.grid}' "
+                     f"(use WxH, or a preset: {', '.join(_GRID_PRESETS)})")
+
+
+def _compute_output_grid(src_w: int, src_h: int,
+                         bound_w: Optional[int], bound_h: Optional[int]) -> tuple[int, int]:
+    """The exact output cell grid for a source with pixel size (src_w, src_h),
+    preserving its aspect ratio with NO padding -- render_cc.py's files are
+    played back by a player (e.g. ccmf-player) that letterboxes to its own
+    window at watch time, unlike a live session's fixed grid, which a real
+    CC monitor has nothing else to show in the padding of (spec: this is
+    tools/render_cc.py's own concern, not the container format's -- see
+    transcoder._video_ffmpeg_cmd's `letterbox` parameter).
+
+    Both bounds given -> the largest grid that fits inside them (computed
+    here, in cell/pixel space, instead of leaving ffmpeg's own
+    force_original_aspect_ratio=decrease to re-derive the same fit and
+    risk landing a pixel off from what this function told the caller to
+    expect). Exactly one bound given -> that dimension is used as-is; the
+    other is derived from the source's aspect ratio. At least one bound is
+    required.
+    """
+    if src_w <= 0 or src_h <= 0:
+        raise ValueError(f"bad source dimensions: {src_w}x{src_h}")
+    if bound_w is not None and bound_h is not None:
+        scale = min((bound_w * 2) / src_w, (bound_h * 3) / src_h)
+        w = max(1, int(src_w * scale) // 2)
+        h = max(1, int(src_h * scale) // 3)
+    elif bound_w is not None:
+        w = bound_w
+        h = max(1, round(bound_w * 2 * src_h / src_w / 3))
+    elif bound_h is not None:
+        h = bound_h
+        w = max(1, round(bound_h * 3 * src_w / src_h / 2))
     else:
-        raise SystemExit(f"render_cc: bad --grid '{spec}' "
-                         f"(use WxH, or a preset: {', '.join(_GRID_PRESETS)})")
-    return width or w, height or h
+        raise ValueError("_compute_output_grid needs at least one bound")
+    return w, h
+
+
+def _probe_source_stats_blocking(source: str, is_url: bool
+                                  ) -> tuple[Optional[tuple[int, int]], Optional[float]]:
+    """Best-effort (width, height) and duration (seconds) of the source's
+    video stream, probed together (one subprocess call per tool tried,
+    rather than two separate round trips) since callers usually want both:
+    dimensions compute an aspect-correct output grid (_compute_output_grid),
+    duration sizes the progress bars. Either or both may come back None;
+    callers degrade gracefully (an assumed aspect ratio; an indeterminate
+    progress bar).
+    """
+    dims: Optional[tuple[int, int]] = None
+    duration: Optional[float] = None
+    if is_url:
+        try:
+            out = subprocess.run(
+                ["yt-dlp", "--no-warnings", "--quiet", "--no-playlist",
+                 "-f", _VIDEO_FMT, "--print", "%(width)sx%(height)sx%(duration)s", source],
+                capture_output=True, text=True, timeout=40)
+            line = out.stdout.strip().splitlines()[0].strip() if out.stdout.strip() else ""
+            parts = line.split("x")
+            if len(parts) == 3:
+                w_str, h_str, d_str = parts
+                if w_str.isdigit() and h_str.isdigit():
+                    dims = (int(w_str), int(h_str))
+                try:
+                    duration = float(d_str)
+                except ValueError:
+                    pass
+        except Exception:
+            pass
+    if (dims is None or duration is None) and shutil.which("ffprobe") is not None:
+        try:
+            out = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height:format=duration",
+                 "-of", "default=noprint_wrappers=1", source],
+                capture_output=True, text=True, timeout=40)
+            info: dict[str, str] = {}
+            for line in out.stdout.splitlines():
+                key, sep, value = line.partition("=")
+                if sep:
+                    info[key.strip()] = value.strip()
+            if dims is None and info.get("width", "").isdigit() \
+                    and info.get("height", "").isdigit():
+                dims = (int(info["width"]), int(info["height"]))
+            if duration is None:
+                try:
+                    duration = float(info.get("duration", ""))
+                except ValueError:
+                    pass
+        except Exception:
+            pass
+    return dims, duration
+
+
+async def _probe_source_stats(source: str, is_url: bool
+                               ) -> tuple[Optional[tuple[int, int]], Optional[float]]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _probe_source_stats_blocking, source, is_url)
 
 
 def _parse_channels(spec: str) -> int:
@@ -227,7 +341,6 @@ async def _render(args: argparse.Namespace) -> int:
         print(f"render_cc: '{source}' isn't a local file, and yt-dlp isn't on PATH.")
         return 1
 
-    w, h = _resolve_grid(args.grid, args.width, args.height)
     channels_mask = _parse_channels(args.channels) if want_audio else 0
     codec_id = ccmf.CODEC_PCM8 if args.audio_codec == "pcm" else ccmf.CODEC_DFPWM
     roles = negotiate_channel_roles(channels_mask) if want_audio else []
@@ -235,6 +348,29 @@ async def _render(args: argparse.Namespace) -> int:
     end = args.end
     if args.duration is not None:
         end = args.start + args.duration
+    total_seconds = None if end is None else max(0.0, end - args.start)
+
+    # One probe covers both what --grid's bounding box needs (the source's
+    # own pixel size, to fit it with no padding -- see _compute_output_grid)
+    # and what the progress bars need (total duration) when --end/--duration
+    # didn't already pin it down.
+    dims: Optional[tuple[int, int]] = None
+    if want_video or total_seconds is None:
+        dims, probed_duration = await _probe_source_stats(source, is_url)
+        if total_seconds is None and probed_duration is not None:
+            total_seconds = max(0.0, probed_duration - args.start)
+
+    if want_video:
+        bound_w, bound_h = _resolve_grid_bound(args)
+        if dims is not None:
+            src_w, src_h = dims
+        else:
+            print(f"render_cc: couldn't determine '{source}'s video dimensions; "
+                 "assuming 16:9.")
+            src_w, src_h = 16, 9
+        w, h = _compute_output_grid(src_w, src_h, bound_w, bound_h)
+    else:
+        w = h = 0
 
     out_path = Path(args.out) if args.out else _default_out(source, is_url)
 
@@ -291,26 +427,50 @@ async def _render(args: argparse.Namespace) -> int:
     queues: dict[str, asyncio.Queue] = {}
     tasks: list[asyncio.Task] = []
 
+    # One bar per stream, showing seconds of source media encoded so far.
+    # total_seconds is None (an indeterminate, count-only bar) when it
+    # couldn't be pinned down by --end/--duration or by probing.
+    bars: list[tqdm] = []
+    video_bar = audio_bar = None
+    if want_video:
+        video_bar = tqdm(total=total_seconds, unit="s", desc="video",
+                         position=0, dynamic_ncols=True)
+        bars.append(video_bar)
+    if want_audio:
+        audio_bar = tqdm(total=total_seconds, unit="s", desc="audio",
+                         position=len(bars), dynamic_ncols=True)
+        bars.append(audio_bar)
+
     async def _run_video() -> None:
         agen = None
+        last_pts = 0
         try:
             agen = iter_video(source, w, h, args.fps,
                               start=pipe_start, end=pipe_end,
                               source_path=source_path, timeline=timeline,
                               adaptive=False, trim_start=trim_start,
-                              trim_duration=trim_duration, gop_samples=gop_samples)
+                              trim_duration=trim_duration, gop_samples=gop_samples,
+                              letterbox=False)
             async for pts, chunk in agen:
+                if video_bar is not None:
+                    video_bar.update(max(0.0, (pts - last_pts) / ccmf.SAMPLE_RATE))
+                    last_pts = pts
                 await video_q.put((pts, chunk))
         except Exception:
             log.exception("render_cc: video pipeline error")
         finally:
             if agen is not None:
                 await agen.aclose()
+            # The loop above only counts each chunk's START pts, so the
+            # final chunk's own span never gets reflected -- snap to 100%.
+            if video_bar is not None and video_bar.total is not None:
+                video_bar.update(max(0.0, video_bar.total - video_bar.n))
             await video_q.put(None)
 
     async def _run_audio() -> None:
         agen = None
         ev_loop = asyncio.get_running_loop()
+        last_pts = 0
         try:
             agen = iter_audio_roles(source, ccmf.SAMPLE_RATE, roles=roles,
                                     decode_channels=source_channels,
@@ -319,6 +479,9 @@ async def _render(args: argparse.Namespace) -> int:
                                     trim_start=trim_start, trim_duration=trim_duration,
                                     chunk_samples=chunk_samples)
             async for pts, chunks in agen:
+                if audio_bar is not None:
+                    audio_bar.update(max(0.0, (pts - last_pts) / ccmf.SAMPLE_RATE))
+                    last_pts = pts
                 encoded: dict[bytes, bytes] = {}
                 for role, data in chunks.items():
                     wire = data
@@ -334,6 +497,8 @@ async def _render(args: argparse.Namespace) -> int:
         finally:
             if agen is not None:
                 await agen.aclose()
+            if audio_bar is not None and audio_bar.total is not None:
+                audio_bar.update(max(0.0, audio_bar.total - audio_bar.n))
             await audio_q.put(None)
 
     if want_video:
@@ -351,6 +516,8 @@ async def _render(args: argparse.Namespace) -> int:
             counts = await _merge_write(f, queues)
     finally:
         await asyncio.gather(*tasks, return_exceptions=True)
+        for bar in bars:
+            bar.close()
         if tmpdir:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -384,10 +551,18 @@ def build_argparser() -> argparse.ArgumentParser:
                     help="output .ccmf path (default: <source>.ccmf, or "
                          "./<title>.ccmf for a URL)")
     ap.add_argument("--grid", default="terminal",
-                    help=f"character grid: WxH, or a preset "
-                         f"({', '.join(_GRID_PRESETS)}) (default: terminal)")
-    ap.add_argument("--width", type=int, help="grid cell width (overrides --grid)")
-    ap.add_argument("--height", type=int, help="grid cell height (overrides --grid)")
+                    help=f"bounding character grid the output fits inside, preserving "
+                         f"the source's aspect ratio with NO letterboxing (a player "
+                         f"letterboxes to its own window at watch time instead): WxH, "
+                         f"or a preset ({', '.join(_GRID_PRESETS)}) (default: terminal). "
+                         f"Ignored if --width and/or --height are given instead.")
+    ap.add_argument("--width", type=int,
+                    help="exact output grid width in cells; height is derived from "
+                         "the source's aspect ratio, unless --height is also given "
+                         "(then both are a bounding box, like --grid)")
+    ap.add_argument("--height", type=int,
+                    help="exact output grid height in cells; width is derived from "
+                         "the source's aspect ratio, unless --width is also given")
     ap.add_argument("--fps", type=int, default=24, help="output frame rate (default: 24)")
     ap.add_argument("--start", type=float, default=0.0,
                     help="seconds into the source to start at (default: 0)")
@@ -406,6 +581,9 @@ def build_argparser() -> argparse.ArgumentParser:
                     help=f"video GOP span in seconds (default: {GOP_SECONDS:g})")
     ap.add_argument("--audio-chunk-seconds", type=float, default=AUDIO_CHUNK_SECONDS,
                     help=f"audio chunk span in seconds (default: {AUDIO_CHUNK_SECONDS:g})")
+    ap.add_argument("--verbose", action="store_true",
+                    help="show detailed ffmpeg/yt-dlp subprocess output alongside the "
+                         "progress bars (default: only warnings/errors)")
     return ap
 
 
@@ -414,8 +592,14 @@ def main(argv=None) -> int:
     if not have_ffmpeg():
         print("render_cc: ffmpeg not found on PATH.")
         return 1
+    if not args.verbose:
+        # The per-frame ffmpeg/yt-dlp passthrough logging (transcoder.py's
+        # _spawn_stderr_drain) is meant for the live server's logs, not a
+        # progress bar's neighbour -- quiet it down to warnings/errors here.
+        logging.getLogger("livecc").setLevel(logging.WARNING)
     try:
-        return asyncio.run(_render(args))
+        with logging_redirect_tqdm():
+            return asyncio.run(_render(args))
     except KeyboardInterrupt:
         print("\nrender_cc: interrupted.")
         return 130

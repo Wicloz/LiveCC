@@ -9,3 +9,5 @@ numpy>=1.26.0
 # numpy core single-threaded.  0.61+ supports NumPy 2.x; pip resolves a mutually
 # compatible pair.  If numba is ever absent the encoder falls back to numpy.
 numba>=0.61.0
+# Progress bars for tools/render_cc.py (a batch CLI, not the live server).
+tqdm>=4.66.0
