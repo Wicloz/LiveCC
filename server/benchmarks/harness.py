@@ -24,10 +24,10 @@ _SERVER_DIR = Path(__file__).resolve().parent.parent
 if str(_SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(_SERVER_DIR))
 
-# Shared media/decode helpers (also used by tools/render_cc.py).  Re-exported so
-# the bench modules can keep importing them from `harness`.
+# Shared media/decode helpers.  Re-exported so the bench modules can keep
+# importing them from `harness`.
 from cc_media import (  # noqa: E402  (needs the sys.path insert above)
-    GRIDS, MEDIA_DIR, PREVIEW_DIR,
+    GRIDS, MEDIA_DIR,
     find_media, have_ffmpeg, render_cells, sample_frames,
 )
 

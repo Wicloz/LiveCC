@@ -22,7 +22,7 @@ Sections: `encoder` (primary), `gop`, `quality`, `samples`, `splitter`, `buffer`
 `startup`. The `samples` section uses developer clips in the repo-root `media/`
 folder and self-skips when it's empty.
 
-> Looking to *see* the output rather than time it? That's the preview renderer,
+> Looking to produce output rather than time it? That's the CCMF exporter,
 > `../tools/render_cc.py` (see `media/README.md`) — it's a dev tool, not a
 > benchmark, so it lives outside this folder.
 
@@ -42,9 +42,10 @@ folder and self-skips when it's empty.
 
 `harness.py` holds the timing/table/synthetic-frame helpers used by the benches.
 Media discovery, real-frame extraction, and the reference blit *decoder* live in
-`../cc_media.py` (shared with the preview renderer and the sample tests);
-`harness` re-exports them, so the benches still `from harness import …`. The
-preview renderer itself is `../tools/render_cc.py` — see `media/README.md`.
+`../cc_media.py` (shared with the sample tests); `harness` re-exports them, so
+the benches still `from harness import …`. The CCMF exporter, a separate dev
+tool built on the same transcoder/encoder code, is `../tools/render_cc.py` —
+see `media/README.md`.
 
 ## Reading the numbers
 

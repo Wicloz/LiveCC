@@ -3,9 +3,9 @@ Shared dev/test helpers around the developer-provided media/ folder and the CC
 codec's reference *decoder*.
 
 Not part of the server runtime (the CC client does the decoding live) — this is
-support code for the benchmarks, the sample tests, and the preview renderer, which
-all need to find sample clips, pull real frames through the front-end, and turn
-encoded blit frames back into the pixels a monitor would show.
+support code for the benchmarks and the sample tests, which need to find sample
+clips, pull real frames through the front-end, and turn encoded blit frames back
+into the pixels a monitor would show.
 
 Lives at the server package root so both `benchmarks/` and `tools/` can import it
 once the server dir is on sys.path.
@@ -22,7 +22,6 @@ import numpy as np
 
 _ROOT_DIR = Path(__file__).resolve().parent.parent       # repo root (server/..)
 MEDIA_DIR = _ROOT_DIR / "media"
-PREVIEW_DIR = MEDIA_DIR / "cc_preview"                    # renderer output (git-ignored)
 
 # Realistic CC display sizes (character grid W x H) for the benchmarks/renderer.
 # Built-in screens are a fixed size; monitors come from the CC:Tweaked formula at
@@ -94,8 +93,8 @@ def find_media(stream: str | None = None) -> list[Path]:
     """Developer-provided samples in media/ (sorted).
 
     With no argument: *every* file except internal bookkeeping — dotfiles like
-    .gitignore and README.md — and the render-output subfolder (a directory, so it
-    drops out naturally).  Deliberately no extension allowlist: whatever a
+    .gitignore and README.md — and any subdirectory (drops out naturally, since
+    only files pass the is_file() filter).  Deliberately no extension allowlist: whatever a
     developer drops here is a clip they expect to work, so a file a pipeline can't
     handle is a real bug to surface, not something to silently skip.
 

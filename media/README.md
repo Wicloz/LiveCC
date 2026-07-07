@@ -20,15 +20,15 @@ What picks them up:
   ffmpeg isn't installed).
 - **Benchmarks** — `server/benchmarks/bench_samples.py` measures `encode_frame`
   on real decoded frames from your samples (more representative than synthetic).
-- **Preview renderer** — `server/tools/render_cc.py` emulates exactly what a
-  ComputerCraft monitor/speaker would show at various resolutions and writes MP4s
-  to `media/cc_preview/` for manual inspection (8-bit 48 kHz mono PCM audio).
+- **CCMF exporter** — `server/tools/render_cc.py` runs a sample through the real
+  transcode pipeline at full speed and writes a `.ccmf` file — the same container
+  a live session streams, just produced once instead of paced to a client.
 
 ```sh
 # from the repo root, after putting a clip or two in media/
 cd server
-python tools/render_cc.py                 # render every sample at default grids
-python tools/render_cc.py --help          # options (grids, duration, ...)
+python tools/render_cc.py ../media/<clip> --grid pocket # convert one sample
+python tools/render_cc.py --help                       # options (grid, fps, audio, ...)
 pytest tests/test_media_samples.py
 python benchmarks/bench_samples.py
 ```

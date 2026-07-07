@@ -463,7 +463,8 @@ def _ytdlp_cmd(youtube_url: str, fmt: str, start: float = 0,
 
 
 def _video_ffmpeg_cmd(px_w: int, px_h: int, fps: int,
-                      source: Optional[str] = None, loop: bool = False) -> list[str]:
+                      source: Optional[str] = None, loop: bool = False,
+                      start: float = 0, duration: Optional[float] = None) -> list[str]:
     # Letterbox aligned to the 2x3 character grid: snap the scaled content to
     # even width / multiple-of-3 height and pad at even-x / multiple-of-3-y
     # offsets.  Otherwise the content edge lands mid-cell, so boundary cells mix
@@ -485,6 +486,13 @@ def _video_ffmpeg_cmd(px_w: int, px_h: int, fps: int,
     if source:                                   # decode a local (seekable) file
         if loop:                                 # --loop: replay the section forever
             cmd += ["-stream_loop", "-1"]
+        # Input-side trim: only meaningful for a file that ISN'T already cut to
+        # [start, start+duration] (a --loop / moov-at-end download already is —
+        # see iter_video's trim_start/trim_duration doc).
+        if start > 0:
+            cmd += ["-ss", f"{start:.3f}"]
+        if duration is not None:
+            cmd += ["-t", f"{duration:.3f}"]
         cmd += ["-i", source, "-map", "0:v:0"]
     else:                                        # stream from yt-dlp pipe
         cmd += ["-i", "pipe:0"]
@@ -493,7 +501,8 @@ def _video_ffmpeg_cmd(px_w: int, px_h: int, fps: int,
 
 
 def _audio_ffmpeg_cmd(sample_rate: int,
-                      source: Optional[str] = None, loop: bool = False) -> list[str]:
+                      source: Optional[str] = None, loop: bool = False,
+                      start: float = 0, duration: Optional[float] = None) -> list[str]:
     # Decode-only: the full mono downmix as raw u8 PCM at the speaker rate
     # (the wire PCM format; DFPWM, when negotiated, is packed from this in
     # Python — see dfpwm.py).  Discrete channel work lives in the multichannel
@@ -504,6 +513,10 @@ def _audio_ffmpeg_cmd(sample_rate: int,
     if source:
         if loop:
             cmd += ["-stream_loop", "-1"]
+        if start > 0:                            # see _video_ffmpeg_cmd's trim note
+            cmd += ["-ss", f"{start:.3f}"]
+        if duration is not None:
+            cmd += ["-t", f"{duration:.3f}"]
         cmd += ["-i", source, "-map", "0:a:0?"]
     else:
         cmd += ["-i", "pipe:0"]
@@ -817,6 +830,10 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
                      source_path: Optional[str] = None,
                      loop: bool = False,
                      timeline: Optional[SourceTimeline] = None,
+                     adaptive: bool = True,
+                     trim_start: float = 0,
+                     trim_duration: Optional[float] = None,
+                     gop_samples: Optional[int] = None,
                      ) -> AsyncGenerator[tuple[int, bytes], None]:
     """Yield (pts_samples, CCMF video chunk) pairs — each chunk one self-contained
     GOP (~GOP_SECONDS of palette + raw/delta/repeat units, see cc_encoder.GopEncoder).
@@ -827,12 +844,26 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
 
     source_path set => decode that local (seekable) file; loop=True replays it
     forever (--loop).  Otherwise stream from the yt-dlp pipe.
+
+    adaptive=False disables the encode-time pacer below (every source frame is
+    encoded, whatever that costs) — for an offline render where wall-clock
+    speed doesn't matter, only throughput does.
+
+    trim_start/trim_duration apply an INPUT-SIDE ffmpeg seek to `source_path`
+    (spec: `-ss`/`-t`).  These are distinct from `start`/`end`, which only
+    affect the yt-dlp fetch (pipe or section download) — a source_path that
+    came FROM a section download is already cut to [start, end], so trimming
+    it again would double-cut.  trim_start/trim_duration are for a source_path
+    the caller supplies as-is (e.g. a plain local file) and wants trimmed here.
+
+    gop_samples overrides the module's GOP_SAMPLES target when set (None keeps
+    the default).
     """
     px_w, px_h = term_w * 2, term_h * 3
     ytdlp: subprocess.Popen | None = None
     ffmpeg: subprocess.Popen | None = None
     splitter = _FrameSplitter(px_w, px_h)
-    gop = GopEncoder(gop_samples=GOP_SAMPLES,
+    gop = GopEncoder(gop_samples=GOP_SAMPLES if gop_samples is None else gop_samples,
                      nominal_duration=round(SAMPLE_RATE / fps))
     ev_loop = asyncio.get_running_loop()
     probe = _FirstPtsProbe()
@@ -846,7 +877,8 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
     try:
         if source_path:
             ffmpeg = subprocess.Popen(
-                _video_ffmpeg_cmd(px_w, px_h, fps, source=source_path, loop=loop),
+                _video_ffmpeg_cmd(px_w, px_h, fps, source=source_path, loop=loop,
+                                  start=trim_start, duration=trim_duration),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             _spawn_stderr_drain(ffmpeg, "ffmpeg", probe=probe)
@@ -902,7 +934,7 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
                 # the effective fps tracks what the CPU can actually sustain.
                 enc_ema = enc if encoded == 0 else \
                     (1 - _PACE_EMA) * enc_ema + _PACE_EMA * enc
-                next_i = idx + _encode_stride(enc_ema, fps)
+                next_i = idx + (_encode_stride(enc_ema, fps) if adaptive else 1)
                 encoded += 1
                 if done is not None:                 # this frame opened a new GOP
                     yield done
@@ -929,6 +961,9 @@ async def iter_audio(youtube_url: str, sample_rate: int = 48000,
                      source_path: Optional[str] = None,
                      loop: bool = False,
                      probe: Optional[_FirstPtsProbe] = None,
+                     trim_start: float = 0,
+                     trim_duration: Optional[float] = None,
+                     chunk_samples: Optional[int] = None,
                      ) -> AsyncGenerator[bytes, None]:
     """Yield ~AUDIO_CHUNK_SECONDS chunks of raw u8 PCM: the full mono downmix.  Codec
     packing and PTS live in iter_audio_roles — this is just the decode tap
@@ -936,14 +971,21 @@ async def iter_audio(youtube_url: str, sample_rate: int = 48000,
 
     source_path set => decode that local (seekable) file; loop=True replays it
     forever (--loop).  Otherwise stream from the yt-dlp pipe.
+
+    trim_start/trim_duration: see iter_video's doc — an input-side ffmpeg seek
+    applied only to `source_path`, distinct from `start`/`end` (the yt-dlp
+    fetch window).  chunk_samples overrides AUDIO_CHUNK_SAMPLES (None keeps
+    the default read size).
     """
     ytdlp: subprocess.Popen | None = None
     ffmpeg: subprocess.Popen | None = None
+    read_size = AUDIO_CHUNK_SAMPLES if chunk_samples is None else chunk_samples
     sent = 0
     try:
         if source_path:
             ffmpeg = subprocess.Popen(
-                _audio_ffmpeg_cmd(sample_rate, source=source_path, loop=loop),
+                _audio_ffmpeg_cmd(sample_rate, source=source_path, loop=loop,
+                                  start=trim_start, duration=trim_duration),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             )
             _spawn_stderr_drain(ffmpeg, "ffmpeg/audio", probe=probe)
@@ -963,7 +1005,7 @@ async def iter_audio(youtube_url: str, sample_rate: int = 48000,
         while True:
             timeout = _FIRST_OUTPUT_TIMEOUT if sent == 0 else _STALL_TIMEOUT
             try:
-                chunk = await _read_with_timeout(ffmpeg, AUDIO_CHUNK_SAMPLES, timeout)
+                chunk = await _read_with_timeout(ffmpeg, read_size, timeout)
             except TimeoutError:
                 log.warning("audio: no output for %ss — stopping", timeout)
                 break
@@ -981,7 +1023,8 @@ async def iter_audio(youtube_url: str, sample_rate: int = 48000,
 
 
 def _multichannel_pcm_cmd(sample_rate: int, n_channels: int,
-                          source: Optional[str] = None, loop: bool = False) -> list[str]:
+                          source: Optional[str] = None, loop: bool = False,
+                          start: float = 0, duration: Optional[float] = None) -> list[str]:
     """Raw interleaved PCM8 at n_channels, undownmixed -- ffmpeg passes discrete
     source channels through unchanged when -ac equals the source's channel
     count, which the caller guarantees (decode_channels is the probed source
@@ -990,6 +1033,10 @@ def _multichannel_pcm_cmd(sample_rate: int, n_channels: int,
     if source:
         if loop:
             cmd += ["-stream_loop", "-1"]
+        if start > 0:                            # see _video_ffmpeg_cmd's trim note
+            cmd += ["-ss", f"{start:.3f}"]
+        if duration is not None:
+            cmd += ["-t", f"{duration:.3f}"]
         cmd += ["-i", source, "-map", "0:a:0?"]
     else:
         cmd += ["-i", "pipe:0"]
@@ -1021,6 +1068,9 @@ async def iter_audio_roles(youtube_url: str, sample_rate: int, roles: list[int],
                            source_path: Optional[str] = None,
                            loop: bool = False,
                            timeline: Optional[SourceTimeline] = None,
+                           trim_start: float = 0,
+                           trim_duration: Optional[float] = None,
+                           chunk_samples: Optional[int] = None,
                            ) -> AsyncGenerator[tuple[int, dict[int, bytes]], None]:
     """Yield (pts_samples, {role: u8 PCM chunk}) covering every role in `roles`
     — the ONE audio producer a session runs, whatever its channel layout.
@@ -1048,11 +1098,17 @@ async def iter_audio_roles(youtube_url: str, sample_rate: int, roles: list[int],
     de-interleave: every role aliases the plain downmix pipeline's chunks.
     Wire-codec packing (DFPWM) is the caller's job — these chunks are the
     PCM truth.
+
+    trim_start/trim_duration/chunk_samples pass straight through to
+    iter_audio / the multichannel ffmpeg command — see iter_video's doc for
+    what trim_start/trim_duration mean (a source_path-only input seek,
+    distinct from start/end).
     """
     probe = _FirstPtsProbe()
     resolved = timeline is None
     base_off = 0
     samples = 0
+    read_size = AUDIO_CHUNK_SAMPLES if chunk_samples is None else chunk_samples
 
     async def _resolve() -> int:
         return await timeline.offset_samples("audio", await _first_pts(probe))
@@ -1060,7 +1116,9 @@ async def iter_audio_roles(youtube_url: str, sample_rate: int, roles: list[int],
     try:
         if decode_channels <= 1:
             agen = iter_audio(youtube_url, sample_rate, start, end,
-                              source_path, loop, probe=probe)
+                              source_path, loop, probe=probe,
+                              trim_start=trim_start, trim_duration=trim_duration,
+                              chunk_samples=chunk_samples)
             try:
                 async for data in agen:
                     if not resolved:
@@ -1072,14 +1130,15 @@ async def iter_audio_roles(youtube_url: str, sample_rate: int, roles: list[int],
                 await agen.aclose()
             return
 
-        frame_bytes = AUDIO_CHUNK_SAMPLES * decode_channels
+        frame_bytes = read_size * decode_channels
         ytdlp: subprocess.Popen | None = None
         ffmpeg: subprocess.Popen | None = None
         try:
             if source_path:
                 ffmpeg = subprocess.Popen(
                     _multichannel_pcm_cmd(sample_rate, decode_channels,
-                                          source=source_path, loop=loop),
+                                          source=source_path, loop=loop,
+                                          start=trim_start, duration=trim_duration),
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 )
                 _spawn_stderr_drain(ffmpeg, "ffmpeg/audio", probe=probe)
