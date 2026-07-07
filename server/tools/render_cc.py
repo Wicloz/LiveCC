@@ -84,6 +84,20 @@ from transcoder import (  # noqa: E402
 
 log = logging.getLogger("livecc")
 
+# Bound, not unbounded: video encoding (GopEncoder.add's OKLab/palette/dither
+# work) is far more CPU-expensive per second of media than audio decoding, so
+# audio routinely finishes producing chunks while video is still a small
+# fraction done (_merge_write's k-way merge is correct regardless -- it
+# always drains the globally-earliest-PTS head -- but an UNBOUNDED queue
+# would let the faster stream buffer its ENTIRE output in memory while
+# waiting for the slower one to catch up in PTS-space). At ~2s/chunk that's
+# still fine for a short clip, but the PTS field alone permits ~186-year
+# files (spec 4.2) and multi-hour loop videos are a real target, so memory
+# must stay bounded by chunk COUNT, not media duration. A producer's put()
+# simply blocks once its queue reaches this many items, until _merge_write
+# drains one -- automatic backpressure, no polling; see _render.
+_MAX_QUEUED_CHUNKS = 32
+
 # --------------------------------------------------------------------------- #
 # CLI vocabulary: grid presets (reused from cc_media) and channel layouts
 # --------------------------------------------------------------------------- #
@@ -422,8 +436,8 @@ async def _render(args: argparse.Namespace) -> int:
     gop_samples = round(args.gop_seconds * ccmf.SAMPLE_RATE)
     chunk_samples = round(args.audio_chunk_seconds * ccmf.SAMPLE_RATE)
 
-    video_q: asyncio.Queue = asyncio.Queue()
-    audio_q: asyncio.Queue = asyncio.Queue()
+    video_q: asyncio.Queue = asyncio.Queue(maxsize=_MAX_QUEUED_CHUNKS)
+    audio_q: asyncio.Queue = asyncio.Queue(maxsize=_MAX_QUEUED_CHUNKS)
     queues: dict[str, asyncio.Queue] = {}
     tasks: list[asyncio.Task] = []
 

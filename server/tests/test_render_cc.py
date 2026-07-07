@@ -207,6 +207,60 @@ def _decode(out_path):
     return [(ctype, pts) for pts, ctype, _payload in ccmf.iter_chunks(data)]
 
 
+def test_render_bounds_a_fast_producer_via_backpressure(tmp_path, monkeypatch):
+    """A stream that finishes far faster than the other (the common case:
+    audio decode is cheap, video encode is expensive) must not buffer its
+    entire output in memory while waiting -- it should block once it's built
+    up _MAX_QUEUED_CHUNKS items ahead, resuming only as _merge_write drains
+    them. Proven here by holding video to a single item (an async Event it
+    won't get past) while audio tries to race through 200, and checking how
+    many audio actually managed to produce during that stall.
+    """
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"x")
+
+    video_gate = asyncio.Event()
+    audio_yielded: list[int] = []
+
+    async def _fake_iter_video_one_then_wait(*_a, **_kw):
+        yield 0, ccmf.chunk(0, ccmf.TYPE_VIDEO, b"v0")
+        await video_gate.wait()
+        yield 999_999, ccmf.chunk(999_999, ccmf.TYPE_VIDEO, b"v1")
+
+    async def _fake_iter_audio_roles_fast_many(*_a, **_kw):
+        for i in range(200):
+            audio_yielded.append(i)
+            yield i * 1000, {0: bytes([i % 256])}
+
+    monkeypatch.setattr(render_cc, "iter_video", _fake_iter_video_one_then_wait)
+    monkeypatch.setattr(render_cc, "iter_audio_roles", _fake_iter_audio_roles_fast_many)
+
+    args = _make_args(tmp_path, clip)
+
+    async def _drive() -> int:
+        task = asyncio.ensure_future(render_cc._render(args))
+        await asyncio.sleep(0.3)  # let the event loop settle into its blocked steady-state
+        assert not task.done(), "render finished without ever needing video_gate"
+        stalled_count = len(audio_yielded)
+        # The real assertion: audio could NOT race through anywhere near all
+        # 200 items while video was stuck on its first -- only up to roughly
+        # one queue's worth (a little slack for the item already popped into
+        # _merge_write's `heads` and any in-flight coroutine step).
+        assert stalled_count < 200
+        assert stalled_count <= render_cc._MAX_QUEUED_CHUNKS + 2, (
+            f"audio produced {stalled_count} items while video was stalled -- "
+            f"backpressure isn't bounding it to ~{render_cc._MAX_QUEUED_CHUNKS}")
+
+        video_gate.set()  # let video finish; the render can now complete naturally
+        return await task
+
+    rc = asyncio.run(_drive())
+    assert rc == 0
+    entries = _decode(tmp_path / "out.ccmf")
+    assert len(entries) == 202  # 2 video + 200 audio
+    assert sorted(entries, key=lambda e: e[1]) == entries
+
+
 def test_render_merges_video_and_audio_in_pts_order(tmp_path, monkeypatch):
     clip = tmp_path / "clip.mp4"
     clip.write_bytes(b"x")
