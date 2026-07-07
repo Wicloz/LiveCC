@@ -901,9 +901,15 @@ class GopEncoder:
       * unchanged grid            -> `repeat` unit (duration only),
       * delta smaller than raw    -> `delta` unit (changed spans),
       * delta >= raw, OR a big
-        RGB-level jump (scene cut)-> fresh palette + `raw` mid-GOP, per the
-                                     spec's SHOULD; later frames delta against
-                                     the new palette.
+        RGB-level jump (scene cut)-> `raw` mid-GOP, per the spec's SHOULD,
+                                     preceded by a fresh palette unit only if
+                                     re-quantising the new frame actually
+                                     produced different colours (the palette
+                                     isn't spec-locked to the raw frame it
+                                     sits next to — Section 4.5 — so an
+                                     unchanged one is never resent); later
+                                     frames delta against whichever palette is
+                                     now in effect.
 
     The RGB check exists because grid-space deltas can't see through a
     degenerate palette: after a near-solid keyframe all 16 entries collapse to
@@ -942,6 +948,7 @@ class GopEncoder:
         self._bytes = 0                         # wire size of the open chunk
         self._w = self._h = 0
         self._tables = None                     # palette tables for delta frames
+        self._pal_bytes = None                  # last emitted palette, to skip resends
         self._prev = None                       # (glyph, fg, bg) of the last frame
         self._prev_rgb = None                   # subsampled pixels of the last frame
 
@@ -967,9 +974,10 @@ class GopEncoder:
     def _open_gop(self, pts: int, frame_rgb: np.ndarray) -> None:
         pal_rgb = generate_palette(frame_rgb)
         self._tables = _palette_tables(pal_rgb)
+        self._pal_bytes = pal_rgb.tobytes()
         self._prev = self._encode(frame_rgb, self._tables)
         self._gop_pts = pts
-        self._entries = [("pal", pal_rgb.tobytes()),
+        self._entries = [("pal", self._pal_bytes),
                          (ccmf.ENC_RAW, pts, self._prev)]   # planes packed at flush
         self._bytes = (self._CHUNK_OVERHEAD + self._PALETTE_UNIT_BYTES
                        + self._FRAME_OVERHEAD
@@ -1000,6 +1008,11 @@ class GopEncoder:
                 cut = True                       # busier than a keyframe: re-key
 
         if cut:
+            # Conservative (over-)estimate: whether the re-key actually needs a
+            # fresh palette unit isn't known until generate_palette() runs
+            # below, so this assumes the worst case.  Never undercounts, so it
+            # can only flush a hair earlier than strictly necessary, never
+            # exceed max_chunk_bytes.
             size = (self._PALETTE_UNIT_BYTES + self._FRAME_OVERHEAD
                     + ccmf.raw_planes_size(self._w, self._h))
         else:
@@ -1013,12 +1026,21 @@ class GopEncoder:
             return done
 
         if cut:
-            # Scene cut: the old palette no longer fits, so re-quantise and drop
-            # in a fresh keyframe mid-GOP (may cost a second encode; cuts are rare).
+            # Scene cut: re-quantise and drop in a fresh keyframe mid-GOP (may
+            # cost a second encode; cuts are rare).  A palette unit isn't
+            # spec-required alongside every raw frame (only the GOP's very
+            # first pair) — if content that changed enough to force a re-key
+            # still quantises to the SAME 16 colours, resending them would be
+            # pure waste, so skip the unit and reuse the existing tables.
             pal_rgb = generate_palette(frame_rgb)
-            self._tables = _palette_tables(pal_rgb)
+            pal_bytes = pal_rgb.tobytes()
+            if pal_bytes != self._pal_bytes:
+                self._tables = _palette_tables(pal_rgb)
+                self._pal_bytes = pal_bytes
+                self._entries.append(("pal", pal_bytes))
+            else:
+                size -= self._PALETTE_UNIT_BYTES
             grids = self._encode(frame_rgb, self._tables)
-            self._entries.append(("pal", pal_rgb.tobytes()))
             self._entries.append((ccmf.ENC_RAW, pts, grids))
         elif body is None:
             self._entries.append((ccmf.ENC_REPEAT, pts, b""))

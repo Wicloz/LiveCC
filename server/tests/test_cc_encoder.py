@@ -1,7 +1,8 @@
 import numpy as np
 import pytest
 
-from cc_encoder import _CC_RGB, encode_frame, generate_palette
+import ccmf
+from cc_encoder import _CC_RGB, GopEncoder, encode_frame, generate_palette
 
 # palette indices used in the assertions
 _WHITE, _LGRAY, _BLUE, _RED = 0, 8, 11, 14
@@ -122,6 +123,83 @@ def test_each_palette_color_round_trips_solid():
         glyph, _fg, bg, _pal = _enc(_solid(tuple(int(c) for c in rgb), 3, 2))
         assert glyph[0, 0] == 0x80
         assert bg[0, 0] == i, f"palette {i} did not round-trip"
+
+
+# --------------------------------------------------------------------------- #
+# GopEncoder: chunking, mid-GOP re-keys, palette resend
+# --------------------------------------------------------------------------- #
+
+_FPS = 24
+
+
+def _gop(gop_samples=ccmf.SAMPLE_RATE * 2):
+    return GopEncoder(gop_samples=gop_samples,
+                      nominal_duration=round(ccmf.SAMPLE_RATE / _FPS))
+
+
+def _decode(chunk_bytes):
+    _pts, _ctype, payload, _next = ccmf.parse_chunk(chunk_bytes)
+    return ccmf.parse_video_payload(payload)
+
+
+def test_gop_opens_with_palette_and_raw_keyframe():
+    rng = np.random.default_rng(0)
+    frame = rng.integers(0, 256, size=(20 * 3, 10 * 2, 3), dtype=np.uint8)
+    gop = _gop()
+    gop.add(0, frame)
+    _pts, chunk_bytes = gop.flush(next_pts=2000)
+    _w, _h, frames = _decode(chunk_bytes)
+    assert [f.encoding for f in frames] == [ccmf.ENC_RAW]
+
+
+def test_unchanged_frame_becomes_a_repeat_unit():
+    rng = np.random.default_rng(0)
+    frame = rng.integers(0, 256, size=(20 * 3, 10 * 2, 3), dtype=np.uint8)
+    gop = _gop()
+    gop.add(0, frame)
+    gop.add(2000, frame)              # byte-identical: no content change
+    _pts, chunk_bytes = gop.flush(next_pts=4000)
+    _w, _h, frames = _decode(chunk_bytes)
+    assert [f.encoding for f in frames] == [ccmf.ENC_RAW, ccmf.ENC_REPEAT]
+
+
+def test_scene_cut_appends_a_rekey_without_flushing_the_chunk():
+    # A big scene cut mid-GOP must land as another palette+raw pair in the
+    # SAME chunk, not force a new one -- the point of the spec's "any order
+    # after the opening pair" flexibility (Section 4.4/4.5).
+    rng = np.random.default_rng(0)
+    dark = np.zeros((20 * 3, 10 * 2, 3), dtype=np.uint8)
+    bright = rng.integers(180, 256, size=(20 * 3, 10 * 2, 3), dtype=np.uint8)
+    gop = _gop()
+    assert gop.add(0, dark) is None
+    assert gop.add(2000, bright) is None      # scene cut: must NOT flush
+    _pts, chunk_bytes = gop.flush(next_pts=4000)
+    _w, _h, frames = _decode(chunk_bytes)
+    assert [f.encoding for f in frames] == [ccmf.ENC_RAW, ccmf.ENC_RAW]
+    # The new content really did need a new palette -- confirms the resend
+    # path still fires when the colours genuinely changed.
+    assert not np.array_equal(frames[0].palette, frames[1].palette)
+
+
+def test_rekey_does_not_resend_an_unchanged_palette():
+    # generate_palette() quantises the colour HISTOGRAM, not pixel positions,
+    # so a spatial rearrange of the exact same colours forces a re-key (via
+    # the RGB scene-cut check) while reproducing byte-identical palette
+    # output.  Spec: the palette isn't locked to the raw frame beside it, so
+    # an unchanged one must not be queued twice.
+    rng = np.random.default_rng(0)
+    frame1 = rng.integers(0, 256, size=(20 * 3, 10 * 2, 3), dtype=np.uint8)
+    frame2 = np.fliplr(frame1).copy()
+    gop = _gop()
+    gop.add(0, frame1)
+    gop.add(2000, frame2)
+    pal_entries = [e for e in gop._entries if e[0] == "pal"]
+    assert len(pal_entries) == 1
+
+    _pts, chunk_bytes = gop.flush(next_pts=4000)
+    _w, _h, frames = _decode(chunk_bytes)
+    assert [f.encoding for f in frames] == [ccmf.ENC_RAW, ccmf.ENC_RAW]
+    assert np.array_equal(frames[0].palette, frames[1].palette)
 
 
 @pytest.mark.parametrize("adaptive", [False, True], ids=["fixed", "adaptive"])
