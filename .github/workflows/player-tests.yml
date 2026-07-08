@@ -1,4 +1,4 @@
-name: player tests
+name: player-tests
 
 on:
   push:
@@ -10,10 +10,13 @@ on:
       - "player/**"
       - ".github/workflows/player-tests.yml"
 
-# Cancel superseded runs on the same ref to save CI minutes. A distinct group
-# name from tests.yml's so the two workflows don't cancel each other.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref to save CI minutes; github.workflow
+# keeps the group name unique per workflow automatically.
 concurrency:
-  group: player-tests-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -23,6 +26,7 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
@@ -34,8 +38,8 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build libasound2-dev mesa-common-dev \
-            libx11-dev libxrandr-dev libxi-dev xorg-dev libgl1-mesa-dev libglu1-mesa-dev
+          sudo apt-get install -y --no-install-recommends ninja-build libasound2-dev \
+            mesa-common-dev libx11-dev libxrandr-dev libxi-dev xorg-dev libgl1-mesa-dev libglu1-mesa-dev
 
       # CMake's own "Visual Studio 17 2022" generator locates the MSVC install
       # via an internal vswhere lookup, which has proven flaky on hosted
@@ -51,7 +55,7 @@ jobs:
 
       - name: Install Ninja
         if: runner.os == 'Windows'
-        run: choco install ninja -y
+        run: choco install ninja -y --no-progress
 
       # raylib + GoogleTest are fetched fresh via CMake FetchContent (see
       # player/CMakeLists.txt); caching _deps avoids re-cloning and
@@ -63,6 +67,8 @@ jobs:
         with:
           path: player/build/_deps
           key: ${{ runner.os }}-player-deps-${{ hashFiles('player/CMakeLists.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-player-deps-
 
       - name: Configure
         working-directory: player

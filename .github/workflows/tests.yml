@@ -4,14 +4,19 @@ on:
   push:
   pull_request:
 
-# Cancel superseded runs on the same ref to save CI minutes.
+permissions:
+  contents: read
+
+# Cancel superseded runs on the same ref to save CI minutes; github.workflow
+# keeps the group name unique per workflow automatically.
 concurrency:
-  group: tests-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -34,7 +39,7 @@ jobs:
       - name: Install ffmpeg
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y --no-install-recommends ffmpeg
 
       # -dev pulls in requirements.txt plus the test-only extras (pytest,
       # httpx for the full-stack websocket tests, lupa for the Lua suite).
