@@ -23,7 +23,7 @@ Sections: `encoder` (primary), `gop`, `quality`, `samples`, `splitter`, `buffer`
 folder and self-skips when it's empty.
 
 > Looking to produce output rather than time it? That's the CCMF exporter,
-> `../tools/render_cc.py` (see `media/README.md`) — it's a dev tool, not a
+> `../tools/convert_to_ccmf.py` (see `media/README.md`) — it's a dev tool, not a
 > benchmark, so it lives outside this folder.
 
 ## What each measures
@@ -44,7 +44,7 @@ folder and self-skips when it's empty.
 Media discovery, real-frame extraction, and the reference blit *decoder* live in
 `../cc_media.py` (shared with the sample tests); `harness` re-exports them, so
 the benches still `from harness import …`. The CCMF exporter, a separate dev
-tool built on the same transcoder/encoder code, is `../tools/render_cc.py` —
+tool built on the same transcoder/encoder code, is `../tools/convert_to_ccmf.py` —
 see `media/README.md`.
 
 ## Reading the numbers

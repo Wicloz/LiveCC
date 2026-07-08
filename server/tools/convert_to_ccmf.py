@@ -1,5 +1,5 @@
 """
-render_cc — convert a media file into a .ccmf file.
+convert_to_ccmf — convert a media file into a .ccmf file.
 
 Stand-alone CLI wrapped around the *real* producer code (transcoder.py,
 cc_encoder.GopEncoder, ccmf.py, dfpwm.py): the same GOP encoding, palette
@@ -32,11 +32,11 @@ needs_download / needs_seekable_source. Live sources are rejected: an
 unbounded stream has no natural file length.
 
 Examples:
-  python tools/render_cc.py clip.mp4
-  python tools/render_cc.py clip.mp4 --grid mon7x4 --fps 30 --channels stereo
-  python tools/render_cc.py clip.mp4 --width 200                    # auto height
-  python tools/render_cc.py https://youtu.be/XXXXXXXXXXX --start 30 --duration 20
-  python tools/render_cc.py clip.mkv --audio-codec dfpwm --channels 5.1 -o out.ccmf
+  python tools/convert_to_ccmf.py clip.mp4
+  python tools/convert_to_ccmf.py clip.mp4 --grid mon7x4 --fps 30 --channels stereo
+  python tools/convert_to_ccmf.py clip.mp4 --width 200                    # auto height
+  python tools/convert_to_ccmf.py https://youtu.be/XXXXXXXXXXX --start 30 --duration 20
+  python tools/convert_to_ccmf.py clip.mkv --audio-codec dfpwm --channels 5.1 -o out.ccmf
 """
 
 from __future__ import annotations
@@ -148,18 +148,18 @@ def _resolve_grid_bound(args: argparse.Namespace) -> tuple[Optional[int], Option
     if "x" in key:
         wt, ht = key.split("x", 1)
         return int(wt), int(ht)
-    raise SystemExit(f"render_cc: bad --grid '{args.grid}' "
+    raise SystemExit(f"convert_to_ccmf: bad --grid '{args.grid}' "
                      f"(use WxH, or a preset: {', '.join(_GRID_PRESETS)})")
 
 
 def _compute_output_grid(src_w: int, src_h: int,
                          bound_w: Optional[int], bound_h: Optional[int]) -> tuple[int, int]:
     """The exact output cell grid for a source with pixel size (src_w, src_h),
-    preserving its aspect ratio with NO padding -- render_cc.py's files are
+    preserving its aspect ratio with NO padding -- convert_to_ccmf.py's files are
     played back by a player (e.g. player/) that letterboxes to its own
     window at watch time, unlike a live session's fixed grid, which a real
     CC monitor has nothing else to show in the padding of (spec: this is
-    tools/render_cc.py's own concern, not the container format's -- see
+    tools/convert_to_ccmf.py's own concern, not the container format's -- see
     transcoder._video_ffmpeg_cmd's `letterbox` parameter).
 
     Both bounds given -> the largest grid that fits inside them (computed
@@ -257,7 +257,7 @@ def _parse_channels(spec: str) -> int:
         tok = tok.strip()
         if tok not in _ROLE_NAMES:
             raise SystemExit(
-                f"render_cc: bad --channels '{tok}' "
+                f"convert_to_ccmf: bad --channels '{tok}' "
                 f"(presets: {', '.join(_CHANNEL_PRESETS)}; "
                 f"or a comma list of roles: {', '.join(_ROLE_NAMES)})")
         mask |= 1 << _ROLE_NAMES[tok]
@@ -337,22 +337,22 @@ async def _render(args: argparse.Namespace) -> int:
     want_video = not args.no_video
     want_audio = not args.no_audio
     if not want_video and not want_audio:
-        print("render_cc: nothing to render (both --no-video and --no-audio given).")
+        print("convert_to_ccmf: nothing to render (both --no-video and --no-audio given).")
         return 1
     if args.start < 0:
-        print("render_cc: --start must be >= 0.")
+        print("convert_to_ccmf: --start must be >= 0.")
         return 1
     if args.duration is not None and args.duration <= 0:
-        print("render_cc: --duration must be > 0.")
+        print("convert_to_ccmf: --duration must be > 0.")
         return 1
     if args.end is not None and args.end <= args.start:
-        print("render_cc: --end must be greater than --start.")
+        print("convert_to_ccmf: --end must be greater than --start.")
         return 1
 
     source = args.source
     is_url = not Path(source).is_file()
     if is_url and shutil.which("yt-dlp") is None:
-        print(f"render_cc: '{source}' isn't a local file, and yt-dlp isn't on PATH.")
+        print(f"convert_to_ccmf: '{source}' isn't a local file, and yt-dlp isn't on PATH.")
         return 1
 
     channels_mask = _parse_channels(args.channels) if want_audio else 0
@@ -379,7 +379,7 @@ async def _render(args: argparse.Namespace) -> int:
         if dims is not None:
             src_w, src_h = dims
         else:
-            print(f"render_cc: couldn't determine '{source}'s video dimensions; "
+            print(f"convert_to_ccmf: couldn't determine '{source}'s video dimensions; "
                  "assuming 16:9.")
             src_w, src_h = 16, 9
         w, h = _compute_output_grid(src_w, src_h, bound_w, bound_h)
@@ -403,16 +403,16 @@ async def _render(args: argparse.Namespace) -> int:
     if is_url:
         is_live, ext = await probe_source_info(source)
         if is_live:
-            print(f"render_cc: '{source}' is a live stream; render_cc only "
+            print(f"convert_to_ccmf: '{source}' is a live stream; convert_to_ccmf only "
                  "converts on-demand (VOD) sources.")
             return 1
         need_download = want_video and (needs_download(ext) or (
             needs_seekable_source(ext) and await probe_moov_at_end(source)))
         if need_download:
-            tmpdir = tempfile.mkdtemp(prefix="render_cc_")
+            tmpdir = tempfile.mkdtemp(prefix="convert_to_ccmf_")
             source_path = await download_source(source, tmpdir, args.start, end, want_audio)
             if not source_path:
-                print("render_cc: failed to download the source.")
+                print("convert_to_ccmf: failed to download the source.")
                 shutil.rmtree(tmpdir, ignore_errors=True)
                 return 1
         else:
@@ -471,7 +471,7 @@ async def _render(args: argparse.Namespace) -> int:
                     last_pts = pts
                 await video_q.put((pts, chunk))
         except Exception:
-            log.exception("render_cc: video pipeline error")
+            log.exception("convert_to_ccmf: video pipeline error")
         finally:
             if agen is not None:
                 await agen.aclose()
@@ -507,7 +507,7 @@ async def _render(args: argparse.Namespace) -> int:
                     payload = ccmf.audio_payload(codec_id, wire, channel=role)
                     await audio_q.put((pts, ccmf.chunk(pts, ccmf.TYPE_AUDIO, payload)))
         except Exception:
-            log.exception("render_cc: audio pipeline error")
+            log.exception("convert_to_ccmf: audio pipeline error")
         finally:
             if agen is not None:
                 await agen.aclose()
@@ -537,16 +537,16 @@ async def _render(args: argparse.Namespace) -> int:
 
     primary = counts.get("video", 0) if want_video else counts.get("audio", 0)
     if primary == 0:
-        print(f"render_cc: failed to produce any {'video' if want_video else 'audio'} "
+        print(f"convert_to_ccmf: failed to produce any {'video' if want_video else 'audio'} "
              "— check the source and grid/codec settings.")
         tmp_out.unlink(missing_ok=True)
         return 1
     if want_video and want_audio and counts.get("audio", 0) == 0:
-        print("render_cc: warning — no audio chunks were produced; the file has video only.")
+        print("convert_to_ccmf: warning — no audio chunks were produced; the file has video only.")
 
     tmp_out.replace(out_path)
     elapsed = time.perf_counter() - t0
-    print(f"render_cc: wrote {out_path} "
+    print(f"convert_to_ccmf: wrote {out_path} "
          f"({counts.get('video', 0)} video GOP(s), {counts.get('audio', 0)} audio chunk(s)) "
          f"in {elapsed:.1f}s")
     return 0
@@ -604,7 +604,7 @@ def build_argparser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_argparser().parse_args(argv)
     if not have_ffmpeg():
-        print("render_cc: ffmpeg not found on PATH.")
+        print("convert_to_ccmf: ffmpeg not found on PATH.")
         return 1
     if not args.verbose:
         # The per-frame ffmpeg/yt-dlp passthrough logging (transcoder.py's
@@ -615,7 +615,7 @@ def main(argv=None) -> int:
         with logging_redirect_tqdm():
             return asyncio.run(_render(args))
     except KeyboardInterrupt:
-        print("\nrender_cc: interrupted.")
+        print("\nconvert_to_ccmf: interrupted.")
         return 130
 
 

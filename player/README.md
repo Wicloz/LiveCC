@@ -22,7 +22,7 @@ src/app/      Thin raylib adapter: window, texture upload, audio streaming,
               in the tested engine, this layer just displays it.
 tests/        GoogleTest suite for src/engine (CTest-registered), plus a
               few small real .ccmf fixtures rendered with the server's
-              render_cc.py tool (some cross-checked against the Python
+              convert_to_ccmf.py tool (some cross-checked against the Python
               reference decoder in ../server).
 ```
 
@@ -68,7 +68,7 @@ Need a sample file? Render one from the repo's `server/` tooling:
 
 ```sh
 cd ../server
-python tools/render_cc.py ../media/<clip> --grid mon4x2 --fps 24 --duration 8 \
+python tools/convert_to_ccmf.py ../media/<clip> --grid mon4x2 --fps 24 --duration 8 \
     --channels stereo -o ../player/sample.ccmf
 ```
 

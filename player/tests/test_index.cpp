@@ -167,7 +167,7 @@ TEST(CcmfFile, MissingFileThrows) {
 }
 
 // Cross-check against the Python reference decoder (server/ccmf.py). This
-// fixture was rendered with `python tools/render_cc.py big_jungus.mp4
+// fixture was rendered with `python tools/convert_to_ccmf.py big_jungus.mp4
 // --grid pocket --fps 10 --duration 1.5 --channels stereo`, and the expected
 // values below are exactly what
 //   python -c "import ccmf; [print(pts, ctype, len(payload)) for pts, ctype,

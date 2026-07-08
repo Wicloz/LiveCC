@@ -478,11 +478,11 @@ def _video_ffmpeg_cmd(px_w: int, px_h: int, fps: int,
     # output frame 0 exactly — the SourceTimeline base (captured off stderr by
     # _FirstPtsProbe; rawvideo itself carries no timestamps).
     #
-    # letterbox=False (render_cc.py's standalone-file path only; every live
+    # letterbox=False (convert_to_ccmf.py's standalone-file path only; every live
     # session needs the fixed grid a real CC monitor requires) skips the pad
     # step entirely.  It also skips the fit-then-snap two-step: px_w/px_h are
     # then expected to already be the exact, aspect-correct target the caller
-    # computed from the source's own dimensions (tools/render_cc.py's
+    # computed from the source's own dimensions (tools/convert_to_ccmf.py's
     # _compute_output_grid), so a single direct scale is both simpler and
     # safer than re-deriving that fit here — it can't land a pixel off from
     # what the caller (and thus the frame splitter downstream) expects.

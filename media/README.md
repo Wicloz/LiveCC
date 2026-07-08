@@ -20,15 +20,15 @@ What picks them up:
   ffmpeg isn't installed).
 - **Benchmarks** — `server/benchmarks/bench_samples.py` measures `encode_frame`
   on real decoded frames from your samples (more representative than synthetic).
-- **CCMF exporter** — `server/tools/render_cc.py` runs a sample through the real
+- **CCMF exporter** — `server/tools/convert_to_ccmf.py` runs a sample through the real
   transcode pipeline at full speed and writes a `.ccmf` file — the same container
   a live session streams, just produced once instead of paced to a client.
 
 ```sh
 # from the repo root, after putting a clip or two in media/
 cd server
-python tools/render_cc.py ../media/<clip> --grid pocket # convert one sample
-python tools/render_cc.py --help                       # options (grid, fps, audio, ...)
+python tools/convert_to_ccmf.py ../media/<clip> --grid pocket # convert one sample
+python tools/convert_to_ccmf.py --help                       # options (grid, fps, audio, ...)
 pytest tests/test_media_samples.py
 python benchmarks/bench_samples.py
 ```

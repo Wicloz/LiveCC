@@ -1,7 +1,7 @@
 """
-render_cc CLI — argument wiring and the PTS merge/write, without needing
+convert_to_ccmf CLI — argument wiring and the PTS merge/write, without needing
 ffmpeg/yt-dlp: the async producers (iter_video / iter_audio_roles) and the
-source probes are stubbed, so this only exercises render_cc's own logic
+source probes are stubbed, so this only exercises convert_to_ccmf's own logic
 (grid/channel parsing, output-path defaulting, and interleaving finished
 video/audio chunks into one file in PTS order).
 """
@@ -15,12 +15,12 @@ from pathlib import Path
 
 import pytest
 
-_RENDER_CC = Path(__file__).resolve().parent.parent / "tools" / "render_cc.py"
-_spec = importlib.util.spec_from_file_location("render_cc", _RENDER_CC)
-render_cc = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(render_cc)
+_CONVERT_TO_CCMF = Path(__file__).resolve().parent.parent / "tools" / "convert_to_ccmf.py"
+_spec = importlib.util.spec_from_file_location("convert_to_ccmf", _CONVERT_TO_CCMF)
+convert_to_ccmf = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(convert_to_ccmf)
 
-import ccmf  # noqa: E402  (server dir already on sys.path via render_cc's import)
+import ccmf  # noqa: E402  (server dir already on sys.path via convert_to_ccmf's import)
 from cc_media import find_media  # noqa: E402
 
 
@@ -32,7 +32,7 @@ def _stub_probe_source_stats(monkeypatch):
     yt-dlp call) regardless of whether it happens to reach that code path."""
     async def _fake(*_a, **_kw):
         return (64, 48), 10.0
-    monkeypatch.setattr(render_cc, "_probe_source_stats", _fake)
+    monkeypatch.setattr(convert_to_ccmf, "_probe_source_stats", _fake)
 
 
 # --------------------------------------------------------------------------- #
@@ -40,37 +40,37 @@ def _stub_probe_source_stats(monkeypatch):
 # --------------------------------------------------------------------------- #
 
 def test_resolve_grid_bound_preset():
-    args = render_cc.build_argparser().parse_args(["clip.mp4", "--grid", "pocket"])
-    assert render_cc._resolve_grid_bound(args) == (26, 20)
+    args = convert_to_ccmf.build_argparser().parse_args(["clip.mp4", "--grid", "pocket"])
+    assert convert_to_ccmf._resolve_grid_bound(args) == (26, 20)
 
 
 def test_resolve_grid_bound_wxh():
-    args = render_cc.build_argparser().parse_args(["clip.mp4", "--grid", "40x15"])
-    assert render_cc._resolve_grid_bound(args) == (40, 15)
+    args = convert_to_ccmf.build_argparser().parse_args(["clip.mp4", "--grid", "40x15"])
+    assert convert_to_ccmf._resolve_grid_bound(args) == (40, 15)
 
 
 def test_resolve_grid_bound_width_only_has_no_height_bound():
     # Giving --width alone means "derive height from aspect ratio", NOT
     # "keep --grid's default height" -- see _resolve_grid_bound's doc.
-    args = render_cc.build_argparser().parse_args(["clip.mp4", "--width", "100"])
-    assert render_cc._resolve_grid_bound(args) == (100, None)
+    args = convert_to_ccmf.build_argparser().parse_args(["clip.mp4", "--width", "100"])
+    assert convert_to_ccmf._resolve_grid_bound(args) == (100, None)
 
 
 def test_resolve_grid_bound_height_only():
-    args = render_cc.build_argparser().parse_args(["clip.mp4", "--height", "40"])
-    assert render_cc._resolve_grid_bound(args) == (None, 40)
+    args = convert_to_ccmf.build_argparser().parse_args(["clip.mp4", "--height", "40"])
+    assert convert_to_ccmf._resolve_grid_bound(args) == (None, 40)
 
 
 def test_resolve_grid_bound_width_and_height_ignores_grid():
-    args = render_cc.build_argparser().parse_args(
+    args = convert_to_ccmf.build_argparser().parse_args(
         ["clip.mp4", "--grid", "pocket", "--width", "10", "--height", "5"])
-    assert render_cc._resolve_grid_bound(args) == (10, 5)
+    assert convert_to_ccmf._resolve_grid_bound(args) == (10, 5)
 
 
 def test_resolve_grid_bound_bad_spec():
-    args = render_cc.build_argparser().parse_args(["clip.mp4", "--grid", "bogus"])
+    args = convert_to_ccmf.build_argparser().parse_args(["clip.mp4", "--grid", "bogus"])
     with pytest.raises(SystemExit):
-        render_cc._resolve_grid_bound(args)
+        convert_to_ccmf._resolve_grid_bound(args)
 
 
 # --------------------------------------------------------------------------- #
@@ -80,19 +80,19 @@ def test_resolve_grid_bound_bad_spec():
 def test_compute_output_grid_both_bounds_fits_inside_landscape():
     # A 16:9 source is narrower (per cell aspect) than a 51x19 bound, so
     # height is the constraining dimension and width comes out under 51.
-    assert render_cc._compute_output_grid(1920, 1080, 51, 19) == (50, 19)
+    assert convert_to_ccmf._compute_output_grid(1920, 1080, 51, 19) == (50, 19)
 
 
 def test_compute_output_grid_both_bounds_fits_inside_portrait():
-    assert render_cc._compute_output_grid(1080, 1920, 51, 19) == (16, 19)
+    assert convert_to_ccmf._compute_output_grid(1080, 1920, 51, 19) == (16, 19)
 
 
 def test_compute_output_grid_width_only_derives_height():
-    assert render_cc._compute_output_grid(1920, 1080, 100, None) == (100, 38)
+    assert convert_to_ccmf._compute_output_grid(1920, 1080, 100, None) == (100, 38)
 
 
 def test_compute_output_grid_height_only_derives_width():
-    assert render_cc._compute_output_grid(1920, 1080, None, 40) == (107, 40)
+    assert convert_to_ccmf._compute_output_grid(1920, 1080, None, 40) == (107, 40)
 
 
 def test_compute_output_grid_square_source_and_bound():
@@ -100,17 +100,17 @@ def test_compute_output_grid_square_source_and_bound():
     # square cell grid: width is the constraining bound here (scale=0.4 from
     # width; 0.6 from height), landing exactly on it while height comes out
     # under its own bound.
-    assert render_cc._compute_output_grid(100, 100, 20, 20) == (20, 13)
+    assert convert_to_ccmf._compute_output_grid(100, 100, 20, 20) == (20, 13)
 
 
 def test_compute_output_grid_rejects_no_bounds():
     with pytest.raises(ValueError):
-        render_cc._compute_output_grid(1920, 1080, None, None)
+        convert_to_ccmf._compute_output_grid(1920, 1080, None, None)
 
 
 def test_compute_output_grid_rejects_bad_source_dims():
     with pytest.raises(ValueError):
-        render_cc._compute_output_grid(0, 1080, 51, 19)
+        convert_to_ccmf._compute_output_grid(0, 1080, 51, 19)
 
 
 # --------------------------------------------------------------------------- #
@@ -125,7 +125,7 @@ _VIDEO_SAMPLES = find_media("video") if _HAS_FFPROBE else []
 @pytest.mark.skipif(not _VIDEO_SAMPLES, reason="no media/ video samples or ffprobe not installed")
 def test_probe_source_stats_blocking_reads_real_dimensions_and_duration():
     sample = _VIDEO_SAMPLES[0]
-    dims, duration = render_cc._probe_source_stats_blocking(str(sample), is_url=False)
+    dims, duration = convert_to_ccmf._probe_source_stats_blocking(str(sample), is_url=False)
 
     assert dims is not None
     w, h = dims
@@ -136,37 +136,37 @@ def test_probe_source_stats_blocking_reads_real_dimensions_and_duration():
 
 
 def test_probe_source_stats_blocking_missing_file_returns_none_none():
-    dims, duration = render_cc._probe_source_stats_blocking(
+    dims, duration = convert_to_ccmf._probe_source_stats_blocking(
         "definitely_not_a_real_file.mp4", is_url=False)
     assert dims is None
     assert duration is None
 
 
 def test_parse_channels_presets():
-    assert render_cc._parse_channels("mono") == ccmf.CAP_CHANNEL_MONO
-    assert render_cc._parse_channels("STEREO") == (
+    assert convert_to_ccmf._parse_channels("mono") == ccmf.CAP_CHANNEL_MONO
+    assert convert_to_ccmf._parse_channels("STEREO") == (
         ccmf.CAP_CHANNEL_FRONT_LEFT | ccmf.CAP_CHANNEL_FRONT_RIGHT)
 
 
 def test_parse_channels_custom_roles():
-    assert render_cc._parse_channels("fl,fr,lfe") == (
+    assert convert_to_ccmf._parse_channels("fl,fr,lfe") == (
         ccmf.CAP_CHANNEL_FRONT_LEFT | ccmf.CAP_CHANNEL_FRONT_RIGHT
         | ccmf.CAP_CHANNEL_LFE)
 
 
 def test_parse_channels_bad_role():
     with pytest.raises(SystemExit):
-        render_cc._parse_channels("fl,nonsense")
+        convert_to_ccmf._parse_channels("fl,nonsense")
 
 
 def test_sanitize_filename_strips_unsafe_chars():
-    assert render_cc._sanitize_filename('a/b:c*d"e') == "a_b_c_d_e"
+    assert convert_to_ccmf._sanitize_filename('a/b:c*d"e') == "a_b_c_d_e"
 
 
 def test_default_out_local_file(tmp_path):
     clip = tmp_path / "clip.mp4"
     clip.write_bytes(b"x")
-    assert render_cc._default_out(str(clip), is_url=False) == clip.with_suffix(".ccmf")
+    assert convert_to_ccmf._default_out(str(clip), is_url=False) == clip.with_suffix(".ccmf")
 
 
 # --------------------------------------------------------------------------- #
@@ -178,7 +178,7 @@ def _make_args(tmp_path, clip, extra=None):
             "--fps", "10"]
     if extra:
         argv += extra
-    return render_cc.build_argparser().parse_args(argv)
+    return convert_to_ccmf.build_argparser().parse_args(argv)
 
 
 async def _fake_iter_video_ok(*a, **kw):
@@ -232,13 +232,13 @@ def test_render_bounds_a_fast_producer_via_backpressure(tmp_path, monkeypatch):
             audio_yielded.append(i)
             yield i * 1000, {0: bytes([i % 256])}
 
-    monkeypatch.setattr(render_cc, "iter_video", _fake_iter_video_one_then_wait)
-    monkeypatch.setattr(render_cc, "iter_audio_roles", _fake_iter_audio_roles_fast_many)
+    monkeypatch.setattr(convert_to_ccmf, "iter_video", _fake_iter_video_one_then_wait)
+    monkeypatch.setattr(convert_to_ccmf, "iter_audio_roles", _fake_iter_audio_roles_fast_many)
 
     args = _make_args(tmp_path, clip)
 
     async def _drive() -> int:
-        task = asyncio.ensure_future(render_cc._render(args))
+        task = asyncio.ensure_future(convert_to_ccmf._render(args))
         await asyncio.sleep(0.3)  # let the event loop settle into its blocked steady-state
         assert not task.done(), "render finished without ever needing video_gate"
         stalled_count = len(audio_yielded)
@@ -247,9 +247,9 @@ def test_render_bounds_a_fast_producer_via_backpressure(tmp_path, monkeypatch):
         # one queue's worth (a little slack for the item already popped into
         # _merge_write's `heads` and any in-flight coroutine step).
         assert stalled_count < 200
-        assert stalled_count <= render_cc._MAX_QUEUED_CHUNKS + 2, (
+        assert stalled_count <= convert_to_ccmf._MAX_QUEUED_CHUNKS + 2, (
             f"audio produced {stalled_count} items while video was stalled -- "
-            f"backpressure isn't bounding it to ~{render_cc._MAX_QUEUED_CHUNKS}")
+            f"backpressure isn't bounding it to ~{convert_to_ccmf._MAX_QUEUED_CHUNKS}")
 
         video_gate.set()  # let video finish; the render can now complete naturally
         return await task
@@ -264,11 +264,11 @@ def test_render_bounds_a_fast_producer_via_backpressure(tmp_path, monkeypatch):
 def test_render_merges_video_and_audio_in_pts_order(tmp_path, monkeypatch):
     clip = tmp_path / "clip.mp4"
     clip.write_bytes(b"x")
-    monkeypatch.setattr(render_cc, "iter_video", _fake_iter_video_ok)
-    monkeypatch.setattr(render_cc, "iter_audio_roles", _fake_iter_audio_roles_ok)
+    monkeypatch.setattr(convert_to_ccmf, "iter_video", _fake_iter_video_ok)
+    monkeypatch.setattr(convert_to_ccmf, "iter_audio_roles", _fake_iter_audio_roles_ok)
 
     args = _make_args(tmp_path, clip)
-    rc = asyncio.run(render_cc._render(args))
+    rc = asyncio.run(convert_to_ccmf._render(args))
     assert rc == 0
 
     out_path = tmp_path / "out.ccmf"
@@ -281,11 +281,11 @@ def test_render_merges_video_and_audio_in_pts_order(tmp_path, monkeypatch):
 def test_render_no_video_produces_error(tmp_path, monkeypatch):
     clip = tmp_path / "clip.mp4"
     clip.write_bytes(b"x")
-    monkeypatch.setattr(render_cc, "iter_video", _fake_iter_video_empty)
-    monkeypatch.setattr(render_cc, "iter_audio_roles", _fake_iter_audio_roles_ok)
+    monkeypatch.setattr(convert_to_ccmf, "iter_video", _fake_iter_video_empty)
+    monkeypatch.setattr(convert_to_ccmf, "iter_audio_roles", _fake_iter_audio_roles_ok)
 
     args = _make_args(tmp_path, clip)
-    rc = asyncio.run(render_cc._render(args))
+    rc = asyncio.run(convert_to_ccmf._render(args))
     assert rc == 1
     assert not (tmp_path / "out.ccmf").exists()
 
@@ -293,11 +293,11 @@ def test_render_no_video_produces_error(tmp_path, monkeypatch):
 def test_render_audio_only_warns_but_succeeds(tmp_path, monkeypatch, capsys):
     clip = tmp_path / "clip.mp4"
     clip.write_bytes(b"x")
-    monkeypatch.setattr(render_cc, "iter_video", _fake_iter_video_ok)
-    monkeypatch.setattr(render_cc, "iter_audio_roles", _fake_iter_audio_roles_empty)
+    monkeypatch.setattr(convert_to_ccmf, "iter_video", _fake_iter_video_ok)
+    monkeypatch.setattr(convert_to_ccmf, "iter_audio_roles", _fake_iter_audio_roles_empty)
 
     args = _make_args(tmp_path, clip)
-    rc = asyncio.run(render_cc._render(args))
+    rc = asyncio.run(convert_to_ccmf._render(args))
     assert rc == 0
     assert (tmp_path / "out.ccmf").exists()
     assert "warning" in capsys.readouterr().out.lower()
@@ -307,7 +307,7 @@ def test_render_rejects_both_streams_disabled(tmp_path):
     clip = tmp_path / "clip.mp4"
     clip.write_bytes(b"x")
     args = _make_args(tmp_path, clip, extra=["--no-video", "--no-audio"])
-    rc = asyncio.run(render_cc._render(args))
+    rc = asyncio.run(convert_to_ccmf._render(args))
     assert rc == 1
 
 
@@ -315,13 +315,13 @@ def test_render_rejects_bad_time_range(tmp_path):
     clip = tmp_path / "clip.mp4"
     clip.write_bytes(b"x")
     args = _make_args(tmp_path, clip, extra=["--start", "5", "--end", "3"])
-    rc = asyncio.run(render_cc._render(args))
+    rc = asyncio.run(convert_to_ccmf._render(args))
     assert rc == 1
 
 
 def test_main_requires_ffmpeg(monkeypatch, tmp_path):
     clip = tmp_path / "clip.mp4"
     clip.write_bytes(b"x")
-    monkeypatch.setattr(render_cc, "have_ffmpeg", lambda: False)
-    rc = render_cc.main([str(clip)])
+    monkeypatch.setattr(convert_to_ccmf, "have_ffmpeg", lambda: False)
+    rc = convert_to_ccmf.main([str(clip)])
     assert rc == 1
