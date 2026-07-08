@@ -174,7 +174,8 @@ class StreamSession:
                  end: Optional[float] = None, loop: bool = False,
                  rate: int = 48000, audio_codec=PCM,
                  caps_channels: int = ccmf.CAP_CHANNEL_MONO,
-                 dynamic_channels: bool = False) -> None:
+                 dynamic_channels: bool = False,
+                 compression: int = ccmf.COMPRESSION_NONE) -> None:
         self.url = url
         self.w, self.h, self.fps = w, h, fps
         self.want_audio = want_audio
@@ -183,6 +184,7 @@ class StreamSession:
         self.codec = audio_codec
         self.requested_channels = caps_channels
         self.dynamic_channels = dynamic_channels
+        self.compression = compression                   # payload compression (spec §4.1.2)
         self.source_channels = 1                         # probed in run() if needed
         self._codec_id = ccmf.CODEC_PCM8 if audio_codec.name == "pcm" \
             else ccmf.CODEC_DFPWM
@@ -307,7 +309,7 @@ class StreamSession:
             agen = iter_video(self.url, self.w, self.h, self.fps,
                               start=self._start_eff, end=self._end_eff,
                               source_path=self._source_path, loop=self.loop,
-                              timeline=self._timeline)
+                              timeline=self._timeline, compression=self.compression)
             # iter_video yields finished CCMF GOP chunks tagged with their first
             # frame's PTS in samples (already on the shared timeline); it may
             # skip source frames to keep up (adaptive pacing) — so trust its
@@ -356,7 +358,8 @@ class StreamSession:
                         data = wire
                     chunk = ccmf.chunk(pts, ccmf.TYPE_AUDIO,
                                        ccmf.audio_payload(self._codec_id, data,
-                                                          channel=role))
+                                                          channel=role),
+                                       compression=self.compression)
                     await buf.put(pts / self.rate, chunk)
         except Exception:
             log.exception("audio producer failed (roles=%s)", self.producible_roles)

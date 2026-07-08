@@ -939,8 +939,10 @@ class GopEncoder:
 
     def __init__(self, gop_samples: int = ccmf.SAMPLE_RATE,
                  nominal_duration: int = 2000,
-                 max_chunk_bytes: int = 96 * 1024) -> None:
+                 max_chunk_bytes: int = 96 * 1024,
+                 compression: int = ccmf.COMPRESSION_NONE) -> None:
         self.gop_samples = gop_samples          # target GOP span (default 1 s)
+        self.compression = compression          # payload compression (spec §4.1.2)
         self.nominal_duration = min(nominal_duration, ccmf.MAX_DURATION)
         self.max_chunk_bytes = max_chunk_bytes  # stay under CC's 128 KiB ws cap
         self._entries: list[tuple] = []         # ("pal", bytes) | (enc, pts, body)
@@ -1102,7 +1104,8 @@ class GopEncoder:
                 units.append(ccmf.repeat_frame_unit(duration))
 
         payload = ccmf.video_payload(self._w, self._h, b"".join(units))
-        out = (self._gop_pts, ccmf.chunk(self._gop_pts, ccmf.TYPE_VIDEO, payload))
+        out = (self._gop_pts, ccmf.chunk(self._gop_pts, ccmf.TYPE_VIDEO, payload,
+                                         compression=self.compression))
         self._entries = []
         return out
 

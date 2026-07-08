@@ -315,6 +315,19 @@ def test_gop_opens_with_palette_and_raw_keyframe():
     assert frames[0].duration == 2000                   # nominal at end of stream
 
 
+def test_gop_encoder_lz4_produces_decodable_chunk():
+    # A GopEncoder built with LZ4 emits chunks whose compression byte is set and
+    # whose payload inflates back to a normal video GOP (parse_chunk decompresses).
+    enc = GopEncoder(gop_samples=48000, nominal_duration=2000,
+                     compression=ccmf.COMPRESSION_LZ4)
+    enc.add(0, _solid_frame((200, 40, 40), 6, 4))
+    chunk = enc.flush()[1]
+    assert chunk[11] == ccmf.COMPRESSION_LZ4
+    pts, (w, h, frames) = _decode_chunk(chunk)
+    assert (pts, w, h) == (0, 6, 4)
+    assert frames[0].encoding == ccmf.ENC_RAW
+
+
 def test_gop_repeats_identical_frames_and_deltas_small_changes():
     # The base carries both colours, so the GOP palette can represent the change
     # (a solid base would quantise to 16 copies of one colour, and the changed

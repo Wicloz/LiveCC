@@ -9,7 +9,7 @@ the decode side.
 1. Container Format — self-describing chunks:
        [marker 1B][PTS u48][length u24][type u8][compression u8][payload]
    PTS is absolute in 48 kHz samples; `compression` compresses the whole payload of
-   any type (0 = none only; deflate/lz4/zstd deferred).  A video payload is a
+   any type (none + LZ4 §4.1.2; deflate/zstd deferred for native clients).  A video payload is a
    self-contained GOP ([w u16][h u16] + a unit stream); an audio payload is
    [a-hdr u8] + samples.
 
@@ -39,7 +39,10 @@ SAMPLE_RATE = 48000              # PTS/duration unit: 48 kHz samples
 TYPE_VIDEO = 0
 TYPE_AUDIO = 1
 
-COMPRESSION_NONE = 0             # deflate/lz4/zstd are deferred
+COMPRESSION_NONE = 0
+COMPRESSION_DEFLATE = 1          # deferred (native clients only)
+COMPRESSION_LZ4 = 2              # spec §4.1.2: [uncompressed size u32 LE][raw LZ4 block]
+COMPRESSION_ZSTD = 3            # deferred (native clients only)
 
 # Frame-unit encodings (unit flags bits 6-4).
 ENC_RAW = 0
@@ -67,12 +70,40 @@ _CHUNK_HEADER = 12               # marker + PTS + length + type + compression
 # Chunk framing
 # --------------------------------------------------------------------------- #
 
+def compress_payload(payload: bytes, compression: int) -> bytes:
+    """Apply chunk-payload compression (spec §4.1.2).  LZ4 wraps the payload as
+    [uncompressed size u32 LE][raw LZ4 block]; `none` is a passthrough.  deflate/
+    zstd are reserved for native clients and not produced here."""
+    if compression == COMPRESSION_NONE:
+        return payload
+    if compression == COMPRESSION_LZ4:
+        import lz4.block                       # lazy: `none` path needs no lz4
+        return (len(payload).to_bytes(4, "little")
+                + lz4.block.compress(payload, store_size=False))
+    raise ValueError(f"unsupported compression {compression}")
+
+
+def decompress_payload(data: bytes, compression: int) -> bytes:
+    """Inverse of compress_payload."""
+    if compression == COMPRESSION_NONE:
+        return data
+    if compression == COMPRESSION_LZ4:
+        import lz4.block
+        if len(data) < 4:
+            raise ValueError("truncated LZ4 payload")
+        size = int.from_bytes(data[:4], "little")
+        return lz4.block.decompress(data[4:], uncompressed_size=size)
+    raise ValueError(f"unsupported compression {compression}")
+
+
 def chunk(pts: int, ctype: int, payload: bytes,
           compression: int = COMPRESSION_NONE) -> bytes:
     """One container chunk.  `pts` is absolute 48 kHz samples (u48).  `compression`
-    (spec §4.1.2) applies to the whole payload; only COMPRESSION_NONE is built."""
+    (spec §4.1.2) is applied to the payload here; `length` counts the resulting
+    on-wire bytes."""
     if not 0 <= pts < 1 << 48:
         raise ValueError(f"PTS out of u48 range: {pts}")
+    payload = compress_payload(payload, compression)
     if len(payload) >= 1 << 24:
         raise ValueError(f"payload exceeds u24 length: {len(payload)}")
     # struct has no u48/u24, so build the header explicitly.
@@ -94,12 +125,11 @@ def parse_chunk(buf: bytes, offset: int = 0) -> tuple[int, int, bytes, int]:
     length = int.from_bytes(buf[offset + 7:offset + 10], "little")
     ctype = buf[offset + 10]
     compression = buf[offset + 11]
-    if compression != COMPRESSION_NONE:
-        raise ValueError(f"unsupported compression {compression}")
     end = offset + _CHUNK_HEADER + length
     if end > len(buf):
         raise ValueError("truncated chunk payload")
-    return pts, ctype, buf[offset + _CHUNK_HEADER:end], end
+    payload = decompress_payload(buf[offset + _CHUNK_HEADER:end], compression)
+    return pts, ctype, payload, end
 
 
 def iter_chunks(buf: bytes) -> Iterator[tuple[int, int, bytes]]:
@@ -390,7 +420,8 @@ def parse_status(body: bytes) -> tuple[int, Optional[int]]:
 # CAPS bitmask values.
 CAP_AUDIO_PCM8 = 0x01
 CAP_AUDIO_DFPWM = 0x02
-CAP_COMPRESS_NONE = 0x01
+CAP_COMPRESS_NONE = 1 << COMPRESSION_NONE     # 0x01, mandatory
+CAP_COMPRESS_LZ4 = 1 << COMPRESSION_LZ4       # 0x04
 # channels: bit N = accepts channel role N (spec §5.4, roles per §4.6).
 CAP_CHANNEL_MONO = 1 << CHANNEL_MONO
 CAP_CHANNEL_FRONT_LEFT = 1 << CHANNEL_FRONT_LEFT

@@ -589,3 +589,49 @@ def test_verbose_is_silenced_when_terminal_is_the_display():
     lines = p.console_lines()
     assert not any(l.startswith("LiveCC: [video]") or l.startswith("LiveCC: [audio]")
                    for l in lines)
+
+
+# --------------------------------------------------------------------------- #
+# LZ4 payload compression (spec §4.1.2)
+# --------------------------------------------------------------------------- #
+
+def test_lz4_decompress_matches_python():
+    # The Lua block decoder must invert the server's lz4.block compressor for
+    # arbitrary payloads — both ends are pinned to the same block format.
+    import lz4.block
+    p = load_player()
+    rng = np.random.default_rng(3)
+    samples = [b"", b"A", b"ab" * 300, bytes(range(256)) * 30,
+               bytes(rng.integers(0, 256, 6000, dtype=np.uint8)),
+               bytes(48) + bytes(rng.integers(0, 256, 4000, dtype=np.uint8))]
+    for raw in samples:
+        block = lz4.block.compress(raw, store_size=False)
+        assert bytes(p.lz4_decompress(block)) == raw, f"len={len(raw)}"
+
+
+def test_lz4_video_chunk_decodes_like_raw():
+    # An LZ4-compressed video GOP must queue the same units as the raw GOP.
+    glyph = np.full((1, 2), 0x81, np.uint8)
+    fg = np.full((1, 2), 1, np.uint8)
+    bg = np.zeros((1, 2), np.uint8)
+    payload = ccmf.video_payload(2, 1, ccmf.palette_unit(bytes(48))
+                                 + ccmf.raw_frame_unit(2000, glyph, fg, bg))
+    raw = ccmf.chunk(0, ccmf.TYPE_VIDEO, payload)
+    comp = ccmf.chunk(0, ccmf.TYPE_VIDEO, payload, compression=ccmf.COMPRESSION_LZ4)
+    assert comp[11] == ccmf.COMPRESSION_LZ4 and raw[11] == ccmf.COMPRESSION_NONE
+
+    def queued(chunk_bytes):
+        pl = load_player()
+        pl.anchor(0)
+        pl.handle_message(chunk_bytes)
+        return list(pl.get_vqueue().values())
+
+    assert len(queued(comp)) == len(queued(raw)) > 0
+
+
+def test_caps_advertises_lz4_compression():
+    # The client's CAPS compress bitmask must set none (bit0) and lz4 (bit2).
+    p = load_player()
+    caps = next(b for b in p.sent() if b and b[0] == ccmf.OP_CAPS)
+    _op, body = ccmf.parse_message(caps)
+    assert ccmf.parse_caps(body).compress_mask & ccmf.CAP_COMPRESS_LZ4

@@ -323,6 +323,43 @@ local function u48(s, i)
     return b1 + b2 * 2 ^ 8 + b3 * 2 ^ 16 + b4 * 2 ^ 24 + b5 * 2 ^ 32 + b6 * 2 ^ 40
 end
 
+-- LZ4 block decompressor (spec §4.1.2): pure Lua, byte-oriented, no bit ops.
+-- `block` is the raw LZ4 sequence data (our [size u32] wrapper already stripped);
+-- decode runs until the compressed input is consumed.
+local function lz4_decompress(block)
+    local byte, char = string.byte, string.char
+    local unpack = table.unpack or unpack
+    local out = {}                       -- decoded bytes (numbers), 1-indexed
+    local o, i, n = 0, 1, #block
+    while i <= n do
+        local token = byte(block, i); i = i + 1
+        local lit = floor(token / 16)                 -- literal run length
+        if lit == 15 then
+            local b
+            repeat b = byte(block, i); i = i + 1; lit = lit + b until b ~= 255
+        end
+        for k = 0, lit - 1 do out[o + 1 + k] = byte(block, i + k) end
+        o, i = o + lit, i + lit
+        if i > n then break end                       -- last sequence: literals only
+        local off = byte(block, i) + byte(block, i + 1) * 256; i = i + 2
+        local mlen = token % 16                        -- match length - 4
+        if mlen == 15 then
+            local b
+            repeat b = byte(block, i); i = i + 1; mlen = mlen + b until b ~= 255
+        end
+        mlen = mlen + 4
+        local src = o - off                            -- overlap-safe byte copy
+        for k = 1, mlen do out[o + k] = out[src + k] end
+        o = o + mlen
+    end
+    local parts, p = {}, 0                             -- assemble in char-safe blocks
+    for j = 1, o, 256 do
+        p = p + 1
+        parts[p] = char(unpack(out, j, math.min(j + 255, o)))
+    end
+    return table.concat(parts)
+end
+
 local function pack_u16(v)
     return string.char(v % 256, floor(v / 256) % 256)
 end
@@ -373,7 +410,7 @@ local function caps_body()
         .. string.char(0)                -- video: no optional encodings yet
         .. string.char(3)                -- audio: pcm8 + dfpwm both decodable
         .. pack_u16(channels_mask())
-        .. string.char(1)                -- compression: none only
+        .. string.char(5)                -- compression: none + lz4 (bits 0,2)
         .. pack_u16(TERM_W) .. pack_u16(TERM_H) .. string.char(fps)
 end
 
@@ -956,8 +993,12 @@ local function handle_message(msg)
         local ctype = msg:byte(11)
         local compression = msg:byte(12)
         local payload = msg:sub(13)
+        if compression == 2 then                     -- LZ4 (spec §4.1.2): [size u32][block]
+            payload = lz4_decompress(payload:sub(5))
+        elseif compression ~= 0 then
+            return                                    -- deflate/zstd: not decodable on CC
+        end
         if VERBOSE then verbose_chunk(pts, length, ctype, compression, payload) end
-        if compression ~= 0 then return end                    -- compressed payloads deferred (CC = none)
         if ctype == TYPE_VIDEO and WANT_VIDEO then
             if not anchor_pts then set_anchor(pts) end   -- draft-00 fallback
             queue_video(pts, payload)
@@ -1118,6 +1159,7 @@ if _LIVECC_TEST then
         get_anchor = function() return anchor_pts, anchor_ms end,
         -- wire handling
         handle_message = handle_message,
+        lz4_decompress = lz4_decompress,
         -- audio engine
         feed_roles = feed_roles,
         audio_pending = audio_pending,

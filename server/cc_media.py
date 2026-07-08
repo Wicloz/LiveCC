@@ -108,7 +108,8 @@ def find_media(stream: str | None = None) -> list[Path]:
     files = [p for p in sorted(MEDIA_DIR.iterdir())
              if p.is_file()
              and not p.name.startswith(".")          # .gitignore and other dotfiles
-             and p.name.lower() != "readme.md"]
+             and p.name.lower() != "readme.md"
+             and p.suffix.lower() != ".ccmf"]         # our OUTPUT format, not a source clip
     if stream is None:
         return files
     return [p for p in files if stream in media_streams(p)]

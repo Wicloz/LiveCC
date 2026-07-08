@@ -357,6 +357,7 @@ async def _render(args: argparse.Namespace) -> int:
 
     channels_mask = _parse_channels(args.channels) if want_audio else 0
     codec_id = ccmf.CODEC_PCM8 if args.audio_codec == "pcm" else ccmf.CODEC_DFPWM
+    compression = ccmf.COMPRESSION_LZ4 if args.compression == "lz4" else ccmf.COMPRESSION_NONE
     roles = negotiate_channel_roles(channels_mask) if want_audio else []
 
     end = args.end
@@ -464,7 +465,7 @@ async def _render(args: argparse.Namespace) -> int:
                               source_path=source_path, timeline=timeline,
                               adaptive=False, trim_start=trim_start,
                               trim_duration=trim_duration, gop_samples=gop_samples,
-                              letterbox=False)
+                              letterbox=False, compression=compression)
             async for pts, chunk in agen:
                 if video_bar is not None:
                     video_bar.update(max(0.0, (pts - last_pts) / ccmf.SAMPLE_RATE))
@@ -505,7 +506,8 @@ async def _render(args: argparse.Namespace) -> int:
                             wire = await ev_loop.run_in_executor(None, dfpwm.encode, data)
                             encoded[data] = wire
                     payload = ccmf.audio_payload(codec_id, wire, channel=role)
-                    await audio_q.put((pts, ccmf.chunk(pts, ccmf.TYPE_AUDIO, payload)))
+                    await audio_q.put((pts, ccmf.chunk(pts, ccmf.TYPE_AUDIO, payload,
+                                                       compression=compression)))
         except Exception:
             log.exception("convert_to_ccmf: audio pipeline error")
         finally:
@@ -588,6 +590,10 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--audio-codec", choices=["pcm", "dfpwm"], default="pcm",
                     help="wire audio codec (default: pcm; dfpwm trades fidelity "
                          "for ~8x less space)")
+    ap.add_argument("--compression", choices=["none", "lz4"], default="none",
+                    help="per-chunk payload compression (spec §4.1.2): none "
+                         "(default), or lz4 — smaller files that the CC client and "
+                         "the C++ player both decode")
     ap.add_argument("--channels", default="mono",
                     help=f"speaker layout: {', '.join(_CHANNEL_PRESETS)}, or a "
                          f"comma list of roles ({', '.join(_ROLE_NAMES)}) (default: mono)")

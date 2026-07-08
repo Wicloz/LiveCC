@@ -178,6 +178,11 @@ def _negotiate(room: ccmf.Room, caps: ccmf.Caps) -> Optional[dict]:
                   and bool(caps.channels & ccmf.CAP_CHANNEL_MONO))
     if not caps.want_video and not want_audio:
         return None
+    # Opportunistic payload compression: use LZ4 when the client advertises it
+    # (the only compression a CC client can inflate, spec §4.1.2), else none.
+    compression = (ccmf.COMPRESSION_LZ4
+                   if caps.compress_mask & ccmf.CAP_COMPRESS_LZ4
+                   else ccmf.COMPRESSION_NONE)
     return {
         "url": room.url,
         "w": _clamp(caps.width, 51, 1, 500),
@@ -190,6 +195,7 @@ def _negotiate(room: ccmf.Room, caps: ccmf.Caps) -> Optional[dict]:
         "loop": room.loop,
         "audio_codec": codec or PCM,
         "caps_channels": caps.channels,
+        "compression": compression,
     }
 
 
@@ -209,6 +215,7 @@ def _sync_signature(kwargs: dict) -> tuple:
         kwargs["want_audio"],
         kwargs["want_video"],
         kwargs["audio_codec"].name,
+        kwargs["compression"],
     )
 
 

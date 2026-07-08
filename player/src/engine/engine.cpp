@@ -42,9 +42,13 @@ void PlaybackEngine::SelectAudioChannel() {
     std::vector<ChunkEntry> mono, left, right;
     for (const ChunkEntry& entry : file_.AudioChunks()) {
         try {
-            const auto header = file_.ReadChunkPayloadRange(entry, 0, 1);
-            const auto channel =
-                static_cast<std::uint8_t>(std::to_integer<std::uint8_t>(header[0]) & 0x0F);
+            // The a-hdr is the first payload byte; a compressed payload must be
+            // inflated first (its leading bytes are the LZ4 wrapper, not a-hdr).
+            const auto payloadHead = entry.compression == kCompressionNone
+                ? file_.ReadChunkPayloadRange(entry, 0, 1)
+                : file_.ReadChunkPayload(entry);
+            const auto channel = static_cast<std::uint8_t>(
+                std::to_integer<std::uint8_t>(payloadHead[0]) & 0x0F);
             if (channel == kChannelMono) {
                 mono.push_back(entry);
             } else if (channel == kChannelFrontLeft) {

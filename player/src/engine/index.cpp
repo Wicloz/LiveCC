@@ -83,7 +83,10 @@ std::vector<std::byte> CcmfFile::ReadChunkPayloadRange(const ChunkEntry& entry,
 }
 
 std::vector<std::byte> CcmfFile::ReadChunkPayload(const ChunkEntry& entry) const {
-    return ReadChunkPayloadRange(entry, 0, entry.length);
+    // ReadChunkPayloadRange returns on-wire (possibly compressed) bytes; the
+    // type decoders expect the raw payload, so inflate here (spec 4.1.2).
+    return DecompressPayload(ReadChunkPayloadRange(entry, 0, entry.length),
+                             entry.compression);
 }
 
 }  // namespace ccmfplayer

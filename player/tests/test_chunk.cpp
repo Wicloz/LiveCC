@@ -55,9 +55,39 @@ TEST(ParseChunkHeader, BadMarkerThrows) {
     EXPECT_THROW((void)ParseChunkHeader(bytes), CcmfError);
 }
 
-TEST(ParseChunkHeader, UnsupportedCompressionThrows) {
+TEST(ParseChunkHeader, RecordsCompressionWithoutRejecting) {
+    // Compression is recorded, not validated, so indexing can still walk a file
+    // using an algorithm this build can't decode (spec 4.1). Rejection happens
+    // later, in DecompressPayload.
     auto bytes = BuildChunk(0, kChunkTypeVideo, MakeBytes({1, 2, 3}), /*compression=*/1);
-    EXPECT_THROW((void)ParseChunkHeader(bytes), CcmfError);
+    EXPECT_EQ(ParseChunkHeader(bytes).compression, 1u);
+}
+
+TEST(DecompressPayload, NoneIsPassthrough) {
+    const auto payload = MakeBytes({1, 2, 3, 4, 5});
+    EXPECT_EQ(DecompressPayload(payload, kCompressionNone), payload);
+}
+
+TEST(DecompressPayload, Lz4RoundTripsServerVector) {
+    // Wire bytes = server lz4.block.compress + our u32 size prefix (spec 4.1.2);
+    // must inflate to the original. Exercises extended literal/match lengths and
+    // an overlapping back-reference.
+    const auto wire = MakeBytes({62, 0, 0, 0, 255, 6, 84, 104, 101, 32, 113, 117,
+                                 105, 99, 107, 32, 98, 114, 111, 119, 110, 32, 102,
+                                 111, 120, 46, 32, 21, 0, 17, 80, 32, 102, 111, 120,
+                                 46});
+    const auto expected = MakeBytes({84, 104, 101, 32, 113, 117, 105, 99, 107, 32,
+                                     98, 114, 111, 119, 110, 32, 102, 111, 120, 46,
+                                     32, 84, 104, 101, 32, 113, 117, 105, 99, 107,
+                                     32, 98, 114, 111, 119, 110, 32, 102, 111, 120,
+                                     46, 32, 84, 104, 101, 32, 113, 117, 105, 99,
+                                     107, 32, 98, 114, 111, 119, 110, 32, 102, 111,
+                                     120, 46});
+    EXPECT_EQ(DecompressPayload(wire, kCompressionLz4), expected);
+}
+
+TEST(DecompressPayload, UnsupportedAlgorithmThrows) {
+    EXPECT_THROW((void)DecompressPayload(MakeBytes({1, 2, 3}), /*deflate=*/1), CcmfError);
 }
 
 }  // namespace

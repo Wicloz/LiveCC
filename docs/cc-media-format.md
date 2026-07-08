@@ -126,18 +126,27 @@ with wide margin.
 
 #### 4.1.2. Compression
 
-`compression` selects a payload-wide compression applied uniformly to **any** chunk
-type: `0` none · `1` deflate · `2` lz4 · `3` zstd. `[ED: deferred — CC decodes
-`0` only for now.]` The whole payload is compressed as one blob; the consumer
-inflates it before dispatching by `type`, so type-specific decoders never handle
-compression.
+`compression` selects a payload-wide compression applied uniformly to **any**
+chunk type: `0` none · `1` deflate · `2` lz4 · `3` zstd. The whole payload is
+compressed as one blob; the consumer inflates it before dispatching by `type`,
+so type-specific decoders never handle compression. Formats:
+
+- **`none`** — the payload is the raw bytes.
+- **`lz4`** — the payload is `[uncompressed size u32 LE][raw LZ4 block]`: read
+  the size, LZ4-block-decode the remainder into it, then interpret the result
+  per `type`. (Raw block = the standard LZ4 sequence format; no frame header.)
+- **`deflate` / `zstd`** — reserved, native-client only, and **not yet
+  produced**. Only `lz4` is realistically decodable on a CC/Lua client (it is
+  byte-oriented; CC has no native bit ops, and its WebSocket can't offload via
+  permessage-deflate).
 
 It is chosen **per chunk**, so a producer compresses what benefits (a video
-GOP's redundant `delta` frames, PCM8 audio, subtitle text) and leaves the rest
-`none`. Per-frame/per-unit compression is deliberately not offered — small deltas
-compress poorly in isolation, and the chunk is already the random-access unit. A
-client advertises what it can inflate via the CAPS `compress` bitmask
-(Section 5.4); a server **MUST** use only advertised algorithms.
+GOP's redundant `delta` frames, PCM8 audio) and leaves the rest `none`. Per-
+frame/per-unit compression is deliberately not offered — small deltas compress
+poorly in isolation, and the chunk is already the random-access unit. A client
+advertises what it can inflate via the CAPS `compress` bitmask (Section 5.4);
+a server **MUST** use only advertised algorithms, so a CC member never receives
+one it can't decode.
 
 ### 4.2. Timestamps
 

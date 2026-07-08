@@ -848,6 +848,7 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
                      trim_duration: Optional[float] = None,
                      gop_samples: Optional[int] = None,
                      letterbox: bool = True,
+                     compression: int = 0,          # ccmf.COMPRESSION_NONE
                      ) -> AsyncGenerator[tuple[int, bytes], None]:
     """Yield (pts_samples, CCMF video chunk) pairs — each chunk one self-contained
     GOP (~GOP_SECONDS of palette + raw/delta/repeat units, see cc_encoder.GopEncoder).
@@ -884,7 +885,8 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
     ffmpeg: subprocess.Popen | None = None
     splitter = _FrameSplitter(px_w, px_h)
     gop = GopEncoder(gop_samples=GOP_SAMPLES if gop_samples is None else gop_samples,
-                     nominal_duration=round(SAMPLE_RATE / fps))
+                     nominal_duration=round(SAMPLE_RATE / fps),
+                     compression=compression)
     ev_loop = asyncio.get_running_loop()
     probe = _FirstPtsProbe()
     base_off = 0                # samples; resolved against timeline at first frame

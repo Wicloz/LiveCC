@@ -171,7 +171,15 @@ def test_negotiate_defaults_prefer_pcm():
         "loop": True,
         "audio_codec": PCM,
         "caps_channels": ccmf.CAP_CHANNEL_MONO,
+        "compression": ccmf.COMPRESSION_NONE,   # default caps advertise none only
     }
+
+
+def test_negotiate_picks_lz4_when_advertised():
+    room = ccmf.parse_room(ccmf.build_room("u"))
+    caps = ccmf.parse_caps(ccmf.build_caps(
+        compress_mask=ccmf.CAP_COMPRESS_NONE | ccmf.CAP_COMPRESS_LZ4))
+    assert main._negotiate(room, caps)["compression"] == ccmf.COMPRESSION_LZ4
 
 
 def test_negotiate_falls_back_to_dfpwm():

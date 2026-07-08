@@ -103,7 +103,7 @@ def _ended(bins):
 
 def _patch(monkeypatch, n_video, n_audio, is_live, ext="webm", moov_at_end=True):
     async def fake_video(url, w, h, fps, start=0, end=None, source_path=None,
-                         loop=False, timeline=None):
+                         loop=False, timeline=None, compression=0):
         # iter_video yields (pts_samples, GOP chunk); one fake chunk per "GOP"
         for i in range(n_video):
             pts = round(i * ccmf.SAMPLE_RATE / fps)
@@ -179,6 +179,21 @@ def test_audio_chunks_carry_sample_pts_and_codec(monkeypatch):
     assert ptss == [0, 4096, 8192]      # PCM: 1 byte/sample -> running sample index
 
 
+def test_audio_chunks_compressed_when_lz4_negotiated(monkeypatch):
+    # A session created with LZ4 emits audio chunks whose compression byte is
+    # set; parse_chunk still inflates them to the same PCM samples.
+    _patch(monkeypatch, n_video=0, n_audio=3, is_live=False)
+    ws = FakeWS()
+    s = StreamSession("u", w=4, h=2, fps=50, want_audio=True, want_video=False,
+                      compression=ccmf.COMPRESSION_LZ4)
+    run(s.run(ws))
+    auds = _auds(ws.bins)
+    assert auds and all(a[11] == ccmf.COMPRESSION_LZ4 for a in auds)
+    _pts, _t, payload, _ = ccmf.parse_chunk(auds[0])
+    codec, _channel, data = ccmf.parse_audio_payload(payload)
+    assert codec == ccmf.CODEC_PCM8 and len(data) == 4096
+
+
 def test_stereo_map_produces_both_channel_roles(monkeypatch):
     # A client whose CAPS ask for just a front_left+front_right pair (no mono),
     # against a (fake) 2-channel source, gets one independent audio stream per
@@ -210,7 +225,7 @@ def _patch_offset_audio(monkeypatch, video_secs, audio_start_s, audio_secs):
     # Video from pts 0 (a --start section's keyframe pre-roll); audio content
     # beginning `audio_start_s` later, chunks of 0.1 s.
     async def fake_video(url, w, h, fps, start=0, end=None, source_path=None,
-                         loop=False, timeline=None):
+                         loop=False, timeline=None, compression=0):
         for i in range(video_secs):
             pts = i * ccmf.SAMPLE_RATE
             yield pts, ccmf.chunk(pts, ccmf.TYPE_VIDEO, b"\x00" * 16)
@@ -317,7 +332,7 @@ def test_reconfigure_channels_adds_and_removes_roles_live(monkeypatch):
     # the session timeline), and roles nobody wants anymore stop being served
     # (buffer closed) without tearing anything else down.
     async def fake_video(url, w, h, fps, start=0, end=None, source_path=None,
-                         loop=False, timeline=None):
+                         loop=False, timeline=None, compression=0):
         if False:
             yield 0, b""
 
@@ -401,7 +416,7 @@ def test_live_skip_reannounces_clock(monkeypatch):
     jump = 30 * ccmf.SAMPLE_RATE
 
     async def fake_video(url, w, h, fps, start=0, end=None, source_path=None,
-                         loop=False, timeline=None):
+                         loop=False, timeline=None, compression=0):
         if False:
             yield 0, b""
 
@@ -487,7 +502,7 @@ def test_live_audio_flows_despite_unaligned_skewed_pipelines(monkeypatch):
 
     def make_fakes(use_timeline):
         async def fake_video(url, w, h, fps, start=0, end=None, source_path=None,
-                             loop=False, timeline=None):
+                             loop=False, timeline=None, compression=0):
             ev = asyncio.get_running_loop()
             await asyncio.sleep(video_delay)
             off = (await timeline.offset_samples("video", None)) if use_timeline else 0
@@ -775,7 +790,7 @@ def test_cancel_finalizes_producer_generator(monkeypatch):
     closed = {"video": False}
 
     async def fake_video(url, w, h, fps, start=0, end=None, source_path=None,
-                         loop=False, timeline=None):
+                         loop=False, timeline=None, compression=0):
         i = 0
         try:
             while True:
@@ -787,7 +802,7 @@ def test_cancel_finalizes_producer_generator(monkeypatch):
             closed["video"] = True
 
     async def fake_audio(url, rate, roles, decode_channels=1, start=0, end=None,
-                         source_path=None, loop=False, timeline=None):
+                         source_path=None, loop=False, timeline=None, compression=0):
         if False:
             yield 0, {}
 

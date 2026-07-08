@@ -5,6 +5,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace ccmfplayer {
 
@@ -25,6 +26,11 @@ inline constexpr std::size_t kChunkHeaderSize = 12;
 // constants instead of switching over a closed set.
 inline constexpr std::uint8_t kChunkTypeVideo = 0;
 inline constexpr std::uint8_t kChunkTypeAudio = 1;
+
+// Compression values (spec 4.1.2). Only `none` and `lz4` are decodable here;
+// `deflate`/`zstd` are reserved for other native clients and rejected on decode.
+inline constexpr std::uint8_t kCompressionNone = 0;
+inline constexpr std::uint8_t kCompressionLz4 = 2;
 
 // Thrown for anything that makes a chunk (or a whole file) unreadable: a bad
 // marker, a truncated header/payload, unsupported compression, or a
@@ -51,5 +57,12 @@ struct ChunkHeader {
 // validates the marker and (for now) that compression is "none". Throws
 // CcmfError on a truncated buffer, a bad marker, or unsupported compression.
 [[nodiscard]] ChunkHeader ParseChunkHeader(std::span<const std::byte> buf);
+
+// Decompresses a chunk payload per its `compression` byte (spec 4.1.2). `none`
+// is a straight copy; `lz4` expects [uncompressed size u32 LE][raw LZ4 block]
+// and inflates it. Throws CcmfError on an unsupported algorithm or malformed
+// data. Callers then interpret the result per the chunk `type`.
+[[nodiscard]] std::vector<std::byte> DecompressPayload(
+    std::span<const std::byte> payload, std::uint8_t compression);
 
 }  // namespace ccmfplayer
