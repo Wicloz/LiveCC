@@ -10,9 +10,9 @@ Pure stdlib + numpy (already a server dependency). No extra installs.
 
 ```sh
 # from the server/ directory
-python benchmarks/run_all.py              # everything
-python benchmarks/run_all.py encoder      # one or more sections
-python benchmarks/run_all.py --profile    # add the encoder + gop cProfile dumps
+python tools/run_benchmarks.py              # everything
+python tools/run_benchmarks.py encoder      # one or more sections
+python tools/run_benchmarks.py --profile    # add the encoder + gop cProfile dumps
 
 # or a single module directly
 python benchmarks/bench_encoder.py

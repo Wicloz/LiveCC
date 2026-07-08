@@ -1,9 +1,9 @@
 """
 Run the whole benchmark suite.
 
-  python benchmarks/run_all.py            # everything
-  python benchmarks/run_all.py encoder    # one or more sections by name
-  python benchmarks/run_all.py --profile  # add the encoder + gop cProfile dumps
+  python tools/run_benchmarks.py            # everything
+  python tools/run_benchmarks.py encoder    # one or more sections by name
+  python tools/run_benchmarks.py --profile  # add the encoder + gop cProfile dumps
 
 Sections: encoder (primary), gop, quality, samples, splitter, buffer, startup.
 ("samples" needs clips in media/ and ffmpeg; it self-skips otherwise.)
@@ -12,6 +12,12 @@ Sections: encoder (primary), gop, quality, samples, splitter, buffer, startup.
 from __future__ import annotations
 
 import sys
+from pathlib import Path
+
+# The bench_*/harness modules live in ../benchmarks, not next to this script.
+_BENCHMARKS_DIR = Path(__file__).resolve().parent.parent / "benchmarks"
+if str(_BENCHMARKS_DIR) not in sys.path:
+    sys.path.insert(0, str(_BENCHMARKS_DIR))
 
 import harness  # noqa: F401  (puts the server dir on sys.path)
 

@@ -20,7 +20,7 @@ Three differences from the live path:
   * No letterboxing. A live session pads to a FIXED grid because a real CC
     monitor has nothing else to show in the unpadded area; a stored file is
     watched back by a player that letterboxes to its own window instead (see
-    ccmf-player/), so baking black bars into the pixel data here would just
+    player/), so baking black bars into the pixel data here would just
     waste cells. --grid (or --width/--height) is a BOUND the output fits
     inside preserving the source's own aspect ratio, not an exact target —
     see _compute_output_grid.
@@ -156,7 +156,7 @@ def _compute_output_grid(src_w: int, src_h: int,
                          bound_w: Optional[int], bound_h: Optional[int]) -> tuple[int, int]:
     """The exact output cell grid for a source with pixel size (src_w, src_h),
     preserving its aspect ratio with NO padding -- render_cc.py's files are
-    played back by a player (e.g. ccmf-player) that letterboxes to its own
+    played back by a player (e.g. player/) that letterboxes to its own
     window at watch time, unlike a live session's fixed grid, which a real
     CC monitor has nothing else to show in the padding of (spec: this is
     tools/render_cc.py's own concern, not the container format's -- see
