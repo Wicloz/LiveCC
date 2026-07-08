@@ -18,10 +18,40 @@ concurrency:
 
 jobs:
   build-and-test:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v4
+
+      # raylib needs its windowing/GL/audio dev headers on Linux; Windows has
+      # no equivalent step (raylib pulls in the Win32/OpenGL libs it needs
+      # itself). Package list per raylib's own Linux build instructions.
+      - name: Install raylib build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libasound2-dev mesa-common-dev \
+            libx11-dev libxrandr-dev libxi-dev xorg-dev libgl1-mesa-dev libglu1-mesa-dev
+
+      # CMake's own "Visual Studio 17 2022" generator locates the MSVC install
+      # via an internal vswhere lookup, which has proven flaky on hosted
+      # Windows runners ("could not find any instance of Visual Studio", even
+      # though one is present) depending on which cmake.exe wins on PATH among
+      # the runner's many bundled toolchains. Loading cl.exe/link.exe onto
+      # PATH directly via vcvarsall sidesteps that lookup entirely, so Ninja
+      # (which just needs a compiler on PATH, no VS-instance detection) can be
+      # used on both platforms with identical configure/build/test commands.
+      - name: Set up MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Ninja
+        if: runner.os == 'Windows'
+        run: choco install ninja -y
 
       # raylib + GoogleTest are fetched fresh via CMake FetchContent (see
       # player/CMakeLists.txt); caching _deps avoids re-cloning and
@@ -34,17 +64,14 @@ jobs:
           path: player/build/_deps
           key: ${{ runner.os }}-player-deps-${{ hashFiles('player/CMakeLists.txt') }}
 
-      # windows-latest ships CMake and Visual Studio 2022 preinstalled; the
-      # "Visual Studio 17 2022" generator lets CMake locate the MSVC toolset
-      # itself, no vcvars/Developer-Prompt setup needed.
       - name: Configure
         working-directory: player
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
 
       - name: Build
         working-directory: player
-        run: cmake --build build --config Debug -j 4
+        run: cmake --build build -j 4
 
       - name: Test
         working-directory: player/build
-        run: ctest -C Debug --output-on-failure
+        run: ctest --output-on-failure
