@@ -44,4 +44,13 @@ std::string FormatTimecode(std::uint64_t pts) {
     return out.str();
 }
 
+int TargetFpsForFrameDuration(std::uint16_t durationSamples, int fallbackFps) noexcept {
+    if (durationSamples == 0) {
+        return fallbackFps;
+    }
+    const double fps = static_cast<double>(kSampleRate) / static_cast<double>(durationSamples);
+    const int rounded = static_cast<int>(fps + 0.5);
+    return std::clamp(rounded, 1, 240);
+}
+
 }  // namespace ccmfplayer

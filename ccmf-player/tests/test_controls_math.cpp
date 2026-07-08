@@ -100,5 +100,36 @@ TEST(FormatTimecode, TruncatesPartialSeconds) {
     EXPECT_EQ(FormatTimecode(5 * kSampleRate + kSampleRate / 2), "0:05");
 }
 
+// --------------------------------------------------------------------------
+// TargetFpsForFrameDuration
+// --------------------------------------------------------------------------
+
+TEST(TargetFpsForFrameDuration, CommonFrameRatesRoundTripExactly) {
+    EXPECT_EQ(TargetFpsForFrameDuration(2000, 60), 24);  // 48000/2000 = 24
+    EXPECT_EQ(TargetFpsForFrameDuration(1600, 60), 30);  // 48000/1600 = 30
+    EXPECT_EQ(TargetFpsForFrameDuration(1920, 60), 25);  // 48000/1920 = 25
+    EXPECT_EQ(TargetFpsForFrameDuration(800, 60), 60);   // 48000/800 = 60
+}
+
+TEST(TargetFpsForFrameDuration, RoundsToNearestWholeFps) {
+    // 48000/2001 = 23.988..., should round to 24, not truncate to 23.
+    EXPECT_EQ(TargetFpsForFrameDuration(2001, 60), 24);
+}
+
+TEST(TargetFpsForFrameDuration, ZeroDurationReturnsFallback) {
+    EXPECT_EQ(TargetFpsForFrameDuration(0, 60), 60);
+    EXPECT_EQ(TargetFpsForFrameDuration(0, 24), 24);
+}
+
+TEST(TargetFpsForFrameDuration, ClampsPathologicallyHighFps) {
+    // duration=1 sample -> 48000 fps, clamped down to the cap.
+    EXPECT_EQ(TargetFpsForFrameDuration(1, 60), 240);
+}
+
+TEST(TargetFpsForFrameDuration, ClampsPathologicallyLowFpsToAtLeastOne) {
+    // duration at the spec's u16 max (~1.36s hold) -> under 1 fps, clamped up.
+    EXPECT_EQ(TargetFpsForFrameDuration(65535, 60), 1);
+}
+
 }  // namespace
 }  // namespace ccmfplayer

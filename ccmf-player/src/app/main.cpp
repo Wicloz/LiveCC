@@ -9,9 +9,14 @@
 #include "app/audio_output.hpp"
 #include "app/ui.hpp"
 #include "app/video_view.hpp"
+#include "engine/controls_math.hpp"
 #include "engine/engine.hpp"
 
 namespace {
+
+// Used before any video frame is available to pace against (no video track,
+// or nothing decoded yet) -- see TargetFpsForFrameDuration.
+constexpr int kFallbackFps = 60;
 
 // --selftest draws exactly one frame and exits 0 immediately, so the app can
 // be smoke-tested from a script without a human at the window (no real
@@ -43,19 +48,17 @@ int main(int argc, char** argv) {
 
     InitWindow(960, 540, "CCMF Player");
     InitAudioDevice();
+
+    // The render loop's target rate tracks the file's OWN video cadence
+    // (recomputed every tick from CurrentFrame()->duration, not cached per
+    // chunk -- spec 4.5 makes duration a per-frame field, so different GOPs
+    // in the same file aren't required to share one frame rate). Starts at
+    // the fallback so the pre-load usage/error screen (no engine, so the
+    // per-tick recompute below never runs) still paces sanely instead of
+    // spinning uncapped.
+    int currentTargetFps = kFallbackFps;
     if (!selfTest) {
-        // Mouse/keyboard state is sampled once per loop iteration (raylib
-        // polls it inside EndDrawing()); a full press+release cycle
-        // delivered within one iteration's window is invisible to every
-        // frame that runs afterward, no matter how the button code is
-        // written. A too-low frame rate is what turns a fast click into
-        // "nothing happened" -- some mouse utilities (reported: Kensington
-        // Konnect) synthesize clicks fast enough to fall inside a 60fps
-        // (~16.6ms) window. 240fps (~4.2ms) shrinks that window well below
-        // any observed synthesized-click duration; the video's own frame
-        // rate is unrelated (paced by PlaybackEngine's PTS clock, not by
-        // how often this loop redraws).
-        SetTargetFPS(240);
+        SetTargetFPS(currentTargetFps);
     }
 
     std::unique_ptr<ccmfplayer::PlaybackEngine> engine;
@@ -110,6 +113,18 @@ int main(int argc, char** argv) {
             }
             if (audioOutput) {
                 audioOutput->Refill(*engine);
+            }
+
+            if (!selfTest) {
+                int desiredFps = kFallbackFps;
+                if (const ccmfplayer::Frame* frame = engine->CurrentFrame()) {
+                    desiredFps = ccmfplayer::TargetFpsForFrameDuration(frame->duration,
+                                                                       kFallbackFps);
+                }
+                if (desiredFps != currentTargetFps) {
+                    SetTargetFPS(desiredFps);
+                    currentTargetFps = desiredFps;
+                }
             }
         }
 

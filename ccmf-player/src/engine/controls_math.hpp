@@ -27,4 +27,19 @@ namespace ccmfplayer {
 // common media-player convention).
 [[nodiscard]] std::string FormatTimecode(std::uint64_t pts);
 
+// Converts a frame's hold duration (spec 4.5's `duration`, 48 kHz samples)
+// to a render-loop target frame rate: the app paces its window (and, with
+// it, how often raylib polls input) to match whatever the *currently
+// playing* video content actually needs, rather than a fixed guess -- a
+// file's chunks aren't required to share one frame rate (spec 4.5: duration
+// is per-frame), so this is meant to be recomputed from CurrentFrame()
+// every tick, not cached across a chunk boundary.
+//
+// Returns `fallbackFps` for a zero duration (shouldn't happen for a real
+// frame, but a zero would otherwise divide by zero), and clamps the result
+// to [1, 240] so a pathological near-zero or huge duration value can't ask
+// the window for an unusable target.
+[[nodiscard]] int TargetFpsForFrameDuration(std::uint16_t durationSamples,
+                                            int fallbackFps) noexcept;
+
 }  // namespace ccmfplayer
