@@ -1,4 +1,4 @@
-# ccmf-player
+# player
 
 A stand-alone desktop media player for local `.ccmf` files ([CCMF](../docs/cc-media-format.md),
 the ComputerCraft Media Format LiveCC streams to CC:Tweaked terminals). Built
@@ -55,13 +55,13 @@ cmake --build build -j 8
 > first thing in this project to touch `_Exit`/`quick_exit`). This is a
 > toolchain packaging issue, not a project one — if you hit it, either use
 > MSVC for the test target or a UCRT-consistent MinGW distribution; the
-> `ccmf_player` app itself is unaffected either way.
+> `player` app itself is unaffected either way.
 
 ## Running
 
 ```sh
-build/src/app/Debug/ccmf_player.exe path/to/clip.ccmf     # MSVC (Debug config)
-build/src/app/ccmf_player.exe path/to/clip.ccmf            # MinGW
+build/src/app/Debug/player.exe path/to/clip.ccmf     # MSVC (Debug config)
+build/src/app/player.exe path/to/clip.ccmf            # MinGW
 ```
 
 Need a sample file? Render one from the repo's `server/` tooling:
@@ -69,7 +69,7 @@ Need a sample file? Render one from the repo's `server/` tooling:
 ```sh
 cd ../server
 python tools/render_cc.py ../media/<clip> --grid mon4x2 --fps 24 --duration 8 \
-    --channels stereo -o ../ccmf-player/sample.ccmf
+    --channels stereo -o ../player/sample.ccmf
 ```
 
 ### Controls
@@ -91,7 +91,7 @@ ctest -C Debug --output-on-failure     # MSVC
 ctest --output-on-failure              # MinGW
 ```
 
-Coverage (GCC/Clang only): configure with `-DCCMF_PLAYER_COVERAGE=ON` to add
+Coverage (GCC/Clang only): configure with `-DPLAYER_COVERAGE=ON` to add
 `--coverage` instrumentation to `ccmf_engine` (verified it compiles/links
 cleanly on its own); run the tests and inspect the `.gcda`/`.gcno` output
 with `gcov` (ships with GCC) or `pip install gcovr` for an HTML/summary

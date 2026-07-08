@@ -44,7 +44,7 @@ std::atomic<unsigned> gTempFileCounter{0};
 TempFile::TempFile(std::span<const std::byte> bytes) {
     const unsigned id = gTempFileCounter.fetch_add(1, std::memory_order_relaxed);
     path_ = std::filesystem::temp_directory_path()
-            / ("ccmf_player_test_" + std::to_string(id) + ".ccmf");
+            / ("player_test_" + std::to_string(id) + ".ccmf");
     std::ofstream out(path_, std::ios::binary | std::ios::trunc);
     out.write(reinterpret_cast<const char*>(bytes.data()),
                static_cast<std::streamsize>(bytes.size()));

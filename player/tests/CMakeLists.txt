@@ -9,7 +9,7 @@ add_executable(ccmf_engine_tests
     test_controls_math.cpp
 )
 
-target_link_libraries(ccmf_engine_tests PRIVATE ccmf_engine GTest::gtest_main ccmf_player_warnings)
+target_link_libraries(ccmf_engine_tests PRIVATE ccmf_engine GTest::gtest_main player_warnings)
 
 # Fixtures (small .ccmf files + expected-output vectors) are read relative to
 # this directory at test run time.

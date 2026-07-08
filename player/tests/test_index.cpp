@@ -161,7 +161,7 @@ TEST(CcmfFile, MissingFileThrows) {
     // rather than a fictitious drive letter -- an unmapped drive letter can
     // make Windows spend several seconds probing it before failing.
     const auto missing =
-        std::filesystem::temp_directory_path() / "ccmf_player_missing_file_test.ccmf";
+        std::filesystem::temp_directory_path() / "player_missing_file_test.ccmf";
     std::filesystem::remove(missing);
     EXPECT_THROW(CcmfFile{missing}, CcmfError);
 }

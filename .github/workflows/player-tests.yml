@@ -1,19 +1,19 @@
-name: ccmf-player tests
+name: player tests
 
 on:
   push:
     paths:
-      - "ccmf-player/**"
-      - ".github/workflows/ccmf-player-tests.yml"
+      - "player/**"
+      - ".github/workflows/player-tests.yml"
   pull_request:
     paths:
-      - "ccmf-player/**"
-      - ".github/workflows/ccmf-player-tests.yml"
+      - "player/**"
+      - ".github/workflows/player-tests.yml"
 
 # Cancel superseded runs on the same ref to save CI minutes. A distinct group
 # name from tests.yml's so the two workflows don't cancel each other.
 concurrency:
-  group: ccmf-player-tests-${{ github.ref }}
+  group: player-tests-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -24,27 +24,27 @@ jobs:
       - uses: actions/checkout@v4
 
       # raylib + GoogleTest are fetched fresh via CMake FetchContent (see
-      # ccmf-player/CMakeLists.txt); caching _deps avoids re-cloning and
+      # player/CMakeLists.txt); caching _deps avoids re-cloning and
       # rebuilding both from scratch on every run, which otherwise dominates
       # the job's time. Keyed on the top-level CMakeLists.txt, which pins
       # their versions -- a version bump naturally invalidates the cache.
       - name: Cache FetchContent dependencies
         uses: actions/cache@v4
         with:
-          path: ccmf-player/build/_deps
-          key: ${{ runner.os }}-ccmf-player-deps-${{ hashFiles('ccmf-player/CMakeLists.txt') }}
+          path: player/build/_deps
+          key: ${{ runner.os }}-player-deps-${{ hashFiles('player/CMakeLists.txt') }}
 
       # windows-latest ships CMake and Visual Studio 2022 preinstalled; the
       # "Visual Studio 17 2022" generator lets CMake locate the MSVC toolset
       # itself, no vcvars/Developer-Prompt setup needed.
       - name: Configure
-        working-directory: ccmf-player
+        working-directory: player
         run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 
       - name: Build
-        working-directory: ccmf-player
+        working-directory: player
         run: cmake --build build --config Debug -j 4
 
       - name: Test
-        working-directory: ccmf-player/build
+        working-directory: player/build
         run: ctest -C Debug --output-on-failure

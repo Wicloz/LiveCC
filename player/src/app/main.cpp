@@ -65,7 +65,7 @@ int main(int argc, char** argv) {
     std::unique_ptr<ccmfplayer::VideoView> videoView;
     std::unique_ptr<ccmfplayer::AudioOutput> audioOutput;
     ccmfplayer::PlayerControls controls;
-    std::string statusText = "usage: ccmf_player <path-to-file.ccmf>";
+    std::string statusText = "usage: player <path-to-file.ccmf>";
 
     if (path != nullptr) {
         try {
