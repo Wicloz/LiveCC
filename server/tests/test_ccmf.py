@@ -143,12 +143,15 @@ def test_delta_spans_never_cross_rows():
 
 
 def test_repeat_unit_and_palette_only_change():
+    # A pure recolour (e.g. a fade) needs no NEW cell content -- but it still
+    # needs a frame unit right after the palette to give it an effective time
+    # (spec §4.4/§4.5): here that's a `repeat`, so the screen recolours with
+    # no redraw.
     w, h = 4, 2
     g = _grids(w, h)
     pal1, pal2 = bytes(48), bytes(range(48))
     units = (ccmf.palette_unit(pal1) + ccmf.raw_frame_unit(100, *g)
-             + ccmf.palette_unit(pal2)          # e.g. a fade: palette, no frame
-             + ccmf.repeat_frame_unit(200))
+             + ccmf.palette_unit(pal2) + ccmf.repeat_frame_unit(200))
     _w, _h, frames = ccmf.parse_video_payload(ccmf.video_payload(w, h, units))
     assert [f.encoding for f in frames] == [ccmf.ENC_RAW, ccmf.ENC_REPEAT]
     assert frames[0].palette.tobytes() == pal1
@@ -160,6 +163,27 @@ def test_video_payload_must_not_end_with_palette():
     units = ccmf.palette_unit(bytes(48))
     with pytest.raises(ValueError):
         ccmf.parse_video_payload(ccmf.video_payload(2, 2, units))
+
+
+def test_video_payload_must_not_end_with_palette_after_a_valid_frame():
+    # The bare "only a palette" case above isn't the only way to end on one --
+    # a dangling palette AFTER legitimate frames is just as undefined (spec
+    # §4.4): it has no frame to borrow an effective time from.
+    w, h = 4, 2
+    g = _grids(w, h)
+    units = (ccmf.palette_unit(bytes(48)) + ccmf.raw_frame_unit(100, *g)
+             + ccmf.palette_unit(bytes(range(48))))
+    with pytest.raises(ValueError):
+        ccmf.parse_video_payload(ccmf.video_payload(w, h, units))
+
+
+def test_video_payload_palette_must_not_be_followed_by_another_palette():
+    w, h = 4, 2
+    g = _grids(w, h)
+    units = (ccmf.palette_unit(bytes(48)) + ccmf.palette_unit(bytes(range(48)))
+             + ccmf.raw_frame_unit(100, *g))
+    with pytest.raises(ValueError):
+        ccmf.parse_video_payload(ccmf.video_payload(w, h, units))
 
 
 def test_audio_payload_roundtrip():

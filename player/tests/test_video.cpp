@@ -16,6 +16,19 @@ namespace {
 
 using testing_support::MakeBytes;
 
+// A 48-byte palette unit body: 16 copies of one solid {r,g,b}, for tests that
+// only care about which palette ends up in effect, not its exact contents.
+std::vector<std::byte> SolidPaletteBody(std::uint8_t r, std::uint8_t g, std::uint8_t b) {
+    std::vector<std::byte> body;
+    body.reserve(48);
+    for (int i = 0; i < 16; ++i) {
+        body.push_back(std::byte{r});
+        body.push_back(std::byte{g});
+        body.push_back(std::byte{b});
+    }
+    return body;
+}
+
 // Cross-checked against server/ccmf.py's pack_chars for codes [0..7] (one
 // full group of 8, no padding):
 //   >>> ccmf.pack_chars(np.arange(8, dtype=np.uint8) + 0x80)
@@ -159,9 +172,68 @@ TEST(DecodeVideoPayload, FrameBeforePaletteThrows) {
     EXPECT_THROW((void)DecodeVideoPayload(payload), CcmfError);
 }
 
+// Spec (docs/cc-media-format.md §4.4): a palette unit MUST NOT be immediately
+// followed by another one -- but this reference player is deliberately
+// permissive about a malformed stream rather than crashing on it, matching
+// player.lua and reproducing this decoder's own long-standing behaviour for
+// the "ends with a palette" case below. The first palette is silently
+// superseded; only the second (the one actually in effect when the frame
+// renders) is ever visible.
+TEST(DecodeVideoPayload, ConsecutivePalettesArePermissiveAndLastOneWins) {
+    std::vector<std::byte> payload = MakeBytes({1, 0, 1, 0});   // width=1, height=1
+
+    std::vector<std::byte> pal1Unit{std::byte{0}};              // flags(0) + body
+    const auto pal1Body = SolidPaletteBody(10, 20, 30);
+    pal1Unit.insert(pal1Unit.end(), pal1Body.begin(), pal1Body.end());
+    payload.insert(payload.end(), pal1Unit.begin(), pal1Unit.end());
+
+    std::vector<std::byte> pal2Unit{std::byte{0}};
+    const auto pal2Body = SolidPaletteBody(200, 210, 220);
+    pal2Unit.insert(pal2Unit.end(), pal2Body.begin(), pal2Body.end());
+    payload.insert(payload.end(), pal2Unit.begin(), pal2Unit.end());
+
+    std::vector<std::byte> rawUnit = MakeBytes({0x80, 0, 0});   // raw, duration=0
+    std::vector<std::byte> planes(RawPlanesSize(1, 1), std::byte{0x80});
+    rawUnit.insert(rawUnit.end(), planes.begin(), planes.end());
+    payload.insert(payload.end(), rawUnit.begin(), rawUnit.end());
+
+    DecodedGop gop;
+    EXPECT_NO_THROW(gop = DecodeVideoPayload(payload));
+    ASSERT_EQ(gop.frames.size(), 1u);
+    EXPECT_EQ(gop.frames[0].palette.colors[0], (std::array<std::uint8_t, 3>{200, 210, 220}));
+}
+
+// Spec §4.4: a palette unit MUST NOT be the last unit in a video payload --
+// again, tolerated here rather than rejected: the dangling palette is parsed
+// but never attached to any frame (nothing follows it to give it an effective
+// time), so it's silently dropped.
+TEST(DecodeVideoPayload, TrailingPaletteAfterAFrameIsPermissivelyIgnored) {
+    std::vector<std::byte> payload = MakeBytes({1, 0, 1, 0});   // width=1, height=1
+
+    std::vector<std::byte> palUnit{std::byte{0}};
+    const auto palBody = SolidPaletteBody(0, 0, 0);
+    palUnit.insert(palUnit.end(), palBody.begin(), palBody.end());
+    payload.insert(payload.end(), palUnit.begin(), palUnit.end());
+
+    std::vector<std::byte> rawUnit = MakeBytes({0x80, 0, 0});   // raw, duration=0
+    std::vector<std::byte> planes(RawPlanesSize(1, 1), std::byte{0x80});
+    rawUnit.insert(rawUnit.end(), planes.begin(), planes.end());
+    payload.insert(payload.end(), rawUnit.begin(), rawUnit.end());
+
+    std::vector<std::byte> danglingPalUnit{std::byte{0}};       // nothing follows this
+    const auto danglingBody = SolidPaletteBody(99, 99, 99);
+    danglingPalUnit.insert(danglingPalUnit.end(), danglingBody.begin(), danglingBody.end());
+    payload.insert(payload.end(), danglingPalUnit.begin(), danglingPalUnit.end());
+
+    DecodedGop gop;
+    EXPECT_NO_THROW(gop = DecodeVideoPayload(payload));
+    ASSERT_EQ(gop.frames.size(), 1u);
+    EXPECT_EQ(gop.frames[0].palette.colors[0], (std::array<std::uint8_t, 3>{0, 0, 0}));
+}
+
 // --------------------------------------------------------------------------
 // Cross-check against the real fixture small_stereo.ccmf (rendered with
-// render_cc.py) and small_stereo.frames.bin, a small binary dump this
+// convert_to_ccmf.py) and small_stereo.frames.bin, a small binary dump this
 // module's tests read directly: [u16 w][u16 h][u16 numFrames] then, for the
 // first and last decoded frame, [u16 duration][u8 encoding][glyph w*h]
 // [fg w*h][bg w*h][palette 48], produced by actually running

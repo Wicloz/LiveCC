@@ -275,14 +275,20 @@ def parse_video_payload(payload: bytes) -> tuple[int, int, list[DecodedFrame]]:
     palette: Optional[np.ndarray] = None
     glyph = fg = bg = None
     frames: list[DecodedFrame] = []
+    pending_palette = False    # a palette seen with no frame yet to anchor its timing
     while pos < len(payload):
         flags = payload[pos]
         pos += 1
         if not flags & 0x80:                                   # palette unit
+            if pending_palette:
+                raise ValueError("a palette unit MUST NOT be immediately followed "
+                                 "by another palette unit (spec §4.4)")
             palette = np.frombuffer(payload, np.uint8, count=48,
                                     offset=pos).reshape(16, 3).copy()
             pos += 48
+            pending_palette = True
             continue
+        pending_palette = False
         enc = (flags >> 4) & 0x07
         (duration,) = struct.unpack_from("<H", payload, pos)
         pos += 2
@@ -321,6 +327,13 @@ def parse_video_payload(payload: bytes) -> tuple[int, int, list[DecodedFrame]]:
         if palette is None:
             raise ValueError("frame before any palette unit")
         frames.append(DecodedFrame(duration, enc, glyph, fg, bg, palette))
+    if pending_palette:
+        # A palette carries no timestamp of its own (spec §4.5): it takes effect
+        # at the same presentation time as the frame unit that follows it, so one
+        # with nothing after it — even after earlier, valid frames — has no
+        # defined effective time.
+        raise ValueError("a palette unit MUST NOT be the last unit in a video "
+                         "payload (spec §4.4)")
     if not frames:
         raise ValueError("video chunk carries no frame (ends with a palette?)")
     return w, h, frames

@@ -219,6 +219,59 @@ def test_rekey_does_not_resend_an_unchanged_palette():
     assert np.array_equal(frames[0].palette, frames[1].palette)
 
 
+def test_a_palette_change_is_always_immediately_followed_by_a_raw_frame():
+    # The asymmetry this encoder relies on: every "pal" unit is queued right
+    # next to an ENC_RAW unit (a palette is useless without a keyframe to
+    # apply it to), but NOT every ENC_RAW unit has a fresh "pal" in front of
+    # it (see the dedup test above) -- a delta/repeat NEVER gets a new
+    # palette.  Checked purely from decoded wire output (what a client
+    # actually sees) across a long, varied sequence spanning several chunks,
+    # forced via a tiny max_chunk_bytes so size-bounded flushes happen too.
+    rng = np.random.default_rng(42)
+    w, h = 12, 8
+    seq = [rng.integers(0, 256, size=(h * 3, w * 2, 3), dtype=np.uint8)]
+    for i in range(60):
+        choice = i % 4
+        if choice == 0:
+            nxt = seq[-1]                                   # identical -> repeat
+        elif choice == 1:
+            nxt = np.fliplr(seq[-1]).copy()                  # same histogram, rearranged
+        elif choice == 2:
+            nxt = np.roll(seq[-1], shift=1, axis=1)          # small shift -> delta
+        else:
+            nxt = rng.integers(0, 256, size=(h * 3, w * 2, 3), dtype=np.uint8)
+        seq.append(nxt)
+
+    gop = GopEncoder(gop_samples=round(ccmf.SAMPLE_RATE * 0.3),
+                     nominal_duration=round(ccmf.SAMPLE_RATE / _FPS),
+                     max_chunk_bytes=4096)
+    chunks = []
+    for i, frame in enumerate(seq):
+        done = gop.add(round(i * ccmf.SAMPLE_RATE / _FPS), frame)
+        if done is not None:
+            chunks.append(done)
+    final = gop.flush(next_pts=round(len(seq) * ccmf.SAMPLE_RATE / _FPS))
+    if final is not None:
+        chunks.append(final)
+    assert len(chunks) > 3, "test didn't actually exercise multiple chunks"
+
+    raw_with_new_palette = raw_with_same_palette = 0
+    for _gop_pts, chunk_bytes in chunks:
+        _w, _h, frames = _decode(chunk_bytes)
+        for j, f in enumerate(frames):
+            changed_palette = j == 0 or not np.array_equal(f.palette, frames[j - 1].palette)
+            if changed_palette:
+                # every palette change must land on a raw frame
+                assert f.encoding == ccmf.ENC_RAW, \
+                    f"chunk pts={_gop_pts}: palette changed on a non-raw unit"
+                raw_with_new_palette += 1
+            elif f.encoding == ccmf.ENC_RAW:
+                raw_with_same_palette += 1
+
+    assert raw_with_new_palette > 0        # the opening pair, plus real re-keys
+    assert raw_with_same_palette > 0       # the dedup path actually fired
+
+
 @pytest.mark.parametrize("adaptive", [False, True], ids=["fixed", "adaptive"])
 def test_numba_and_numpy_cores_agree(adaptive):
     # The compiled core is the active path; the numpy core is the reference.  They

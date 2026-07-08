@@ -181,7 +181,10 @@ A video chunk is a **self-contained GOP** and thus a RAP.
   redundant `delta` frames still compress together as one blob.
 - The unit stream is decoded until `length` is consumed (no unit count).
 - The stream **MUST** begin with a `palette` unit followed by a `raw` frame
-  (the keyframe), and **MUST NOT** end with a `palette` unit.
+  (the keyframe). A `palette` unit **MUST NOT** end the stream, and **MUST
+  NOT** be immediately followed by another `palette` unit — see Section 4.5,
+  a palette carries no timestamp of its own, so it always needs exactly one
+  frame unit right after it to give it an effective time.
 
 ### 4.5. Units
 
@@ -195,8 +198,12 @@ A video chunk is a **self-contained GOP** and thus a RAP.
 `flags` bit 7: `0` = palette unit, `1` = frame unit.
 
 **Palette unit** (`bit7=0`): body is exactly 48 bytes (16 × RGB, 8-bit
-channels). It replaces the current palette for subsequent frames and is applied
-instantaneously (no timestamp). Palette-only changes (e.g. fades) need no frame.
+channels). It carries no timestamp of its own — it replaces the current
+palette at the same presentation time as the frame unit that immediately
+follows it (Section 4.4's **MUST**), so a decoder applies both together. A
+pure recolour (e.g. a fade) needs no new cell content, not no frame: pair the
+palette with a `repeat` unit to recolour everything on screen without a
+redraw.
 
 **Frame unit** (`bit7=1`): bits 6–4 select the encoding; bits 3–0 reserved.
 

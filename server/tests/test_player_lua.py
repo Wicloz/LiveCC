@@ -486,6 +486,52 @@ def test_video_units_render_only_when_due():
     assert len(blits[2][b"text"]) == 1         # the single changed cell
 
 
+def test_consecutive_palettes_are_permissive_and_last_one_wins():
+    # Spec: a palette unit MUST NOT be immediately followed by another one
+    # (docs/cc-media-format.md §4.4) -- but this client is deliberately
+    # permissive about a malformed stream rather than crashing on it. Both
+    # share the keyframe's PTS (queue_video never advances its running `cur`
+    # for a palette unit), so they become due in the same atomic redraw; only
+    # the second is ever visibly applied.
+    p = load_player()
+    p.anchor(0)
+    pal1 = bytes([10, 20, 30] * 16)
+    pal2 = bytes([200, 210, 220] * 16)
+    glyph = np.full((1, 2), 0x81, np.uint8)
+    fg = np.full((1, 2), 1, np.uint8)
+    bg = np.full((1, 2), 0, np.uint8)
+    units = (ccmf.palette_unit(pal1) + ccmf.palette_unit(pal2)
+             + ccmf.raw_frame_unit(2000, glyph, fg, bg))
+    payload = ccmf.video_payload(2, 1, units)
+    p.handle_message(ccmf.chunk(0, ccmf.TYPE_VIDEO, payload))   # must not raise
+    p.at_clock(0)
+    p.drain_due()
+    rgb = p.stub[b"palette_colors"][1]         # colour constant 2^0, palette index 0
+    r, g, b = rgb[1], rgb[2], rgb[3]            # Lua array: 1-indexed
+    assert (round(r * 255), round(g * 255), round(b * 255)) == (200, 210, 220)
+
+
+def test_trailing_dangling_palette_does_not_crash():
+    # Spec: a palette unit MUST NOT be the last unit in a video payload -- but
+    # again, this client tolerates a non-conforming stream instead of
+    # crashing: the dangling palette is queued like any other unit and simply
+    # recolours the screen with nothing new to draw when its turn comes.
+    p = load_player()
+    p.anchor(0)
+    glyph = np.full((1, 2), 0x81, np.uint8)
+    fg = np.full((1, 2), 1, np.uint8)
+    bg = np.full((1, 2), 0, np.uint8)
+    units = (ccmf.palette_unit(bytes(48)) + ccmf.raw_frame_unit(2000, glyph, fg, bg)
+             + ccmf.palette_unit(bytes(range(48))))         # dangling: spec MUST NOT
+    payload = ccmf.video_payload(2, 1, units)
+    p.handle_message(ccmf.chunk(0, ccmf.TYPE_VIDEO, payload))   # must not raise
+    p.at_clock(0)
+    p.drain_due()
+    p.at_clock(2400)
+    p.drain_due()                              # the dangling palette becomes due here
+    assert int(p.stub[b"palettes"]) == 32      # both palette units were applied
+
+
 # --------------------------------------------------------------------------- #
 # --verbose: chunk header logging
 # --------------------------------------------------------------------------- #

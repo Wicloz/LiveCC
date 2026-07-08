@@ -21,6 +21,7 @@ stub = {
     monitor = { w = 20, h = 10, present = true },
     blits = {},           -- { {x=,y=,text=,fg=,bg=}, ... } from the screen
     palettes = 0,         -- setPaletteColour call count
+    palette_colors = {},  -- CC colour constant -> last {r,g,b} it was set to
     flushes = 0,          -- setVisible(true) count
 }
 
@@ -111,7 +112,10 @@ window = {
                 stub.blits[#stub.blits + 1] =
                     { x = cx, y = cy, text = text, fg = fg, bg = bg }
             end,
-            setPaletteColour = function() stub.palettes = stub.palettes + 1 end,
+            setPaletteColour = function(colour, r, g, b)
+                stub.palettes = stub.palettes + 1
+                stub.palette_colors[colour] = { r, g, b }
+            end,
             clear = noop,
             write = noop,
             setBackgroundColor = noop,
