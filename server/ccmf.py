@@ -63,6 +63,7 @@ CHANNEL_REAR_LEFT = 7
 CHANNEL_REAR_RIGHT = 8
 
 MAX_DURATION = 0xFFFF            # u16 samples (~1.36 s); longer holds use repeats
+MAX_GRID_CELLS = 65535           # delta span `start` is u16 (Section 4.5.2): w*h cap
 _CHUNK_HEADER = 12               # marker + PTS + length + type + compression
 
 

@@ -205,13 +205,31 @@ def test_negotiate_nothing_to_play_is_rejected():
     assert main._negotiate(room, caps) is None
 
 
-def test_negotiate_clamps_dimensions_and_fps():
+def test_negotiate_clamps_fps_and_defaults_height():
     room = ccmf.parse_room(ccmf.build_room("u"))
-    caps = ccmf.parse_caps(ccmf.build_caps(width=9999, height=0, fps=200))
+    caps = ccmf.parse_caps(ccmf.build_caps(width=80, height=0, fps=200))
     kwargs = main._negotiate(room, caps)
-    assert kwargs["w"] == 500          # clamped high
+    assert kwargs["w"] == 80
     assert kwargs["h"] == 19           # 0 -> default
     assert kwargs["fps"] == 30         # clamped high
+
+
+def test_negotiate_accepts_ccs_largest_real_grid():
+    # 335x124 (mon16x9, cc_media.py's GRID_PRESETS) is the biggest grid a real
+    # CC monitor can be -- it must fit under the cell-count budget untouched.
+    room = ccmf.parse_room(ccmf.build_room("u"))
+    caps = ccmf.parse_caps(ccmf.build_caps(width=335, height=124))
+    kwargs = main._negotiate(room, caps)
+    assert (kwargs["w"], kwargs["h"]) == (335, 124)
+
+
+def test_negotiate_drops_grid_over_cell_budget():
+    # Dropped rather than downscaled: the client asked for a specific size
+    # that CCMF's u16 delta-span `start` field (spec Section 4.5.2) can't
+    # address (256x256 = 65536 cells, one over the 65535 cap).
+    room = ccmf.parse_room(ccmf.build_room("u"))
+    caps = ccmf.parse_caps(ccmf.build_caps(width=256, height=256))
+    assert main._negotiate(room, caps) is None
 
 
 # --------------------------------------------------------------------------- #

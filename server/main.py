@@ -168,6 +168,11 @@ def _negotiate(room: ccmf.Room, caps: ccmf.Caps) -> Optional[dict]:
     `channels` bitmask is just forwarded as caps_channels; StreamSession.run()
     negotiates the actual role set once it knows the source's real channel
     count (transcoder.negotiate_channel_roles).
+
+    A requested grid whose total cell count doesn't fit CCMF's delta span
+    encoding (ccmf.MAX_GRID_CELLS) is dropped rather than rescaled -- the
+    client asked for a specific size, and silently serving something else is
+    worse than an explicit ERROR it can retry with saner CAPS.
     """
     codec = None
     if caps.audio_mask & ccmf.CAP_AUDIO_PCM8:
@@ -178,6 +183,10 @@ def _negotiate(room: ccmf.Room, caps: ccmf.Caps) -> Optional[dict]:
                   and bool(caps.channels & ccmf.CAP_CHANNEL_MONO))
     if not caps.want_video and not want_audio:
         return None
+    w = _clamp(caps.width, 51, 1, 65535)
+    h = _clamp(caps.height, 19, 1, 65535)
+    if w * h > ccmf.MAX_GRID_CELLS:
+        return None
     # Opportunistic payload compression: use LZ4 when the client advertises it
     # (the only compression a CC client can inflate, spec §4.1.2), else none.
     compression = (ccmf.COMPRESSION_LZ4
@@ -185,8 +194,8 @@ def _negotiate(room: ccmf.Room, caps: ccmf.Caps) -> Optional[dict]:
                    else ccmf.COMPRESSION_NONE)
     return {
         "url": room.url,
-        "w": _clamp(caps.width, 51, 1, 500),
-        "h": _clamp(caps.height, 19, 1, 500),
+        "w": w,
+        "h": h,
         "fps": _clamp(caps.fps, 24, 1, 30),
         "want_audio": want_audio,
         "want_video": caps.want_video,
@@ -340,7 +349,9 @@ async def ws_play(websocket: WebSocket):
 
     kwargs = _negotiate(room, caps)
     if kwargs is None:
-        await _reject(websocket, "Nothing to play (no usable stream requested).")
+        await _reject(websocket,
+                      "Nothing to play (no usable stream requested, or "
+                      "requested grid too large).")
         return
 
     if room.sync:

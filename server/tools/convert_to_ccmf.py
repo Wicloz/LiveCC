@@ -384,6 +384,11 @@ async def _render(args: argparse.Namespace) -> int:
                  "assuming 16:9.")
             src_w, src_h = 16, 9
         w, h = _compute_output_grid(src_w, src_h, bound_w, bound_h)
+        if w * h > ccmf.MAX_GRID_CELLS:
+            print(f"convert_to_ccmf: output grid {w}x{h} ({w * h} cells) exceeds "
+                 f"CCMF's {ccmf.MAX_GRID_CELLS}-cell limit (delta span `start` is "
+                 f"u16, spec Section 4.5.2) -- pick a smaller --grid/--width/--height.")
+            return 1
     else:
         w = h = 0
 

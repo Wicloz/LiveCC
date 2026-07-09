@@ -319,6 +319,18 @@ def test_render_rejects_bad_time_range(tmp_path):
     assert rc == 1
 
 
+def test_render_rejects_grid_over_cell_budget(tmp_path, capsys):
+    # 64x48 source (the stubbed probe) into a 9999x9999 bounding box scales to
+    # 9999x4999 -- ~50M cells, way past CCMF's 65535-cell delta-span limit.
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"x")
+    args = _make_args(tmp_path, clip, extra=["--width", "9999", "--height", "9999"])
+    rc = asyncio.run(convert_to_ccmf._render(args))
+    assert rc == 1
+    assert not (tmp_path / "out.ccmf").exists()
+    assert "cell" in capsys.readouterr().out.lower()
+
+
 def test_main_requires_ffmpeg(monkeypatch, tmp_path):
     clip = tmp_path / "clip.mp4"
     clip.write_bytes(b"x")
