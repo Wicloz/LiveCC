@@ -46,6 +46,7 @@ int main(int argc, char** argv) {
     const bool selfTest = ParseSelfTestFlag(argc, argv);
     const char* path = FirstNonFlagArg(argc, argv);
 
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_VSYNC_HINT);
     InitWindow(960, 540, "CCMF Player");
     InitAudioDevice();
 
