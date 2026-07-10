@@ -28,6 +28,15 @@ bool HasPts(const std::vector<ChunkEntry>& run, std::uint64_t pts) {
                        [pts](const ChunkEntry& e) { return e.pts == pts; });
 }
 
+// Appends one chunk with a zero-filled payload of `payloadLen` bytes (zeros
+// carry no stray marker bytes, so resync stays unambiguous) to `out`.
+void AppendChunk(std::vector<std::byte>& out, std::uint64_t pts, std::uint8_t type,
+                 std::size_t payloadLen) {
+    const std::vector<std::byte> payload(payloadLen, std::byte{0});
+    const auto chunk = BuildChunk(pts, type, payload);
+    out.insert(out.end(), chunk.begin(), chunk.end());
+}
+
 // --------------------------------------------------------------------------
 // Lazy discovery: nothing is read up front; chunks enter the index only when
 // something asks for them.
@@ -138,6 +147,77 @@ TEST(CcmfFile, RegionAroundHomesWithoutWalkingFromTheStart) {
     EXPECT_FALSE(HasPts(run, 0u));
     EXPECT_GT(run.front().pts, 0u);
     EXPECT_LE(run.front().pts, 500000u - 5u * 48000u);  // started before the guard window
+}
+
+TEST(CcmfFile, ReSeekInKnownRegionDoesZeroIO) {
+    // The surrogate answers directly: once a region has been discovered, a seek
+    // whose answer lies entirely within it issues no resync probes and reads no
+    // headers from disk. (The file must exceed the tail backread window, or the
+    // whole thing gets indexed at open and there's nothing left to home for.)
+    std::vector<std::byte> bytes;
+    for (int i = 0; i < 400; ++i) {  // ~165 KB, past the 64 KB tail window
+        AppendChunk(bytes, static_cast<std::uint64_t>(i) * 48000, kChunkTypeVideo, 400);
+    }
+    const TempFile file(bytes);
+    CcmfFile ccmf(file.Path());
+
+    const std::uint64_t pts = 100ull * 48000;  // early: not captured by the tail read
+    (void)ccmf.RegionAround(pts);  // warm the surrogate (this one does I/O)
+    ASSERT_GT(ccmf.HomingProbeCount(), 0u);  // the first seek genuinely homed
+
+    ccmf.ResetProbeCounters();
+    const std::vector<ChunkEntry> run = ccmf.RegionAround(pts);  // identical target
+    EXPECT_TRUE(HasPts(run, pts));
+    EXPECT_EQ(ccmf.HomingProbeCount(), 0u);      // no probes...
+    EXPECT_EQ(ccmf.DiskHeaderReadCount(), 0u);   // ...and no disk reads
+}
+
+TEST(CcmfFile, HomingStaysBoundedWithWildlyVaryingChunkSizes) {
+    // Chunk byte size and pts are decoupled: a block of fat chunks followed by
+    // a block of tiny ones makes byte offset a poor proxy for time, the case
+    // that degrades naive interpolation search. The safeguarded home must still
+    // resolve the correct chunk in far fewer probes than there are chunks.
+    constexpr int kFat = 120;
+    constexpr int kTiny = 120;
+    std::vector<std::byte> bytes;
+    for (int i = 0; i < kFat; ++i) {
+        AppendChunk(bytes, static_cast<std::uint64_t>(i) * 48000, kChunkTypeVideo, 20000);
+    }
+    for (int i = kFat; i < kFat + kTiny; ++i) {
+        AppendChunk(bytes, static_cast<std::uint64_t>(i) * 48000, kChunkTypeVideo, 1);
+    }
+    const TempFile file(bytes);
+    CcmfFile ccmf(file.Path());
+
+    // Seek into the fat block (not captured by the tail read), where homing must
+    // cross the fat/tiny non-linearity from the global bracket.
+    const std::uint64_t target = 60ull * 48000;
+    ccmf.ResetProbeCounters();
+    const std::vector<ChunkEntry> run = ccmf.RegionAround(target);
+    EXPECT_TRUE(HasPts(run, target));            // correct active chunk
+    EXPECT_GT(ccmf.HomingProbeCount(), 0u);      // it genuinely homed...
+    EXPECT_LT(ccmf.HomingProbeCount(), 64u);     // ...and stayed bounded, << 240 chunks
+}
+
+TEST(CcmfFile, ResolvesALongGopThatStartedFarBeforeTheTarget) {
+    // "One keyframe with hundreds of repeats": a single video chunk at pts 0
+    // followed by many audio chunks. Seeking deep must still find that lone
+    // video chunk (the active GOP began long before), via the look-back growth,
+    // without a long ladder of homes.
+    std::vector<std::byte> bytes;
+    AppendChunk(bytes, 0, kChunkTypeVideo, 8);  // the long GOP, one chunk
+    for (int i = 1; i < 3000; ++i) {            // ~84 KB, past the tail window
+        AppendChunk(bytes, static_cast<std::uint64_t>(i) * 48000, kChunkTypeAudio, 16);
+    }
+    const TempFile file(bytes);
+    CcmfFile ccmf(file.Path());
+
+    const std::uint64_t target = 2000ull * 48000;
+    ccmf.ResetProbeCounters();
+    const std::vector<ChunkEntry> run = ccmf.RegionAround(target);
+    EXPECT_TRUE(HasPts(run, 0u));                 // captured the far-back GOP...
+    EXPECT_TRUE(HasPts(run, target));             // ...and reached the target
+    EXPECT_LT(ccmf.HomingProbeCount(), 64u);      // grow-by-x4 keeps the homes few
 }
 
 // --------------------------------------------------------------------------

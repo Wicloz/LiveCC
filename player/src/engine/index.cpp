@@ -47,9 +47,10 @@ const ChunkEntry& CcmfFile::Record(const ChunkEntry& entry) {
 
 std::optional<ChunkEntry> CcmfFile::ReadHeaderAt(std::uint64_t offset) {
     if (const auto it = known_.find(offset); it != known_.end()) {
-        return it->second;
+        return it->second;  // surrogate hit: no I/O
     }
     ChunkEntry entry;
+    ++diskHeaderReads_;
     if (!TryReadHeaderAt(file_, offset, fileSize_, entry)) {
         return std::nullopt;
     }
@@ -119,36 +120,55 @@ std::uint64_t CcmfFile::HomeToPtsAtMost(std::uint64_t target) {
         return 0;
     }
 
+    // Safeguarded interpolation search over the monotone offset<->pts mapping.
+    // Interpolation converges superlinearly (~log log n) when the mapping is
+    // smooth -- the common case -- but degrades toward linear when chunk sizes
+    // vary wildly (dense all-keyframe GOPs next to tiny repeat-only GOPs make
+    // bytes a poor proxy for time). A Brent-style safeguard forces a bisection
+    // step whenever the previous step failed to at least halve the bracket, so
+    // the byte width shrinks geometrically no matter how misleading the
+    // interpolation is -- bounding the worst case to O(log2(bytes)) probes while
+    // leaving the smooth-file fast path untouched.
+    std::uint64_t prevWidth = hi->offset - lo->offset;
+    bool forceBisect = false;
+
     for (int iter = 0; iter < kMaxHomingIterations; ++iter) {
         if (!hi || hi->offset <= lo->End()) {
             break;  // lo's next boundary is hi (or EOF): lo is pinned just below target
         }
+        const std::uint64_t gapLo = lo->End();
+        const std::uint64_t gapHi = hi->offset;
 
-        // Interpolate a byte offset for `target` between the bracket, then resync
-        // forward to the next real boundary there.
+        std::uint64_t guess;
+        if (forceBisect) {
+            guess = gapLo + (gapHi - gapLo) / 2;  // guaranteed geometric shrink
+        } else {
+            const double frac = static_cast<double>(target - lo->pts) /
+                                static_cast<double>(hi->pts - lo->pts);
+            guess = static_cast<std::uint64_t>(
+                static_cast<double>(lo->offset) +
+                frac * static_cast<double>(hi->offset - lo->offset));
+            guess = std::clamp(guess, gapLo, gapHi - 1);
+        }
+
+        // Resync forward from the guess to the next real boundary in the gap.
         std::optional<ChunkEntry> mid;
-        const double frac = static_cast<double>(target - lo->pts) /
-                            static_cast<double>(hi->pts - lo->pts);
-        auto guess = static_cast<std::uint64_t>(
-            static_cast<double>(lo->offset) +
-            frac * static_cast<double>(hi->offset - lo->offset));
-        guess = std::clamp(guess, lo->End(), hi->offset - 1);
-
         std::vector<ChunkEntry> collected;
-        if (auto m = Resync(file_, guess, hi->offset, fileSize_, kHomingRequiredLinks, collected)) {
+        ++homingProbes_;
+        if (auto m = Resync(file_, guess, gapHi, fileSize_, kHomingRequiredLinks, collected)) {
             for (const ChunkEntry& e : collected) {
                 Record(e);
             }
-            if (*m > lo->offset && *m < hi->offset) {
+            if (*m > lo->offset && *m < gapHi) {
                 mid = known_.at(*m);
             }
         }
         if (!mid) {
-            // Interpolation found nothing strictly inside the bracket; take the
-            // guaranteed next boundary (lo's chain-adjacent successor) instead.
-            // This always makes progress and terminates the loop.
+            // The guess fell inside the last chunk before hi (no boundary at or
+            // after it within the gap): step to lo's guaranteed chain-adjacent
+            // successor. Poor progress, but the safeguard below will bisect next.
             mid = ReadHeaderAt(lo->End());
-            if (!mid || mid->offset <= lo->offset || mid->offset >= hi->offset) {
+            if (!mid || mid->offset <= lo->offset || mid->offset >= gapHi) {
                 break;
             }
         }
@@ -158,6 +178,10 @@ std::uint64_t CcmfFile::HomeToPtsAtMost(std::uint64_t target) {
         } else {
             hi = mid;
         }
+
+        const std::uint64_t width = hi->offset - lo->offset;
+        forceBisect = width > prevWidth / 2;  // didn't halve -> bisect next step
+        prevWidth = width;
     }
 
     return lo->offset;
@@ -201,7 +225,12 @@ std::vector<ChunkEntry> CcmfFile::RegionAround(std::uint64_t pts) {
         if (!knowsVideo_ || sawVideoAtOrBefore || target == 0 || grow >= kMaxRegionGrows) {
             return run;
         }
-        guard *= 2;
+        // The active GOP began before the region start (a long, repeat-heavy
+        // GOP). Grow the look-back geometrically by x4 (not x2) so an extreme
+        // GOP spanning many guard-windows costs a handful of re-homes, not a
+        // long ladder; the already-walked suffix stays in known_, so each
+        // re-home only probes the new backward extension.
+        guard *= 4;
     }
 }
 

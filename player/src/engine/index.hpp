@@ -74,6 +74,17 @@ public:
     // engine's construction-time bootstrap for any file that has video.
     [[nodiscard]] bool KnowsAnyVideo() const noexcept { return knowsVideo_; }
 
+    // Instrumentation for the seek/refine machinery. `HomingProbeCount` is the
+    // number of resync probes issued while homing (each an I/O round-trip);
+    // `DiskHeaderReadCount` is how many chunk headers were read from disk during
+    // lazy discovery. Both exclude the one-time tail backread and the eager
+    // IndexAll() path. A seek whose region is already fully known adds zero to
+    // both -- the surrogate (known_) answered it directly. Use ResetProbeCounters
+    // to measure a single operation.
+    [[nodiscard]] std::uint64_t HomingProbeCount() const noexcept { return homingProbes_; }
+    [[nodiscard]] std::uint64_t DiskHeaderReadCount() const noexcept { return diskHeaderReads_; }
+    void ResetProbeCounters() noexcept { homingProbes_ = 0; diskHeaderReads_ = 0; }
+
     // A full, eager linear scan from offset 0 (the pre-lazy behaviour), returned
     // partitioned by type. Provided ONLY as a reference/verification path (tests
     // cross-check against it, and it's an escape hatch); the playback path never
@@ -123,6 +134,8 @@ private:
     std::optional<std::vector<ChunkEntry>> tailChunks_;
     bool bootstrapped_ = false;
     bool knowsVideo_ = false;
+    std::uint64_t homingProbes_ = 0;
+    std::uint64_t diskHeaderReads_ = 0;
 };
 
 }  // namespace ccmfplayer
