@@ -11,9 +11,10 @@
 namespace ccmfplayer {
 
 // Owns the GPU texture a decoded video frame is uploaded into, and draws it
-// scaled/letterboxed to fit an arbitrary window size. One instance per
-// playing file -- the texture is sized to that file's grid at construction
-// and never resized.
+// scaled/letterboxed to fit an arbitrary window size. The texture is sized to a
+// specific grid at construction; because a file MAY change resolution mid-stream
+// (spec 4.4), the owner re-creates the VideoView when the engine's grid size
+// changes (compare GridWidth()/GridHeight() to the engine's Width()/Height()).
 class VideoView {
 public:
     VideoView(std::uint16_t gridWidth, std::uint16_t gridHeight);
@@ -21,6 +22,9 @@ public:
 
     VideoView(const VideoView&) = delete;
     VideoView& operator=(const VideoView&) = delete;
+
+    [[nodiscard]] std::uint16_t GridWidth() const noexcept { return gridWidth_; }
+    [[nodiscard]] std::uint16_t GridHeight() const noexcept { return gridHeight_; }
 
     // Re-renders `frame` into the CPU pixel buffer and uploads it to the GPU
     // texture. A no-op if `frame` is nullptr, so the last successfully

@@ -110,7 +110,15 @@ int main(int argc, char** argv) {
             }
 
             if (videoView) {
-                videoView->Update(engine->CurrentFrame());
+                const ccmfplayer::Frame* frame = engine->CurrentFrame();
+                // A file may change resolution mid-stream (spec 4.4): re-create
+                // the view (and its texture) when the active GOP's grid changes.
+                if (frame != nullptr && (videoView->GridWidth() != engine->Width()
+                                         || videoView->GridHeight() != engine->Height())) {
+                    videoView = std::make_unique<ccmfplayer::VideoView>(engine->Width(),
+                                                                        engine->Height());
+                }
+                videoView->Update(frame);
             }
             if (audioOutput) {
                 audioOutput->Refill(*engine);

@@ -31,7 +31,16 @@ void VideoView::Update(const Frame* frame) {
     if (frame == nullptr) {
         return;
     }
-    RenderCellsToRgb(*frame, gridWidth_, gridHeight_, pixels_);
+    // RenderCellsToRgb throws if the frame's cell count doesn't match this
+    // view's grid -- which can happen for one tick right at a mid-stream
+    // resolution change, before the owner recreates the view. Swallow it and
+    // keep the last frame rather than crashing; the resized view arrives next
+    // tick.
+    try {
+        RenderCellsToRgb(*frame, gridWidth_, gridHeight_, pixels_);
+    } catch (const CcmfError&) {
+        return;
+    }
     UpdateTexture(texture_, pixels_.data());
 }
 

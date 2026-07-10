@@ -87,6 +87,10 @@ public:
     [[nodiscard]] std::uint32_t ChannelCount() const noexcept {
         return hasAudio_ ? outputChannels_ : 0;
     }
+    // Grid size of the GOP CurrentFrame() belongs to. Usually constant, but a
+    // self-describing file MAY change resolution mid-stream (spec 4.4), so this
+    // tracks the active GOP and can change after an Advance()/Seek() -- callers
+    // rendering to a fixed-size surface should re-check it and resize on change.
     [[nodiscard]] std::uint16_t Width() const noexcept { return width_; }
     [[nodiscard]] std::uint16_t Height() const noexcept { return height_; }
     // The file's total span in samples (spec 4.2 units), computed once at

@@ -180,6 +180,12 @@ void PlaybackEngine::ResolveVideoAt(std::uint64_t pts) noexcept {
         // and to long GOPs; using the next video chunk's pts instead would leave
         // the cache open to end-of-file whenever the run stopped on an audio
         // chunk, freezing playback on the first GOP.
+        // A GOP is self-describing (spec 4.4): its own width/height may differ
+        // from earlier GOPs (a mid-file resolution change). Track the active
+        // GOP's grid so Width()/Height() describe what CurrentFrame() actually
+        // is, letting the app resize its view when it changes.
+        width_ = decodedGop_.width;
+        height_ = decodedGop_.height;
         std::uint64_t span = 0;
         for (const Frame& frame : decodedGop_.frames) {
             span += frame.duration;
