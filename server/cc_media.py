@@ -120,6 +120,9 @@ def sample_frames(path, w: int, h: int, fps: int = 24, limit: int = 8) -> list:
     front-end (the same ffmpeg scale/letterbox + frame splitter the server uses),
     returning (H*3, W*2, 3) uint8 arrays ready for encode_frame.
 
+    `w`/`h` are the character-cell grid dimensions (not pixels) -- converted to
+    the pixel target internally, same as everywhere else in this codebase.
+
     Reads incrementally and stops at `limit`, so it stays cheap on long clips.
     """
     from transcoder import _FrameSplitter, _video_ffmpeg_cmd   # lazy: pulls numpy

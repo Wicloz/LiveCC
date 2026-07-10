@@ -368,8 +368,8 @@ The server **MUST NOT** echo the chosen configuration; clients learn actual
 [ channels u16 ] one-hot per channel role (Section 4.6): bit N = accepts role N
                  (bit0 mono · bit1 front-left · bit2 front-right · … up to 7.1)
 [ compress u8 ]  bitmask: bit0 none · bit1 deflate · bit2 lz4 · bit3 zstd
-[ width  u16 ]
-[ height u16 ]
+[ width  u16 ]   requested grid width, in character cells (Section 4.5)
+[ height u16 ]   requested grid height, in character cells (Section 4.5)
 [ fps    u8  ]
 ```
 
