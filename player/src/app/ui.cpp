@@ -18,6 +18,20 @@ constexpr float kTimeTextWidth = 150.0f;  // reserved space for "H:MM:SS / H:MM:
 constexpr float kSeekBarThickness = 8.0f;
 constexpr std::uint64_t kKeySeekStepSamples = 5ull * kSampleRate;
 
+// MPV-style auto-hide: fully visible for kControlsShowSeconds after the last
+// input activity, then linearly fades to invisible over kControlsFadeSeconds.
+constexpr double kControlsShowSeconds = 1.4;
+constexpr double kControlsFadeSeconds = 0.6;
+
+// Multiplies a color's existing alpha by `factor` (0..1), rather than
+// replacing it like raylib's own Fade() does -- so the bar's own translucency
+// (e.g. Fade(BLACK, 0.6f) for the backdrop) survives being additionally faded
+// out by the auto-hide timer.
+Color WithAlpha(Color c, float factor) {
+    c.a = static_cast<unsigned char>(static_cast<float>(c.a) * factor);
+    return c;
+}
+
 float ButtonRowY(int windowHeight, float height) {
     return static_cast<float>(windowHeight) - kBarHeight + (kBarHeight - height) * 0.5f;
 }
@@ -61,10 +75,12 @@ void DrawLoopIcon(Rectangle button, Color color) {
 bool PlayerControls::Update(PlaybackEngine& engine, int windowWidth, int windowHeight) {
     bool seeked = false;
 
-    if (IsKeyPressed(KEY_SPACE)) {
+    const bool spacePressed = IsKeyPressed(KEY_SPACE);
+    const bool loopKeyPressed = IsKeyPressed(KEY_L);
+    if (spacePressed) {
         engine.TogglePlayPause();
     }
-    if (IsKeyPressed(KEY_L)) {
+    if (loopKeyPressed) {
         engine.ToggleLooping();
     }
 
@@ -85,6 +101,20 @@ bool PlayerControls::Update(PlaybackEngine& engine, int windowWidth, int windowH
     const Rectangle seekHitArea{seekBar.x, static_cast<float>(windowHeight) - kBarHeight,
                                 seekBar.width, kBarHeight};
     const Vector2 mouse = GetMousePosition();
+
+    // Any input activity resets the auto-hide timer (see ui.hpp's class doc):
+    // mouse movement, a held/pressed button, or a keyboard shortcut. The
+    // first call just establishes a baseline (and starts the bar visible on
+    // load) rather than counting a "jump" from (0,0) as movement.
+    const bool mouseMoved = mouseSeen_ && (mouse.x != lastMouseX_ || mouse.y != lastMouseY_);
+    lastMouseX_ = mouse.x;
+    lastMouseY_ = mouse.y;
+    if (!mouseSeen_ || mouseMoved || leftDown || spacePressed || loopKeyPressed
+        || IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_RIGHT) || IsKeyPressed(KEY_HOME)
+        || IsKeyPressed(KEY_END)) {
+        lastActivityTime_ = GetTime();
+    }
+    mouseSeen_ = true;
 
     // Press-arms / release-commits: the action fires on release only if the
     // cursor is still over the same button, and only if the press that
@@ -141,49 +171,70 @@ bool PlayerControls::Update(PlaybackEngine& engine, int windowWidth, int windowH
     return seeked;
 }
 
+float PlayerControls::VisibilityAlpha() const {
+    const double elapsed = GetTime() - lastActivityTime_;
+    if (elapsed <= kControlsShowSeconds) {
+        return 1.0f;
+    }
+    const double fadeElapsed = elapsed - kControlsShowSeconds;
+    if (fadeElapsed >= kControlsFadeSeconds) {
+        return 0.0f;
+    }
+    return 1.0f - static_cast<float>(fadeElapsed / kControlsFadeSeconds);
+}
+
 void PlayerControls::Draw(const PlaybackEngine& engine, int windowWidth, int windowHeight) const {
+    const float alpha = VisibilityAlpha();
+    if (alpha <= 0.0f) {
+        return;
+    }
+
     const float barTop = static_cast<float>(windowHeight) - kBarHeight;
     DrawRectangle(0, static_cast<int>(barTop), windowWidth, static_cast<int>(kBarHeight),
-                  Fade(BLACK, 0.6f));
+                  WithAlpha(Fade(BLACK, 0.6f), alpha));
 
     const Rectangle playButton = PlayButtonRect(windowWidth, windowHeight);
-    DrawRectangleRec(playButton, Fade(WHITE, 0.15f));
+    DrawRectangleRec(playButton, WithAlpha(Fade(WHITE, 0.15f), alpha));
     if (engine.IsPlaying()) {
         DrawRectangle(static_cast<int>(playButton.x + 10), static_cast<int>(playButton.y + 8), 6,
-                      24, RAYWHITE);
+                      24, WithAlpha(RAYWHITE, alpha));
         DrawRectangle(static_cast<int>(playButton.x + 24), static_cast<int>(playButton.y + 8), 6,
-                      24, RAYWHITE);
+                      24, WithAlpha(RAYWHITE, alpha));
     } else {
         const Vector2 p1{playButton.x + 12, playButton.y + 8};
         const Vector2 p2{playButton.x + 12, playButton.y + 32};
         const Vector2 p3{playButton.x + 30, playButton.y + 20};
-        DrawTriangle(p1, p2, p3, RAYWHITE);
+        DrawTriangle(p1, p2, p3, WithAlpha(RAYWHITE, alpha));
     }
 
     const Rectangle loopButton = LoopButtonRect(windowWidth, windowHeight);
     // Filled background when active, outline-only when not -- an
     // unambiguous on/off state independent of icon precision.
-    DrawRectangleRec(loopButton, engine.IsLooping() ? Fade(SKYBLUE, 0.45f) : Fade(WHITE, 0.15f));
-    DrawRectangleLinesEx(loopButton, 1.0f, engine.IsLooping() ? SKYBLUE : Fade(WHITE, 0.4f));
-    DrawLoopIcon(loopButton, engine.IsLooping() ? WHITE : Fade(RAYWHITE, 0.7f));
+    DrawRectangleRec(loopButton, WithAlpha(
+        engine.IsLooping() ? Fade(SKYBLUE, 0.45f) : Fade(WHITE, 0.15f), alpha));
+    DrawRectangleLinesEx(loopButton, 1.0f,
+                        WithAlpha(engine.IsLooping() ? SKYBLUE : Fade(WHITE, 0.4f), alpha));
+    DrawLoopIcon(loopButton, WithAlpha(engine.IsLooping() ? WHITE : Fade(RAYWHITE, 0.7f), alpha));
 
     const Rectangle seekBar = SeekBarRect(windowWidth, windowHeight);
-    DrawRectangleRec(seekBar, Fade(WHITE, 0.25f));
+    DrawRectangleRec(seekBar, WithAlpha(Fade(WHITE, 0.25f), alpha));
     const double fraction = FractionForPts(engine.CurrentPts(), engine.Duration());
     const auto filledWidth = static_cast<float>(fraction) * seekBar.width;
     if (filledWidth > 0.0f) {
         DrawRectangle(static_cast<int>(seekBar.x), static_cast<int>(seekBar.y),
-                      static_cast<int>(filledWidth), static_cast<int>(seekBar.height), RAYWHITE);
+                      static_cast<int>(filledWidth), static_cast<int>(seekBar.height),
+                      WithAlpha(RAYWHITE, alpha));
     }
     DrawCircle(static_cast<int>(seekBar.x + filledWidth),
-               static_cast<int>(seekBar.y + seekBar.height * 0.5f), 7.0f, RAYWHITE);
+               static_cast<int>(seekBar.y + seekBar.height * 0.5f), 7.0f,
+               WithAlpha(RAYWHITE, alpha));
 
     const std::string text =
         FormatTimecode(engine.CurrentPts()) + " / " + FormatTimecode(engine.Duration());
     const int textX = static_cast<int>(static_cast<float>(windowWidth) - kMargin - kTimeTextWidth
                                        + 8.0f);
     const int textY = static_cast<int>(barTop + (kBarHeight - 20.0f) * 0.5f);
-    DrawText(text.c_str(), textX, textY, 18, RAYWHITE);
+    DrawText(text.c_str(), textX, textY, 18, WithAlpha(RAYWHITE, alpha));
 }
 
 }  // namespace ccmfplayer
