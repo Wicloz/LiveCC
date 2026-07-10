@@ -4,38 +4,33 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
-#include <span>
+#include <map>
+#include <optional>
 #include <vector>
 
 #include "engine/chunk.hpp"
 
 namespace ccmfplayer {
 
-// One entry in a file's chunk index: everything needed to seek to and read a
-// chunk's payload without re-scanning the file.
-struct ChunkEntry {
-    std::uint64_t offset = 0;    // byte offset of the chunk's marker byte
-    std::uint64_t pts = 0;
-    std::uint32_t length = 0;    // payload length in bytes (excludes the header)
-    std::uint8_t type = 0;
-    std::uint8_t compression = 0;
-};
-
-// Opens a .ccmf file and indexes its chunk sequence (spec 4.1): one
-// header-only scan from offset 0 -- a stored file "is a bare sequence of
-// container chunks" (spec 1) read by "chaining" from the start (spec
-// 4.1.1) -- giving fast seeking later without ever decoding a payload up
-// front. Chunks are additionally partitioned by type into VideoChunks()/
-// AudioChunks() views, each required to be non-decreasing in PTS (a
-// structural assumption the playback engine's seek binary search depends
-// on); a file that violates it is rejected at load time rather than
-// producing silently-wrong seeks later.
+// Opens a .ccmf file and provides a *lazy, self-synchronizing* view of its
+// chunk sequence. Unlike a naive reader, it never scans the whole file up
+// front (spec 4.1.1 designs CCMF to be seekable like MPEG-TS: a marker byte
+// plus chainable `length` fields). Instead it builds a **sparse index** of
+// chunks discovered on demand -- when reading backwards for the duration, when
+// walking forward during playback, and when homing in on a seek target -- and
+// records every chunk it ever identifies so the work is never repeated. Opening
+// even a multi-gigabyte file is therefore O(tail), not O(file).
+//
+// The index is offset-keyed and always consistent: a chunk is recorded exactly
+// once, and every discovery path funnels through Record(). Callers resolve a
+// presentation timestamp to the chunk(s) active there via RegionAround(), which
+// guarantees the relevant contiguous run of chunks has been discovered.
 //
 // Not copyable (owns a file handle); movable.
 class CcmfFile {
 public:
-    // Opens `path` and builds the index. Throws CcmfError if the file can't
-    // be opened, or its chunk sequence is malformed (spec 7).
+    // Opens `path`. Cheap: stats the size and reads nothing else (the index is
+    // populated lazily). Throws CcmfError only if the file can't be opened.
     explicit CcmfFile(const std::filesystem::path& path);
 
     CcmfFile(const CcmfFile&) = delete;
@@ -43,40 +38,91 @@ public:
     CcmfFile(CcmfFile&&) = default;
     CcmfFile& operator=(CcmfFile&&) = default;
 
-    // Every chunk in file order, including types this player doesn't
-    // otherwise interpret (e.g. a reserved/subtitle type) -- present so
-    // skipped chunks are still visible to callers that want to know.
-    [[nodiscard]] std::span<const ChunkEntry> Chunks() const noexcept { return chunks_; }
-    // Video (type 0) chunks only, in ascending-PTS file order.
-    [[nodiscard]] std::span<const ChunkEntry> VideoChunks() const noexcept { return videoChunks_; }
-    // Audio (type 1) chunks only, in ascending-PTS file order.
-    [[nodiscard]] std::span<const ChunkEntry> AudioChunks() const noexcept { return audioChunks_; }
+    [[nodiscard]] std::uint64_t FileSize() const noexcept { return fileSize_; }
 
-    // Reads and returns the raw payload bytes for one chunk entry (seeks the
-    // underlying file). `entry` must be one this CcmfFile produced (from
-    // Chunks()/VideoChunks()/AudioChunks()); behavior is undefined otherwise.
-    // Logically const (doesn't change the index), even though it physically
-    // moves the file's read position -- hence the mutable stream member.
+    // The chunk at offset 0 (a stored file is a bare sequence of chunks, so it
+    // begins with one -- spec 1). std::nullopt for an empty file or one whose
+    // first bytes aren't a valid header. Records what it finds.
+    [[nodiscard]] std::optional<ChunkEntry> FirstChunk();
+
+    // The chain-adjacent chunk immediately after `entry` (at entry.End()), or
+    // std::nullopt at end-of-file / on a malformed boundary. The cheap forward
+    // step used by normal playback; consults the index before touching disk.
+    [[nodiscard]] std::optional<ChunkEntry> NextChunkAfter(const ChunkEntry& entry);
+
+    // The file's trailing chunk chain, recovered by reading backwards from EOF
+    // (spec 4.1.1). Computed once and cached; every chunk is recorded. Empty
+    // only for a file with no recoverable tail chunk.
+    [[nodiscard]] const std::vector<ChunkEntry>& TailChunks();
+
+    // Ensures the index contains the contiguous run of chunks needed to resolve
+    // any track (video GOP or audio role) active at `pts`, and returns that run
+    // in ascending file order. The run starts far enough before `pts` to include
+    // a long GOP or audio chunk already in progress, and ends at the first chunk
+    // whose pts exceeds `pts` (or EOF). This is the seek homer: it interpolates
+    // a byte guess from the sparse index, resyncs there, and narrows until the
+    // target region is pinned -- all discovered chunks are recorded.
+    [[nodiscard]] std::vector<ChunkEntry> RegionAround(std::uint64_t pts);
+
+    // A snapshot of every chunk currently in the sparse index, ascending by
+    // offset. Reflects only what has been discovered so far (for diagnostics
+    // and tests that assert the index grew opportunistically rather than all at
+    // once).
+    [[nodiscard]] std::vector<ChunkEntry> KnownChunks() const;
+
+    // Whether any video (type 0) chunk has been discovered yet. True after the
+    // engine's construction-time bootstrap for any file that has video.
+    [[nodiscard]] bool KnowsAnyVideo() const noexcept { return knowsVideo_; }
+
+    // A full, eager linear scan from offset 0 (the pre-lazy behaviour), returned
+    // partitioned by type. Provided ONLY as a reference/verification path (tests
+    // cross-check against it, and it's an escape hatch); the playback path never
+    // calls it. Throws CcmfError on a truncated/malformed chunk sequence.
+    struct FullIndex {
+        std::vector<ChunkEntry> chunks;  // every chunk in file order
+        std::vector<ChunkEntry> video;   // type 0 only
+        std::vector<ChunkEntry> audio;   // type 1 only
+    };
+    [[nodiscard]] FullIndex IndexAll();
+
+    // Reads and returns the raw payload bytes for one chunk entry, inflating any
+    // compression (spec 4.1.2) so callers get the decompressed payload.
     [[nodiscard]] std::vector<std::byte> ReadChunkPayload(const ChunkEntry& entry) const;
 
-    // Reads just `length` bytes of a chunk's payload starting `payloadOffset`
-    // bytes into it, without reading the rest -- for peeking at a small
-    // header (e.g. an audio chunk's a-hdr byte, spec 4.6) without paying to
-    // read the whole payload. Throws CcmfError if `payloadOffset + length`
-    // exceeds the chunk's declared length. ReadChunkPayload(entry) is
-    // exactly ReadChunkPayloadRange(entry, 0, entry.length).
+    // Reads `length` bytes of a chunk's *on-wire* (possibly compressed) payload
+    // starting `payloadOffset` bytes in, without reading the rest -- for peeking
+    // at a small header. Throws CcmfError if the range exceeds the chunk's
+    // declared length. ReadChunkPayload(entry) is ReadChunkPayloadRange(entry, 0,
+    // entry.length) followed by decompression.
     [[nodiscard]] std::vector<std::byte> ReadChunkPayloadRange(const ChunkEntry& entry,
                                                                 std::uint64_t payloadOffset,
                                                                 std::uint64_t length) const;
 
 private:
-    void BuildIndex();
+    // Inserts `entry` into the sparse index (idempotent, keyed by offset) and
+    // returns the stored copy. Every discovery path goes through here.
+    const ChunkEntry& Record(const ChunkEntry& entry);
+
+    // The header at `offset`, from the index if already known, else read (and
+    // recorded) from disk. std::nullopt on a malformed/out-of-range header.
+    [[nodiscard]] std::optional<ChunkEntry> ReadHeaderAt(std::uint64_t offset);
+
+    // Records FirstChunk() and TailChunks() so the index brackets any pts in
+    // [0, duration]; sets knowsVideo_ if a video chunk turns up. Idempotent.
+    void EnsureBootstrap();
+
+    // Offset of a chunk boundary whose pts is <= `target`, homed in as close to
+    // `target` as the sparse index and resync allow. Bootstrap must have run.
+    [[nodiscard]] std::uint64_t HomeToPtsAtMost(std::uint64_t target);
 
     std::filesystem::path path_;
     mutable std::ifstream file_;
-    std::vector<ChunkEntry> chunks_;
-    std::vector<ChunkEntry> videoChunks_;
-    std::vector<ChunkEntry> audioChunks_;
+    std::uint64_t fileSize_ = 0;
+
+    std::map<std::uint64_t, ChunkEntry> known_;  // offset -> chunk; the sparse index
+    std::optional<std::vector<ChunkEntry>> tailChunks_;
+    bool bootstrapped_ = false;
+    bool knowsVideo_ = false;
 };
 
 }  // namespace ccmfplayer

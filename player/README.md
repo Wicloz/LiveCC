@@ -99,11 +99,24 @@ report. If your MinGW distribution hits the linker issue noted above, it
 blocks the *test binary* the same way with or without coverage on — that's
 the toolchain bug, not this option.
 
+## Loading & seeking
+
+Files are opened lazily and are **self-synchronizing** (CCMF spec §4.1.1): the
+player never scans the whole file up front. It reads backwards from the end to
+recover the duration, then builds its chunk index opportunistically — while
+playing forward, and while homing in on a seek (interpolate a byte offset,
+resync to the next marker, narrow). Opening a multi-gigabyte file is therefore
+near-instant, and seeking touches only a small neighbourhood of chunks.
+
 ## Known limitations (v1)
 
-- Audio: plays mono, or true interleaved stereo (front-left + front-right).
-  A file with only surround/center/LFE roles (e.g. rendered with
-  `--channels 5.1`) has no audio output — no downmix is implemented.
+- Audio output uses a **fixed** layout (stereo by default; the OS
+  default-device channel count isn't queried yet). Whatever roles a file
+  carries near the playhead are up/down-mixed into it (a mono source fills both
+  channels; a stereo/5.1 source is downmixed), so any file plays — but a true
+  positional 5.1/7.1 render isn't reproduced. `HasAudio()` is a best-effort
+  head/tail probe, so audio that appears only strictly mid-file may not open a
+  device.
 - No file-open dialog or drag-and-drop; the file path is a CLI argument.
 - A/V sync: audio is the master clock, so the displayed video frame trails
   "what you're hearing" by roughly the audio device's buffer depth (tens of

@@ -1,5 +1,6 @@
 add_library(ccmf_engine STATIC
     chunk.cpp
+    resync.cpp
     index.cpp
     video.cpp
     render.cpp

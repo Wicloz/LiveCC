@@ -88,7 +88,8 @@ TEST(FindFrameIndexForPts, SingleFrameAlwaysZero) {
 // --------------------------------------------------------------------------
 
 TEST(PlaybackEngine, ConstructionReportsFileProperties) {
-    PlaybackEngine engine(Fixture("multi_gop_mono.ccmf"));
+    // A mono output device (outputChannels = 1) playing this mono file.
+    PlaybackEngine engine(Fixture("multi_gop_mono.ccmf"), 1);
     EXPECT_TRUE(engine.HasVideo());
     EXPECT_TRUE(engine.HasAudio());
     EXPECT_EQ(engine.ChannelCount(), 1u);
@@ -125,7 +126,8 @@ TEST(PlaybackEngine, AudioOnlyFixtureHasNoVideo) {
 TEST(PlaybackEngine, SeekToStartShowsFirstFrame) {
     PlaybackEngine engine(Fixture("multi_gop_mono.ccmf"));
     CcmfFile raw(Fixture("multi_gop_mono.ccmf"));
-    const DecodedGop expectedGop0 = DecodeVideoPayload(raw.ReadChunkPayload(raw.VideoChunks()[0]));
+    const CcmfFile::FullIndex idx = raw.IndexAll();
+    const DecodedGop expectedGop0 = DecodeVideoPayload(raw.ReadChunkPayload(idx.video[0]));
 
     engine.Seek(0);
     ASSERT_NE(engine.CurrentFrame(), nullptr);
@@ -137,7 +139,8 @@ TEST(PlaybackEngine, SeekToStartShowsFirstFrame) {
 TEST(PlaybackEngine, SeekIntoSecondGopDecodesTheRightChunk) {
     PlaybackEngine engine(Fixture("multi_gop_mono.ccmf"));
     CcmfFile raw(Fixture("multi_gop_mono.ccmf"));
-    const DecodedGop expectedGop1 = DecodeVideoPayload(raw.ReadChunkPayload(raw.VideoChunks()[1]));
+    const CcmfFile::FullIndex idx = raw.IndexAll();
+    const DecodedGop expectedGop1 = DecodeVideoPayload(raw.ReadChunkPayload(idx.video[1]));
 
     engine.Seek(50000);  // GOP1 starts at 48000; 2000 samples into it
     ASSERT_NE(engine.CurrentFrame(), nullptr);
@@ -148,8 +151,9 @@ TEST(PlaybackEngine, SeekIntoSecondGopDecodesTheRightChunk) {
 TEST(PlaybackEngine, SeekToExactDurationShowsLastFrameOfLastGop) {
     PlaybackEngine engine(Fixture("multi_gop_mono.ccmf"));
     CcmfFile raw(Fixture("multi_gop_mono.ccmf"));
+    const CcmfFile::FullIndex idx = raw.IndexAll();
     const DecodedGop expectedLastGop =
-        DecodeVideoPayload(raw.ReadChunkPayload(raw.VideoChunks().back()));
+        DecodeVideoPayload(raw.ReadChunkPayload(idx.video.back()));
 
     engine.Seek(216000);
     EXPECT_EQ(engine.CurrentPts(), 216000u);
@@ -181,14 +185,52 @@ TEST(PlaybackEngine, RepeatedSeeksWithinTheSameGopAreCheap) {
     (void)second;
 }
 
+TEST(PlaybackEngine, VideoSwitchesGopsWhenNextVideoTrailsAudioInFileOrder) {
+    // Regression: a GOP's active range must be bounded by its own duration, not
+    // by "the next video chunk's pts". Reassemble the real fixture with the
+    // audio chunk placed *before* the video chunk at each timestamp, so the
+    // chunk right after a target's group is audio. A region walk that stops at
+    // the first chunk past the target then contains no "next video" chunk -- if
+    // the engine derived the active range from that, it would cache the first
+    // GOP all the way to EOF and freeze video after ~the first GOP (the actual
+    // First Transmission.ccmf symptom).
+    CcmfFile src(Fixture("multi_gop_mono.ccmf"));
+    const CcmfFile::FullIndex idx = src.IndexAll();
+    ASSERT_EQ(idx.video.size(), idx.audio.size());
+    ASSERT_GE(idx.video.size(), 3u);
+
+    std::vector<std::byte> bytes;
+    std::vector<DecodedGop> expectedGops;
+    for (std::size_t i = 0; i < idx.video.size(); ++i) {
+        const auto videoPayload = src.ReadChunkPayload(idx.video[i]);
+        const auto audioPayload = src.ReadChunkPayload(idx.audio[i]);
+        expectedGops.push_back(DecodeVideoPayload(videoPayload));
+        const auto ac = testing_support::BuildChunk(idx.audio[i].pts, kChunkTypeAudio, audioPayload);
+        const auto vc = testing_support::BuildChunk(idx.video[i].pts, kChunkTypeVideo, videoPayload);
+        bytes.insert(bytes.end(), ac.begin(), ac.end());  // audio first...
+        bytes.insert(bytes.end(), vc.begin(), vc.end());   // ...then video, same pts
+    }
+    const testing_support::TempFile file(bytes);
+    PlaybackEngine engine(file.Path(), 1);
+
+    // Seeking into each GOP must resolve that GOP, not a stale earlier one.
+    for (std::size_t g = 0; g < idx.video.size(); ++g) {
+        engine.Seek(idx.video[g].pts + 1000);
+        ASSERT_NE(engine.CurrentFrame(), nullptr) << "GOP " << g;
+        const std::size_t fi = FindFrameIndexForPts(expectedGops[g].frames, 1000);
+        EXPECT_EQ(engine.CurrentFrame()->glyph, expectedGops[g].frames[fi].glyph) << "GOP " << g;
+    }
+}
+
 // --------------------------------------------------------------------------
 // Audio pulling: cross-checked against direct decode of the same chunks.
 // --------------------------------------------------------------------------
 
 TEST(PlaybackEngine, PullAudioFromStartMatchesDirectDecode) {
-    PlaybackEngine engine(Fixture("multi_gop_mono.ccmf"));
+    PlaybackEngine engine(Fixture("multi_gop_mono.ccmf"), 1);  // mono output
     CcmfFile raw(Fixture("multi_gop_mono.ccmf"));
-    const DecodedAudio expected = DecodeAudioPayload(raw.ReadChunkPayload(raw.AudioChunks()[0]));
+    const CcmfFile::FullIndex idx = raw.IndexAll();
+    const DecodedAudio expected = DecodeAudioPayload(raw.ReadChunkPayload(idx.audio[0]));
 
     engine.Seek(0);
     std::vector<std::int16_t> buf(100);
@@ -200,10 +242,11 @@ TEST(PlaybackEngine, PullAudioFromStartMatchesDirectDecode) {
 }
 
 TEST(PlaybackEngine, PullAudioAcrossChunkBoundaryIsContinuous) {
-    PlaybackEngine engine(Fixture("multi_gop_mono.ccmf"));
+    PlaybackEngine engine(Fixture("multi_gop_mono.ccmf"), 1);  // mono output
     CcmfFile raw(Fixture("multi_gop_mono.ccmf"));
-    const DecodedAudio chunk0 = DecodeAudioPayload(raw.ReadChunkPayload(raw.AudioChunks()[0]));
-    const DecodedAudio chunk1 = DecodeAudioPayload(raw.ReadChunkPayload(raw.AudioChunks()[1]));
+    const CcmfFile::FullIndex idx = raw.IndexAll();
+    const DecodedAudio chunk0 = DecodeAudioPayload(raw.ReadChunkPayload(idx.audio[0]));
+    const DecodedAudio chunk1 = DecodeAudioPayload(raw.ReadChunkPayload(idx.audio[1]));
     ASSERT_EQ(chunk0.pcm.size(), 48000u);
 
     engine.Seek(0);
@@ -218,7 +261,7 @@ TEST(PlaybackEngine, PullAudioAcrossChunkBoundaryIsContinuous) {
 }
 
 TEST(PlaybackEngine, PullAudioNearEndOfTrackReturnsOnlyWhatRemains) {
-    PlaybackEngine engine(Fixture("multi_gop_mono.ccmf"));
+    PlaybackEngine engine(Fixture("multi_gop_mono.ccmf"), 1);  // mono output
     engine.Seek(216000 - 50);
     std::vector<std::int16_t> buf(1000, -1);
     const std::size_t written = engine.PullAudio(buf);
@@ -227,13 +270,14 @@ TEST(PlaybackEngine, PullAudioNearEndOfTrackReturnsOnlyWhatRemains) {
 }
 
 TEST(PlaybackEngine, SeekResetsTheAudioCursor) {
-    PlaybackEngine engine(Fixture("multi_gop_mono.ccmf"));
+    PlaybackEngine engine(Fixture("multi_gop_mono.ccmf"), 1);  // mono output
     std::vector<std::int16_t> buf(1000);
     engine.PullAudio(buf);  // advance the cursor away from 0
 
     engine.Seek(0);
     CcmfFile raw(Fixture("multi_gop_mono.ccmf"));
-    const DecodedAudio expected = DecodeAudioPayload(raw.ReadChunkPayload(raw.AudioChunks()[0]));
+    const CcmfFile::FullIndex idx = raw.IndexAll();
+    const DecodedAudio expected = DecodeAudioPayload(raw.ReadChunkPayload(idx.audio[0]));
     std::vector<std::int16_t> after(100);
     engine.PullAudio(after);
     for (std::size_t i = 0; i < 100; ++i) {
@@ -247,9 +291,10 @@ TEST(PlaybackEngine, StereoAudioInterleavesLeftAndRight) {
     ASSERT_EQ(engine.ChannelCount(), 2u);
 
     CcmfFile raw(Fixture("small_stereo.ccmf"));
-    ASSERT_EQ(raw.AudioChunks().size(), 2u);
-    const DecodedAudio left = DecodeAudioPayload(raw.ReadChunkPayload(raw.AudioChunks()[0]));
-    const DecodedAudio right = DecodeAudioPayload(raw.ReadChunkPayload(raw.AudioChunks()[1]));
+    const CcmfFile::FullIndex idx = raw.IndexAll();
+    ASSERT_EQ(idx.audio.size(), 2u);
+    const DecodedAudio left = DecodeAudioPayload(raw.ReadChunkPayload(idx.audio[0]));
+    const DecodedAudio right = DecodeAudioPayload(raw.ReadChunkPayload(idx.audio[1]));
     ASSERT_EQ(left.channel, kChannelFrontLeft);
     ASSERT_EQ(right.channel, kChannelFrontRight);
 
@@ -260,6 +305,55 @@ TEST(PlaybackEngine, StereoAudioInterleavesLeftAndRight) {
     for (std::size_t frame = 0; frame < 10; ++frame) {
         EXPECT_EQ(buf[frame * 2 + 0], left.pcm[frame]) << "frame " << frame << " left";
         EXPECT_EQ(buf[frame * 2 + 1], right.pcm[frame]) << "frame " << frame << " right";
+    }
+}
+
+// --------------------------------------------------------------------------
+// Fixed output layout + dynamic remap: the output channel count comes from the
+// device, and the file's source layout is up/down-mixed into it.
+// --------------------------------------------------------------------------
+
+TEST(PlaybackEngine, OutputChannelCountIsFixedNotTakenFromFile) {
+    // The same mono file rendered to a mono vs. a stereo output device.
+    PlaybackEngine mono(Fixture("multi_gop_mono.ccmf"), 1);
+    PlaybackEngine stereo(Fixture("multi_gop_mono.ccmf"), 2);
+    EXPECT_EQ(mono.ChannelCount(), 1u);
+    EXPECT_EQ(stereo.ChannelCount(), 2u);
+}
+
+TEST(PlaybackEngine, MonoSourceUpmixesToBothStereoOutputChannels) {
+    PlaybackEngine engine(Fixture("multi_gop_mono.ccmf"), 2);  // stereo output, mono file
+    ASSERT_EQ(engine.ChannelCount(), 2u);
+
+    CcmfFile raw(Fixture("multi_gop_mono.ccmf"));
+    const CcmfFile::FullIndex idx = raw.IndexAll();
+    const DecodedAudio mono = DecodeAudioPayload(raw.ReadChunkPayload(idx.audio[0]));
+
+    engine.Seek(0);
+    std::vector<std::int16_t> buf(20);  // 10 frames x 2 channels
+    ASSERT_EQ(engine.PullAudio(buf), 20u);
+    for (std::size_t f = 0; f < 10; ++f) {
+        EXPECT_EQ(buf[f * 2 + 0], mono.pcm[f]) << "frame " << f << " left";
+        EXPECT_EQ(buf[f * 2 + 1], mono.pcm[f]) << "frame " << f << " right";
+    }
+}
+
+TEST(PlaybackEngine, StereoSourceDownmixesToMonoOutput) {
+    PlaybackEngine engine(Fixture("small_stereo.ccmf"), 1);  // mono output, stereo file
+    ASSERT_EQ(engine.ChannelCount(), 1u);
+
+    CcmfFile raw(Fixture("small_stereo.ccmf"));
+    const CcmfFile::FullIndex idx = raw.IndexAll();
+    const DecodedAudio left = DecodeAudioPayload(raw.ReadChunkPayload(idx.audio[0]));
+    const DecodedAudio right = DecodeAudioPayload(raw.ReadChunkPayload(idx.audio[1]));
+
+    engine.Seek(0);
+    std::vector<std::int16_t> buf(10);
+    ASSERT_EQ(engine.PullAudio(buf), 10u);
+    for (std::size_t f = 0; f < 10; ++f) {
+        const auto avg = static_cast<std::int16_t>(
+            (static_cast<std::int32_t>(left.pcm[f]) + right.pcm[f]) / 2);
+        EXPECT_EQ(buf[f], avg) << "frame " << f;
     }
 }
 
@@ -288,7 +382,7 @@ TEST(PlaybackEngine, AdvanceWhilePausedDoesNothing) {
 }
 
 TEST(PlaybackEngine, AdvanceFollowsTheAudioCursorWhenAudioIsPresent) {
-    PlaybackEngine engine(Fixture("multi_gop_mono.ccmf"));
+    PlaybackEngine engine(Fixture("multi_gop_mono.ccmf"), 1);  // mono output
     engine.Seek(0);
     engine.Play();
 
@@ -369,7 +463,7 @@ TEST(PlaybackEngine, LoopingContinuesPlayingAcrossMultipleWraps) {
 }
 
 TEST(PlaybackEngine, AudioFollowsLoopRestartToo) {
-    PlaybackEngine engine(Fixture("multi_gop_mono.ccmf"));
+    PlaybackEngine engine(Fixture("multi_gop_mono.ccmf"), 1);  // mono output
     engine.SetLooping(true);
     engine.Play();
 
@@ -383,7 +477,8 @@ TEST(PlaybackEngine, AudioFollowsLoopRestartToo) {
     // The audio cursor was reset by the loop restart too, so pulling again
     // from here reproduces the start of the track, not silence/EOF.
     CcmfFile raw(Fixture("multi_gop_mono.ccmf"));
-    const DecodedAudio expected = DecodeAudioPayload(raw.ReadChunkPayload(raw.AudioChunks()[0]));
+    const CcmfFile::FullIndex idx = raw.IndexAll();
+    const DecodedAudio expected = DecodeAudioPayload(raw.ReadChunkPayload(idx.audio[0]));
     std::vector<std::int16_t> after(100);
     const std::size_t written = engine.PullAudio(after);
     ASSERT_EQ(written, 100u);
@@ -411,7 +506,7 @@ TEST(PlaybackEngine, CorruptFirstVideoChunkThrowsFromConstructor) {
     std::vector<std::byte> bytes = ReadWholeFile(original);
 
     CcmfFile raw(original);
-    const ChunkEntry& first = raw.VideoChunks()[0];
+    const ChunkEntry first = raw.IndexAll().video[0];
     // Stomp the whole payload with a byte pattern DecodeVideoPayload can't
     // parse as a valid unit stream (0xFF -> flags bit7 set, enc=7, unknown).
     for (std::uint64_t i = 0; i < first.length; ++i) {
@@ -427,11 +522,12 @@ TEST(PlaybackEngine, CorruptMiddleVideoChunkDegradesGracefully) {
     std::vector<std::byte> bytes = ReadWholeFile(original);
 
     CcmfFile raw(original);
-    const ChunkEntry& secondGop = raw.VideoChunks()[2];  // corrupt GOP index 2, not first/last
+    const CcmfFile::FullIndex idx = raw.IndexAll();
+    const ChunkEntry secondGop = idx.video[2];  // corrupt GOP index 2, not first/last
     for (std::uint64_t i = 0; i < secondGop.length; ++i) {
         bytes[secondGop.offset + kChunkHeaderSize + i] = std::byte{0xFF};
     }
-    const DecodedGop expectedGop0 = DecodeVideoPayload(raw.ReadChunkPayload(raw.VideoChunks()[0]));
+    const DecodedGop expectedGop0 = DecodeVideoPayload(raw.ReadChunkPayload(idx.video[0]));
 
     const TempFile corrupted(bytes);
     PlaybackEngine engine(corrupted.Path());  // must NOT throw: only chunk 2 is bad

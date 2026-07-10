@@ -3,9 +3,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <list>
 #include <optional>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "engine/audio.hpp"
@@ -17,10 +19,9 @@ namespace ccmfplayer {
 // Resolves which chunk in an ascending-PTS chunk list is "active" at `pts`:
 // the last chunk whose own pts is <= `pts` (every chunk holds until the next
 // one starts). A `pts` before the first chunk clamps to index 0; `chunks`
-// MUST be sorted ascending by pts (true of CcmfFile's VideoChunks()/
-// AudioChunks(), and of any single audio role's chunk list, since those are
-// subsets of AudioChunks() in file order). Returns 0 for an empty `chunks`
-// (callers must not dereference without checking emptiness first).
+// MUST be sorted ascending by pts. A generic binary-search helper over an
+// in-memory chunk run (e.g. one RegionAround() result); returns 0 for an empty
+// `chunks` (callers must not dereference without checking emptiness first).
 [[nodiscard]] std::size_t FindChunkIndexForPts(std::span<const ChunkEntry> chunks,
                                                 std::uint64_t pts) noexcept;
 
@@ -38,11 +39,15 @@ namespace ccmfplayer {
 // about chunks, GOPs, or codecs. Everything here is framework-independent
 // and fully unit-testable without a window or audio device.
 //
-// Audio scope (see the project plan): plays mono (role 0) if present, or
-// true interleaved stereo if both front-left and front-right are present;
-// other roles (center/LFE/surround/rear) are decoded by nothing here (no
-// 5.1/7.1 downmix in v1) -- a file with only those roles has HasAudio() ==
-// false.
+// Audio scope: the OUTPUT layout is fixed by the app/OS device (mono or
+// stereo, `outputChannels` in the constructor), independent of what the file
+// carries. The file's role set may change at any point (spec 5.4), so nothing
+// is pre-scanned; instead, whatever roles are present near the current PTS are
+// discovered opportunistically and up/down-mixed into the fixed output roles
+// (ResolveOutputSources, audio.hpp): a mono source fills both stereo channels,
+// a stereo source downmixes to a mono output, and so on. PullAudio() therefore
+// always emits exactly ChannelCount() interleaved channels regardless of the
+// source layout.
 //
 // Sync model: while playing, if the file has audio, audio is the master
 // clock -- PullAudio() advances the audio cursor as the app layer's audio
@@ -59,19 +64,28 @@ namespace ccmfplayer {
 // decoded, isn't playable at all.
 class PlaybackEngine {
 public:
-    explicit PlaybackEngine(const std::filesystem::path& path);
+    // `outputChannels` is the fixed device output layout: 1 (mono) or 2
+    // (stereo, the default). The file's own channel layout is irrelevant to
+    // this -- source roles are remixed into these output channels (see the
+    // class doc's audio scope).
+    explicit PlaybackEngine(const std::filesystem::path& path, std::uint32_t outputChannels = 2);
 
     PlaybackEngine(const PlaybackEngine&) = delete;
     PlaybackEngine& operator=(const PlaybackEngine&) = delete;
     PlaybackEngine(PlaybackEngine&&) = default;
     PlaybackEngine& operator=(PlaybackEngine&&) = default;
 
-    [[nodiscard]] bool HasVideo() const noexcept { return !file_.VideoChunks().empty(); }
-    [[nodiscard]] bool HasAudio() const noexcept { return !audioRoles_.empty(); }
-    // 0 if HasAudio() is false; otherwise 1 (mono) or 2 (stereo). PullAudio's
-    // output is interleaved frames of exactly this many samples each.
+    [[nodiscard]] bool HasVideo() const noexcept { return hasVideo_; }
+    // Best-effort: true if any audio chunk was found near the file's head or
+    // tail. (A file whose audio appears only strictly mid-file, with none near
+    // either end, may read as false -- producers keep a stable layout, so this
+    // is a practical, not exact, signal; see the class doc.)
+    [[nodiscard]] bool HasAudio() const noexcept { return hasAudio_; }
+    // 0 if HasAudio() is false; otherwise the fixed output channel count (1 or
+    // 2), NOT the file's source channel count. PullAudio's output is
+    // interleaved frames of exactly this many samples each.
     [[nodiscard]] std::uint32_t ChannelCount() const noexcept {
-        return static_cast<std::uint32_t>(audioRoles_.size());
+        return hasAudio_ ? outputChannels_ : 0;
     }
     [[nodiscard]] std::uint16_t Width() const noexcept { return width_; }
     [[nodiscard]] std::uint16_t Height() const noexcept { return height_; }
@@ -128,37 +142,55 @@ public:
     std::size_t PullAudio(std::span<std::int16_t> out) noexcept;
 
 private:
-    // One audio role's own chunk list and decode cache (spec 4.6: multiple
-    // roles are independent chunk sequences sharing PTS, e.g. stereo's
-    // front-left/front-right).
-    struct AudioRoleState {
-        std::vector<ChunkEntry> chunks;
-        std::optional<std::size_t> decodedChunkIndex;
-        std::vector<std::int16_t> decodedPcm;
+    // One source audio role active at the cursor: its chunk plus decoded PCM.
+    struct ActiveRole {
+        std::uint8_t role = 0;
+        ChunkEntry chunk;
+        std::vector<std::int16_t> pcm;
     };
 
-    void SelectAudioChannel();
-    void ComputeDuration();
-    void DecodeVideoChunkAt(std::size_t chunkIndex) noexcept;
-    void ResolveVideoFrame() noexcept;
-    [[nodiscard]] bool EnsureAudioRoleDecoded(AudioRoleState& role, std::uint64_t pts) noexcept;
+    void BootstrapVideoAndDuration();  // dims + duration from head probe + tail
+    void ResolveVideoAt(std::uint64_t pts) noexcept;
+    [[nodiscard]] bool DecodeGopAt(const ChunkEntry& entry) noexcept;  // false on decode failure
+    void RefreshActiveAudio(std::uint64_t pts) noexcept;
+    // Decodes an audio chunk with a small LRU cache (returns nullptr on decode
+    // failure). Cache keyed by chunk offset.
+    [[nodiscard]] const DecodedAudio* DecodeAudioCached(const ChunkEntry& entry) noexcept;
 
     CcmfFile file_;
     std::uint16_t width_ = 0;
     std::uint16_t height_ = 0;
     std::uint64_t duration_ = 0;
+    bool hasVideo_ = false;
+    bool hasAudio_ = false;
+    std::uint32_t outputChannels_ = 2;
+    std::vector<std::uint8_t> outputRoles_;  // fixed output layout (spec 4.6 roles)
 
     std::uint64_t currentPts_ = 0;
     bool playing_ = false;
     bool looping_ = false;
     std::string lastError_;
 
-    std::vector<AudioRoleState> audioRoles_;  // size 0, 1 (mono), or 2 (stereo: [L, R])
-    std::uint64_t audioCursorPts_ = 0;
-
-    std::optional<std::size_t> decodedVideoChunkIndex_;
+    // Video: the currently-decoded GOP and which chunk it came from, plus the
+    // pts at which it stops being the active GOP (the next video chunk's pts,
+    // or duration).
+    std::optional<std::uint64_t> decodedVideoOffset_;
+    std::uint64_t activeVideoStart_ = 0;
+    std::uint64_t activeVideoEnd_ = 0;
     DecodedGop decodedGop_;
     std::size_t currentFrameIndex_ = 0;
+
+    // Audio: the roles active at the cursor and the pts window over which that
+    // set stays valid; refreshed lazily when the cursor leaves it.
+    std::uint64_t audioCursorPts_ = 0;
+    std::vector<ActiveRole> activeAudio_;
+    std::uint64_t activeAudioValidFrom_ = 0;
+    std::uint64_t activeAudioValidUntil_ = 0;
+
+    // Small LRU of decoded audio chunks (offset -> PCM), so re-deriving the
+    // active set within the same chunks doesn't re-decode.
+    std::list<std::pair<std::uint64_t, DecodedAudio>> audioCache_;
+    std::size_t audioCacheCap_ = 8;
 };
 
 }  // namespace ccmfplayer

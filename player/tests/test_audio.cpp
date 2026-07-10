@@ -140,10 +140,11 @@ TEST(DecodeAudioPayload, HeaderOnlyPayloadIsEmptyPcm) {
 // 72000 samples each, first 5 raw bytes all 128 (silence).
 TEST(DecodeAudioPayload, MatchesPythonReferenceForRealFixture) {
     const std::filesystem::path fixturesDir(CCMF_TEST_FIXTURES_DIR);
-    const CcmfFile ccmf(fixturesDir / "small_stereo.ccmf");
-    ASSERT_EQ(ccmf.AudioChunks().size(), 2u);
+    CcmfFile ccmf(fixturesDir / "small_stereo.ccmf");
+    const CcmfFile::FullIndex idx = ccmf.IndexAll();
+    ASSERT_EQ(idx.audio.size(), 2u);
 
-    const DecodedAudio left = DecodeAudioPayload(ccmf.ReadChunkPayload(ccmf.AudioChunks()[0]));
+    const DecodedAudio left = DecodeAudioPayload(ccmf.ReadChunkPayload(idx.audio[0]));
     EXPECT_EQ(left.codec, kAudioCodecPcm8);
     EXPECT_EQ(left.channel, kChannelFrontLeft);
     ASSERT_EQ(left.pcm.size(), 72000u);
@@ -151,10 +152,57 @@ TEST(DecodeAudioPayload, MatchesPythonReferenceForRealFixture) {
         EXPECT_EQ(left.pcm[i], 0) << "sample " << i;  // byte 128 -> amplitude 0
     }
 
-    const DecodedAudio right = DecodeAudioPayload(ccmf.ReadChunkPayload(ccmf.AudioChunks()[1]));
+    const DecodedAudio right = DecodeAudioPayload(ccmf.ReadChunkPayload(idx.audio[1]));
     EXPECT_EQ(right.codec, kAudioCodecPcm8);
     EXPECT_EQ(right.channel, kChannelFrontRight);
     EXPECT_EQ(right.pcm.size(), 72000u);
+}
+
+// --------------------------------------------------------------------------
+// Output layout + role remapping (the fixed-output / dynamic up-down-mix path).
+// --------------------------------------------------------------------------
+
+TEST(OutputRolesForChannelCount, MonoAndStereo) {
+    EXPECT_EQ(OutputRolesForChannelCount(1), (std::vector<std::uint8_t>{kChannelMono}));
+    EXPECT_EQ(OutputRolesForChannelCount(2),
+              (std::vector<std::uint8_t>{kChannelFrontLeft, kChannelFrontRight}));
+    // Anything else falls back to stereo.
+    EXPECT_EQ(OutputRolesForChannelCount(6),
+              (std::vector<std::uint8_t>{kChannelFrontLeft, kChannelFrontRight}));
+    EXPECT_EQ(OutputRolesForChannelCount(0), (std::vector<std::uint8_t>{kChannelMono}));
+}
+
+TEST(ResolveOutputSources, ExactMatchPassesThrough) {
+    EXPECT_EQ(ResolveOutputSources(kChannelFrontLeft, {kChannelFrontLeft, kChannelFrontRight}),
+              (std::vector<std::uint8_t>{kChannelFrontLeft}));
+    EXPECT_EQ(ResolveOutputSources(kChannelMono, {kChannelMono}),
+              (std::vector<std::uint8_t>{kChannelMono}));
+}
+
+TEST(ResolveOutputSources, MonoSourceUpmixesToBothStereoChannels) {
+    EXPECT_EQ(ResolveOutputSources(kChannelFrontLeft, {kChannelMono}),
+              (std::vector<std::uint8_t>{kChannelMono}));
+    EXPECT_EQ(ResolveOutputSources(kChannelFrontRight, {kChannelMono}),
+              (std::vector<std::uint8_t>{kChannelMono}));
+}
+
+TEST(ResolveOutputSources, StereoSourceDownmixesToMonoOutput) {
+    // Mono output with no mono source but L+R present -> average of the two.
+    EXPECT_EQ(ResolveOutputSources(kChannelMono, {kChannelFrontLeft, kChannelFrontRight}),
+              (std::vector<std::uint8_t>{kChannelFrontLeft, kChannelFrontRight}));
+}
+
+TEST(ResolveOutputSources, PrefersNearestNeighbourThenAnything) {
+    // FL output, only FR present -> use FR rather than go silent.
+    EXPECT_EQ(ResolveOutputSources(kChannelFrontLeft, {kChannelFrontRight}),
+              (std::vector<std::uint8_t>{kChannelFrontRight}));
+    // FR output, mono present -> prefer mono.
+    EXPECT_EQ(ResolveOutputSources(kChannelFrontRight, {kChannelMono, kChannelFrontLeft}),
+              (std::vector<std::uint8_t>{kChannelMono}));
+}
+
+TEST(ResolveOutputSources, EmptyPresentIsSilence) {
+    EXPECT_TRUE(ResolveOutputSources(kChannelMono, {}).empty());
 }
 
 }  // namespace

@@ -50,6 +50,26 @@ struct ChunkHeader {
     std::uint8_t compression = 0;
 };
 
+// One located chunk: a parsed header (spec 4.1) plus the byte offset of its
+// marker in the file. This is the atom of the sparse chunk index and the unit
+// the resync primitives (resync.hpp) chain over -- everything needed to seek to
+// a chunk and read its payload without re-scanning. Defined here (rather than
+// in index.hpp) so both the index and the low-level resync layer can use it
+// without a circular include.
+struct ChunkEntry {
+    std::uint64_t offset = 0;    // byte offset of the chunk's marker byte
+    std::uint64_t pts = 0;
+    std::uint32_t length = 0;    // payload length in bytes (excludes the 12-byte header)
+    std::uint8_t type = 0;
+    std::uint8_t compression = 0;
+
+    // Byte offset just past this chunk -- where the next chunk's marker sits
+    // (spec 4.1.1: chunk N+1 begins at offset(N) + 12 + length).
+    [[nodiscard]] constexpr std::uint64_t End() const noexcept {
+        return offset + kChunkHeaderSize + length;
+    }
+};
+
 // Parses exactly the first kChunkHeaderSize bytes of `buf` as a chunk header.
 // `buf` may be longer (only the header is read); it must be at least
 // kChunkHeaderSize bytes. This function knows nothing about a payload's

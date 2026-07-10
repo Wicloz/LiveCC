@@ -54,4 +54,21 @@ struct DecodedAudio {
 // CcmfError on an empty payload or an unsupported codec.
 [[nodiscard]] DecodedAudio DecodeAudioPayload(std::span<const std::byte> payload);
 
+// The output channel layout for an `n`-channel device, as a list of channel
+// roles (spec 4.6 numbering): 1 -> {mono}, 2 -> {front-left, front-right}.
+// Any other count is treated as stereo. The player's output layout is fixed by
+// the OS device, independent of what roles a file happens to carry.
+[[nodiscard]] std::vector<std::uint8_t> OutputRolesForChannelCount(std::uint32_t channelCount);
+
+// Given the audio roles actually present at some instant (`present`, spec 4.6
+// numbering), resolve which of them feed output channel `outputRole`. The
+// output sample is the integer average of the returned roles' samples; an empty
+// result means silence. This implements spec 5.4's "derive the nearest role --
+// a neighbour, a downmix, ultimately the mono mix -- rather than omit it" rule,
+// so a fixed output layout can render whatever (changing) role set a file
+// carries: mono source -> both stereo channels, stereo source -> mono downmix,
+// etc.
+[[nodiscard]] std::vector<std::uint8_t> ResolveOutputSources(
+    std::uint8_t outputRole, const std::vector<std::uint8_t>& present);
+
 }  // namespace ccmfplayer

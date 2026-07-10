@@ -89,6 +89,54 @@ std::vector<std::uint8_t> DecodeDfpwmToU8(std::span<const std::byte> data) {
     return out;
 }
 
+std::vector<std::uint8_t> OutputRolesForChannelCount(std::uint32_t channelCount) {
+    if (channelCount <= 1) {
+        return {kChannelMono};
+    }
+    return {kChannelFrontLeft, kChannelFrontRight};
+}
+
+namespace {
+bool Contains(const std::vector<std::uint8_t>& roles, std::uint8_t role) {
+    return std::find(roles.begin(), roles.end(), role) != roles.end();
+}
+}  // namespace
+
+std::vector<std::uint8_t> ResolveOutputSources(std::uint8_t outputRole,
+                                               const std::vector<std::uint8_t>& present) {
+    if (present.empty()) {
+        return {};  // no audio here at all -> silence
+    }
+    if (Contains(present, outputRole)) {
+        return {outputRole};  // exact match: pass through
+    }
+
+    switch (outputRole) {
+        case kChannelMono:
+            // Prefer a proper L+R downmix; otherwise the generic fallback below
+            // averages whatever is present (ultimately the mono mix).
+            if (Contains(present, kChannelFrontLeft) && Contains(present, kChannelFrontRight)) {
+                return {kChannelFrontLeft, kChannelFrontRight};
+            }
+            break;
+        case kChannelFrontLeft:
+            if (Contains(present, kChannelMono)) return {kChannelMono};
+            if (Contains(present, kChannelFrontRight)) return {kChannelFrontRight};
+            break;
+        case kChannelFrontRight:
+            if (Contains(present, kChannelMono)) return {kChannelMono};
+            if (Contains(present, kChannelFrontLeft)) return {kChannelFrontLeft};
+            break;
+        default:
+            if (Contains(present, kChannelMono)) return {kChannelMono};
+            break;
+    }
+
+    // Generic fallback: average every present role (a full downmix). Guarantees
+    // a mapped output channel always plays rather than going silent.
+    return present;
+}
+
 DecodedAudio DecodeAudioPayload(std::span<const std::byte> payload) {
     if (payload.empty()) {
         throw CcmfError("empty audio payload");

@@ -1,6 +1,7 @@
 add_executable(ccmf_engine_tests
     test_support.cpp
     test_chunk.cpp
+    test_resync.cpp
     test_index.cpp
     test_video.cpp
     test_render.cpp

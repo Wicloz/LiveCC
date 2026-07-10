@@ -292,10 +292,11 @@ ExpectedFixture ReadExpectedFixture(const std::filesystem::path& path) {
 
 TEST(DecodeVideoPayload, MatchesPythonReferenceForRealFixture) {
     const std::filesystem::path fixturesDir(CCMF_TEST_FIXTURES_DIR);
-    const CcmfFile ccmf(fixturesDir / "small_stereo.ccmf");
-    ASSERT_EQ(ccmf.VideoChunks().size(), 1u);
+    CcmfFile ccmf(fixturesDir / "small_stereo.ccmf");
+    const CcmfFile::FullIndex idx = ccmf.IndexAll();
+    ASSERT_EQ(idx.video.size(), 1u);
 
-    const DecodedGop gop = DecodeVideoPayload(ccmf.ReadChunkPayload(ccmf.VideoChunks()[0]));
+    const DecodedGop gop = DecodeVideoPayload(ccmf.ReadChunkPayload(idx.video[0]));
     const ExpectedFixture expected = ReadExpectedFixture(fixturesDir / "small_stereo.frames.bin");
 
     ASSERT_EQ(gop.width, expected.width);
