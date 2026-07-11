@@ -5,8 +5,9 @@ Run the whole benchmark suite.
   python tools/run_benchmarks.py encoder    # one or more sections by name
   python tools/run_benchmarks.py --profile  # add the encoder + gop cProfile dumps
 
-Sections: encoder (primary), gop, quality, samples, splitter, buffer, startup.
-("samples" needs clips in media/ and ffmpeg; it self-skips otherwise.)
+Sections: encoder (primary), gop, quality, samples, compression, splitter,
+buffer, startup.  ("samples"/"compression" use clips in media/; they self-skip
+without them / ffmpeg.)
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ if str(_BENCHMARKS_DIR) not in sys.path:
 import harness  # noqa: F401  (puts the server dir on sys.path)
 
 import bench_buffer
+import bench_compression
 import bench_encoder
 import bench_gop
 import bench_quality
@@ -34,6 +36,7 @@ SECTIONS = {
     "gop": bench_gop.main,
     "quality": bench_quality.main,
     "samples": bench_samples.main,
+    "compression": bench_compression.main,
     "splitter": bench_splitter.main,
     "buffer": bench_buffer.main,
     "startup": bench_startup.main,

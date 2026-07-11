@@ -18,9 +18,9 @@ python tools/run_benchmarks.py --profile    # add the encoder + gop cProfile dum
 python benchmarks/bench_encoder.py
 ```
 
-Sections: `encoder` (primary), `gop`, `quality`, `samples`, `splitter`, `buffer`,
-`startup`. The `samples` section uses developer clips in the repo-root `media/`
-folder and self-skips when it's empty.
+Sections: `encoder` (primary), `gop`, `quality`, `samples`, `compression`,
+`splitter`, `buffer`, `startup`. The `samples`/`compression` sections use
+developer clips in the repo-root `media/` folder and self-skip when it's empty.
 
 > Looking to produce output rather than time it? That's the CCMF exporter,
 > `../tools/convert_to_ccmf.py` (see `media/README.md`) — it's a dev tool, not a
@@ -34,6 +34,7 @@ folder and self-skips when it's empty.
 | `bench_gop.py` | `cc_encoder.GopEncoder` — the CCMF container layer (05fdf41) that wraps `encode_frame` in production: `add()` amortised over realistic streaming sequences (static/motion/scene-cuts, by grid), plus the raw `ccmf` pack/unpack + `delta_spans` primitives it calls every frame. |
 | `bench_quality.py` | Transcoder **fidelity**: decodes the blit wire format back to pixels and reports PSNR (raw and after a 2×2 box blur, which approximates the eye integrating dithered sub-pixels) plus % cells dithered — for synthetic content **and** for any real `media/` samples. |
 | `bench_samples.py` | `encode_frame` on **real decoded frames** from `media/` clips — by grid and by clip. Needs ffmpeg + samples; self-skips otherwise. |
+| `bench_compression.py` | Chunk **compression** (spec §4.1.2) on real CCMF payloads from every `media/` file, by type (packed/ANS video, PCM8/DFPWM audio): size distributions for LZ4/LZ4HC (CC-decodable) vs deflate/zstd/brotli/lzma/bz2 (native), plus byte-rANS candidates (order-0, `lz4>rANS0`, an order-1 floor) — for choosing a second CC-suitable codec. Reads raw clips (ffmpeg) and any `.ccmf` files; self-skips without either. |
 | `bench_splitter.py` | `_FrameSplitter` throughput (whole-frame and 64 KiB-chunked) — the read path before the encode offload. |
 | `bench_buffer.py` | `TimedBuffer` put / pop_due — the scheduler's per-tick deque work. |
 | `bench_startup.py` | One-time import + OKLab LUT build cost and its resident footprint. |
