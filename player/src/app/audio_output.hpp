@@ -31,6 +31,11 @@ public:
     // replay a snippet from the old position.
     void Flush();
 
+    // Pauses the stream and stops feeding it -- for an in-progress scrub drag,
+    // where the position jumps every frame and playing the audio would be
+    // garbage. Resume by calling Flush() (drops the stale buffer) then Refill().
+    void Suspend();
+
 private:
     std::uint32_t channelCount_;
     AudioStream stream_{};

@@ -95,18 +95,31 @@ int main(int argc, char** argv) {
 
         if (engine) {
             const bool seeked = controls.Update(*engine, windowWidth, windowHeight);
-            if (seeked && audioOutput) {
-                audioOutput->Flush();
+            const bool scrubbing = controls.IsScrubbing();
+            if (audioOutput) {
+                if (scrubbing) {
+                    // Position is jumping every frame; playing it would be
+                    // garbage. Go silent for the whole drag; the release commits
+                    // a `seeked` that flushes and resumes below.
+                    audioOutput->Suspend();
+                } else if (seeked) {
+                    audioOutput->Flush();
+                }
             }
 
-            const std::uint64_t ptsBeforeAdvance = engine->CurrentPts();
-            engine->Advance(dt);
-            // A loop restart (PlaybackEngine::Advance reaching the end with
-            // IsLooping() set) is a seek too -- CurrentPts() dropping below
-            // its pre-call value is how it shows up here, since Advance()
-            // has no other way to signal it happened.
-            if (audioOutput && engine->CurrentPts() < ptsBeforeAdvance) {
-                audioOutput->Flush();
+            // While scrubbing, hold the position where the drag put it -- don't
+            // let playback advance past it (or the audio-master clock fight the
+            // scrub). Playback resumes on release.
+            if (!scrubbing) {
+                const std::uint64_t ptsBeforeAdvance = engine->CurrentPts();
+                engine->Advance(dt);
+                // A loop restart (PlaybackEngine::Advance reaching the end with
+                // IsLooping() set) is a seek too -- CurrentPts() dropping below
+                // its pre-call value is how it shows up here, since Advance()
+                // has no other way to signal it happened.
+                if (audioOutput && engine->CurrentPts() < ptsBeforeAdvance) {
+                    audioOutput->Flush();
+                }
             }
 
             if (videoView) {
@@ -120,7 +133,7 @@ int main(int argc, char** argv) {
                 }
                 videoView->Update(frame);
             }
-            if (audioOutput) {
+            if (audioOutput && !scrubbing) {
                 audioOutput->Refill(*engine);
             }
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 #include "engine/engine.hpp"
 
 namespace ccmfplayer {
@@ -33,6 +35,12 @@ public:
     // otherwise replay a stale pre-seek snippet.
     bool Update(PlaybackEngine& engine, int windowWidth, int windowHeight);
 
+    // Whether the scrub bar is being dragged right now. While true the caller
+    // should suspend audio output (the position is jumping around, so playing it
+    // is garbage) and skip advancing playback; on release, Update() returns
+    // `seeked` so the caller can flush and resume from the final position.
+    [[nodiscard]] bool IsScrubbing() const noexcept { return dragging_; }
+
     // Draws the controls; call after the video so they render on top of it.
     // A no-op once the auto-hide fade has reached zero.
     void Draw(const PlaybackEngine& engine, int windowWidth, int windowHeight) const;
@@ -44,6 +52,11 @@ private:
     bool playButtonArmed_ = false;
     bool loopButtonArmed_ = false;
     bool dragging_ = false;
+    // The pts the mouse is over mid-drag: the playhead/timecode read from this
+    // every frame (glued to the cursor), while the expensive seek/preview is
+    // throttled to lastScrubSeekTime_ so it can't block the render loop.
+    std::uint64_t scrubTargetPts_ = 0;
+    double lastScrubSeekTime_ = 0.0;
 
     double lastActivityTime_ = 0.0;
     float lastMouseX_ = 0.0f;

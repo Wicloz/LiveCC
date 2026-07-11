@@ -18,6 +18,12 @@ constexpr float kTimeTextWidth = 150.0f;  // reserved space for "H:MM:SS / H:MM:
 constexpr float kSeekBarThickness = 8.0f;
 constexpr std::uint64_t kKeySeekStepSamples = 5ull * kSampleRate;
 
+// Minimum spacing between the actual (expensive) seek+decode while dragging the
+// scrub bar. The playhead follows the mouse every frame regardless; only the
+// preview decode is rate-limited, so a heavy per-seek cost on a long file can't
+// stall the loop and make the bar lag the cursor. ~16 preview updates/second.
+constexpr double kScrubSeekInterval = 0.06;
+
 // MPV-style auto-hide: fully visible for kControlsShowSeconds after the last
 // input activity, then linearly fades to invisible over kControlsFadeSeconds.
 constexpr double kControlsShowSeconds = 1.4;
@@ -134,6 +140,15 @@ bool PlayerControls::Update(PlaybackEngine& engine, int windowWidth, int windowH
         if (loopButtonArmed_ && CheckCollisionPointRec(mouse, loopButton)) {
             engine.ToggleLooping();
         }
+        if (dragging_) {
+            // Commit the drop: land exactly on the release position (the
+            // throttle may have skipped the last few mouse moves), and report a
+            // seek so the caller flushes stale audio and resumes from here.
+            const double fraction = SeekBarFractionForMouseX(mouse.x, seekBar.x, seekBar.width);
+            scrubTargetPts_ = PtsForFraction(fraction, engine.Duration());
+            engine.Seek(scrubTargetPts_);
+            seeked = true;
+        }
         playButtonArmed_ = false;
         loopButtonArmed_ = false;
         dragging_ = false;
@@ -141,8 +156,17 @@ bool PlayerControls::Update(PlaybackEngine& engine, int windowWidth, int windowH
 
     if (dragging_ && leftDown) {
         const double fraction = SeekBarFractionForMouseX(mouse.x, seekBar.x, seekBar.width);
-        engine.Seek(PtsForFraction(fraction, engine.Duration()));
-        seeked = true;
+        scrubTargetPts_ = PtsForFraction(fraction, engine.Duration());
+        // Throttle the actual seek/decode so it can't block the loop; the
+        // playhead is drawn from scrubTargetPts_ every frame (see Draw), so the
+        // bar stays glued to the cursor even as the preview catches up. Audio
+        // is suspended by the caller for the whole drag (IsScrubbing()), not
+        // flushed per seek -- so `seeked` is deliberately NOT set here.
+        const double now = GetTime();
+        if (now - lastScrubSeekTime_ >= kScrubSeekInterval) {
+            engine.Seek(scrubTargetPts_);
+            lastScrubSeekTime_ = now;
+        }
     }
 
     std::uint64_t keyTarget = engine.CurrentPts();
@@ -216,9 +240,15 @@ void PlayerControls::Draw(const PlaybackEngine& engine, int windowWidth, int win
                         WithAlpha(engine.IsLooping() ? SKYBLUE : Fade(WHITE, 0.4f), alpha));
     DrawLoopIcon(loopButton, WithAlpha(engine.IsLooping() ? WHITE : Fade(RAYWHITE, 0.7f), alpha));
 
+    // Mid-drag, show the position the mouse is over (scrubTargetPts_), which
+    // updates every frame, rather than CurrentPts() which only catches up at
+    // the throttled preview rate -- so the playhead and time read-out track the
+    // cursor with no lag.
+    const std::uint64_t displayPts = dragging_ ? scrubTargetPts_ : engine.CurrentPts();
+
     const Rectangle seekBar = SeekBarRect(windowWidth, windowHeight);
     DrawRectangleRec(seekBar, WithAlpha(Fade(WHITE, 0.25f), alpha));
-    const double fraction = FractionForPts(engine.CurrentPts(), engine.Duration());
+    const double fraction = FractionForPts(displayPts, engine.Duration());
     const auto filledWidth = static_cast<float>(fraction) * seekBar.width;
     if (filledWidth > 0.0f) {
         DrawRectangle(static_cast<int>(seekBar.x), static_cast<int>(seekBar.y),
@@ -230,7 +260,7 @@ void PlayerControls::Draw(const PlaybackEngine& engine, int windowWidth, int win
                WithAlpha(RAYWHITE, alpha));
 
     const std::string text =
-        FormatTimecode(engine.CurrentPts()) + " / " + FormatTimecode(engine.Duration());
+        FormatTimecode(displayPts) + " / " + FormatTimecode(engine.Duration());
     const int textX = static_cast<int>(static_cast<float>(windowWidth) - kMargin - kTimeTextWidth
                                        + 8.0f);
     const int textY = static_cast<int>(barTop + (kBarHeight - 20.0f) * 0.5f);

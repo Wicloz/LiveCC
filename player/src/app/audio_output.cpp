@@ -63,4 +63,10 @@ void AudioOutput::Flush() {
     PlayAudioStream(stream_);
 }
 
+void AudioOutput::Suspend() {
+    if (IsAudioStreamPlaying(stream_)) {
+        PauseAudioStream(stream_);
+    }
+}
+
 }  // namespace ccmfplayer
