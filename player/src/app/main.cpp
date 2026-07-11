@@ -130,6 +130,14 @@ int main(int argc, char** argv) {
                     desiredFps = ccmfplayer::TargetFpsForFrameDuration(frame->duration,
                                                                        kFallbackFps);
                 }
+                // Low-fps video (e.g. a 12 fps GOP) must not slow the loop below
+                // the rate at which audio needs feeding, or the sound goes
+                // choppy -- the loop services AudioOutput once per tick. Floor
+                // the loop rate while audio plays; the video frame is just shown
+                // for extra ticks, which is cheap and looks identical.
+                if (audioOutput && desiredFps < kFallbackFps) {
+                    desiredFps = kFallbackFps;
+                }
                 if (desiredFps != currentTargetFps) {
                     SetTargetFPS(desiredFps);
                     currentTargetFps = desiredFps;

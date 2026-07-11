@@ -43,13 +43,19 @@ void AudioOutput::Refill(PlaybackEngine& engine) {
     if (!IsAudioStreamPlaying(stream_)) {
         ResumeAudioStream(stream_);
     }
-    if (!IsAudioStreamProcessed(stream_)) {
-        return;
+    // Fill EVERY free sub-buffer this tick, not just one. The render loop's
+    // rate follows the video's fps (main.cpp), which for low-fps content can be
+    // far slower than audio drains -- a single 2048-frame (~43 ms) top-up per
+    // tick starves the stream at, say, 12 fps (~83 ms/tick) and the audio turns
+    // choppy. Draining IsAudioStreamProcessed keeps the stream full regardless
+    // of how slow (or jittery) the tick rate is. (main.cpp also floors the loop
+    // rate while audio plays, so this rarely needs more than one pass.)
+    while (IsAudioStreamProcessed(stream_)) {
+        std::vector<std::int16_t> buffer(
+            static_cast<std::size_t>(kBufferFrames) * channelCount_, 0);
+        engine.PullAudio(buffer);  // leaves silence past end-of-audio (buffer is zeroed)
+        UpdateAudioStream(stream_, buffer.data(), kBufferFrames);
     }
-
-    std::vector<std::int16_t> buffer(static_cast<std::size_t>(kBufferFrames) * channelCount_, 0);
-    engine.PullAudio(buffer);
-    UpdateAudioStream(stream_, buffer.data(), kBufferFrames);
 }
 
 void AudioOutput::Flush() {
