@@ -30,14 +30,22 @@ std::vector<std::int16_t> DecodePcm8ToI16(std::span<const std::byte> data) {
     return ScaleU8ToI16(u8);
 }
 
-// Line-for-line port of server/dfpwm.py's _decode_kernel. C++20 guarantees
-// signed right shift is arithmetic (floor toward -infinity, [expr.shift]),
-// matching Python's `>>` on ints exactly, so this ports directly without any
-// sign-handling differences; every intermediate value here stays well within
-// int32_t range (charge/antijerk/low_pass hover near +-128, strength within
-// [8, 1023]), so there's no overflow concern either.
+// Bit-exact port of CC:Tweaked's cc.audio.dfpwm decoder (cross-checked against
+// server/dfpwm.py, itself validated against ffmpeg sample-for-sample). C++20
+// guarantees signed right shift is arithmetic (floor toward -infinity,
+// [expr.shift]), matching the reference `>>` on ints exactly, so the predictor
+// arithmetic ports directly with no sign-handling differences; every
+// intermediate stays well within int32_t range (charge/antijerk/low_pass hover
+// near +-128, strength within [8, 1023]), so there's no overflow concern.
+//
+// The running low_pass accumulator IS the decoder state and is deliberately
+// never clamped between steps -- only each emitted sample is clamped to
+// [-128,127] before the +128 bias. That lets the clamp happen inline as we
+// write straight into the uint8 output: one pass, one allocation, no int32
+// scratch buffer (the old two-pass form materialized an 8x-size int32 array
+// just to re-scan it here).
 std::vector<std::uint8_t> DecodeDfpwmToU8(std::span<const std::byte> data) {
-    std::vector<std::int32_t> levels(data.size() * 8, 0);
+    std::vector<std::uint8_t> out(data.size() * 8);
 
     std::int32_t charge = 0;
     std::int32_t strength = 0;
@@ -45,6 +53,7 @@ std::vector<std::uint8_t> DecodeDfpwmToU8(std::span<const std::byte> data) {
     std::int32_t prevCharge = 0;
     std::int32_t lowPass = 0;
 
+    std::size_t o = 0;
     for (std::size_t i = 0; i < data.size(); ++i) {
         std::uint8_t byteVal = std::to_integer<std::uint8_t>(data[i]);
         for (int j = 0; j < 8; ++j) {
@@ -77,14 +86,10 @@ std::vector<std::uint8_t> DecodeDfpwmToU8(std::span<const std::byte> data) {
             prevCharge = nextCharge;
 
             lowPass += ((antijerk - lowPass) * 140 + 128) >> 8;
-            levels[i * 8 + j] = lowPass;
+            const std::int32_t clamped =
+                std::clamp(lowPass, std::int32_t{-128}, std::int32_t{127});
+            out[o++] = static_cast<std::uint8_t>(clamped + 128);
         }
-    }
-
-    std::vector<std::uint8_t> out(levels.size());
-    for (std::size_t k = 0; k < levels.size(); ++k) {
-        const std::int32_t clamped = std::clamp(levels[k], std::int32_t{-128}, std::int32_t{127});
-        out[k] = static_cast<std::uint8_t>(clamped + 128);
     }
     return out;
 }
