@@ -205,6 +205,14 @@ class StreamSession:
         self.source_channels = 1                         # probed in run() if needed
         self._codec_id = ccmf.CODEC_PCM8 if audio_codec.name == "pcm" \
             else ccmf.CODEC_DFPWM
+        # DFPWM is itself an adaptive 1-bit predictive codec, so its output is
+        # already near-maximum-entropy: LZ4 gains ~nothing on real audio (and
+        # slightly EXPANDS it), while still costing the CC client a Lua inflate
+        # per chunk.  So compress audio only when it's PCM8 (which does benefit,
+        # e.g. on quiet/sparse passages).  Video keeps `compression` regardless.
+        self._audio_compression = (self.compression
+                                   if self._codec_id == ccmf.CODEC_PCM8
+                                   else ccmf.COMPRESSION_NONE)
 
         self.start = max(0.0, float(start))
         self.end: Optional[float] = float(end) if end else None
@@ -397,7 +405,7 @@ class StreamSession:
                     chunk = ccmf.chunk(pts, ccmf.TYPE_AUDIO,
                                        ccmf.audio_payload(self._codec_id, data,
                                                           channel=role),
-                                       compression=self.compression)
+                                       compression=self._audio_compression)
                     await buf.put(pts / self.rate, chunk)
         except Exception:
             log.exception("audio producer failed (roles=%s)", self.producible_roles)

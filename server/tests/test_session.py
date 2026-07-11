@@ -56,6 +56,20 @@ def test_set_use_ans_purges_buffered_ans_chunks():
     run(go())
 
 
+def test_dfpwm_audio_skips_compression_but_video_keeps_it():
+    # DFPWM output is already near-max-entropy, so LZ4 is disabled on DFPWM audio
+    # chunks (it would only cost the CC client a pointless inflate); PCM8 keeps
+    # it, and video compression is unaffected either way.
+    s_df = StreamSession("u", w=6, h=4, fps=24, want_audio=True,
+                         audio_codec=DFPWM, compression=ccmf.COMPRESSION_LZ4)
+    assert s_df._audio_compression == ccmf.COMPRESSION_NONE
+    assert s_df.video_config.compression == ccmf.COMPRESSION_LZ4
+
+    s_pcm = StreamSession("u", w=6, h=4, fps=24, want_audio=True,
+                          audio_codec=PCM, compression=ccmf.COMPRESSION_LZ4)
+    assert s_pcm._audio_compression == ccmf.COMPRESSION_LZ4
+
+
 def test_pop_due_releases_in_pts_order():
     async def go():
         b = TimedBuffer(10, drop_oldest=False)

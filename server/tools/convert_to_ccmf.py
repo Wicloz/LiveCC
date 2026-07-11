@@ -362,6 +362,11 @@ async def _render(args: argparse.Namespace) -> int:
     # ANS keyframes are self-entropy-coded, so the chunk is left uncompressed
     # (spec §4.5.3); packed keyframes still honour --compression.
     video_config = VideoConfig(compression=compression, use_ans=args.ans)
+    # DFPWM output is already near-maximum-entropy (an adaptive 1-bit predictive
+    # codec), so LZ4 gains ~nothing on it and just costs a Lua inflate on the CC
+    # client; only PCM8 audio benefits from compression.
+    audio_compression = (compression if codec_id == ccmf.CODEC_PCM8
+                         else ccmf.COMPRESSION_NONE)
     roles = negotiate_channel_roles(channels_mask) if want_audio else []
 
     end = args.end
@@ -516,7 +521,7 @@ async def _render(args: argparse.Namespace) -> int:
                             encoded[data] = wire
                     payload = ccmf.audio_payload(codec_id, wire, channel=role)
                     await audio_q.put((pts, ccmf.chunk(pts, ccmf.TYPE_AUDIO, payload,
-                                                       compression=compression)))
+                                                       compression=audio_compression)))
         except Exception:
             log.exception("convert_to_ccmf: audio pipeline error")
         finally:
