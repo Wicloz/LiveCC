@@ -252,7 +252,7 @@ def test_mono_source_fills_stereo_setup(tmp_path, media_server):
 
 def _patch_fast_session(monkeypatch, n_video=4, n_audio=6, is_live=False):
     async def fake_video(url, w, h, fps, start=0, end=None, source_path=None,
-                         loop=False, timeline=None, compression=0):
+                         loop=False, timeline=None, compression=0, config=None):
         for i in range(n_video):
             pts = round(i * ccmf.SAMPLE_RATE / fps)
             yield pts, ccmf.chunk(pts, ccmf.TYPE_VIDEO, b"\x00" * 16)

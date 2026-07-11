@@ -148,6 +148,10 @@ advertises what it can inflate via the CAPS `compress` bitmask (Section 5.4);
 a server **MUST** use only advertised algorithms, so a CC member never receives
 one it can't decode.
 
+A chunk carrying a `raw-ANS` keyframe (Section 4.5.3) **MUST** use `compression`
+= `none`: its planes are already entropy coded. This is per chunk, so audio and
+packed (`raw`) video chunks in the same stream may still be compressed.
+
 ### 4.2. Timestamps
 
 `PTS` is a 48-bit absolute count of **48 kHz samples** since the start of the
@@ -221,9 +225,12 @@ redraw.
 | 0   | raw       | `duration u16`, then packed planes (keyframe)    |
 | 1   | delta     | `duration u16`, then changed spans (Section 4.5.2)|
 | 2   | repeat    | `duration u16` only — hold current frame         |
+| 3   | raw-ANS   | entropy-coded keyframe (optional, Section 4.5.3) |
 
 `duration` is in 48 kHz samples (≤ 65535 ≈ 1.36 s). Longer holds use successive
-`repeat` units. A frame is a **keyframe/RAP** iff its encoding is `raw`.
+`repeat` units. A frame is a **keyframe/RAP** iff its encoding is `raw` or
+`raw-ANS`. Encodings `0`–`2` are mandatory for every decoder; `3` is optional
+and CAPS-gated (Section 5.4).
 
 #### 4.5.1. raw planes
 
@@ -258,6 +265,58 @@ SHOULD emit `raw` when a `delta` would exceed a full frame.
 
 > Note: `start` (u16) addresses ≤ 65535 cells; CC's maximum (335×124 = 41540)
 > fits. Larger non-CC grids are out of scope for this field width.
+
+#### 4.5.3. raw-ANS (entropy-coded keyframe)
+
+`raw-ANS` (encoding `3`) is an **optional** alternate serialization of a
+keyframe's three planes — same cells as `raw`, entropy-coded instead of
+bit-packed. It is gated by the CAPS `CAP_VIDEO_ANS` bit (Section 5.4): a
+producer emits it only when **every** recipient advertises it; `raw`/`delta`/
+`repeat` remain mandatory. Like `raw`, it is a keyframe/RAP.
+
+```
+frame unit = [ flags ] [ duration u16 ] [ body_len u24 ] [ body ]
+body       = [ glyph plane ] [ fg plane ] [ bg plane ]
+```
+
+`body_len` (the byte length of the three planes) prefixes the body so a decoder
+can skip the whole frame without decoding it — its size is data-dependent. The
+glyph plane holds the bare 5-bit indices (0–31); fg/bg hold palette indices
+(0–15).
+
+A chunk carrying a `raw-ANS` unit **MUST NOT** also be chunk-compressed
+(`compression` = `none`, Section 4.1.2): the planes are already entropy coded,
+so a second pass only wastes CPU. Packed (`raw`) GOPs are unaffected and may
+still be compressed.
+
+Each **plane** is run-length encoded, then the run *values* are range-ANS
+(rANS) coded and the run *lengths* are byte tokens:
+
+```
+plane = [ k u8 ]                         distinct run-value symbols present
+        [ sym u8, freq u16 ] × k         normalized frequencies, Σ = 4096, desc.
+        [ rans_len u24 ]                 byte length of the rANS stream
+        [ rans bytes ]                   4-byte initial state (big-endian) + renorm bytes
+        [ length token ... ]             one run length per run, until W·H cells
+length token = a byte < 255 (the length), or 0xFF followed by a u16.
+```
+
+**rANS parameters** (fixed): total frequency `M = 4096` (`2^12`), lower bound
+`L = 2^16`, byte renormalization. These keep every intermediate below `2^24`, so
+a decoder can use IEEE-double arithmetic exactly (Lua 5.1 has no 64-bit ints).
+Decode, per run value: `slot = x mod M`; find the symbol whose cumulative
+interval contains `slot` (a linear scan over the frequency-descending table —
+the dominant symbol wins in one or two compares); `x = freq·⌊x/M⌋ + slot − cum`;
+then while `x < L`, `x = x·256 + next_byte`. This is deliberately bit-operation
+free — the CC/Lua client is the primary decode target, and its lack of native
+bit operators is what rules out bit-level coders (deflate, table-ANS). Runs
+collapse flat regions (letterboxing, solid fills) to a handful of symbols, so a
+decoder typically does **less** work than unpacking W·H bit-packed cells.
+
+> This improves on sanjuuni's 32vid ANS (the design origin — separate symbol
+> planes, a per-frame frequency model, a run-length pre-pass) by substituting
+> byte-renormalized rANS for its bit-level tANS; there is no bitstream
+> compatibility with 32vid, and none is intended.
 
 ### 4.6. Audio Payload
 
@@ -363,7 +422,7 @@ The server **MUST NOT** echo the chosen configuration; clients learn actual
 
 ```
 [ flags u8 ]     bit0 want-video · bit1 want-audio
-[ video u8 ]     bitmask, optional/future encodings (raw/delta/repeat are mandatory)
+[ video u8 ]     bitmask, optional encodings (raw/delta/repeat mandatory): bit0 raw-ANS (§4.5.3)
 [ audio u8 ]     bitmask: bit0 pcm8 · bit1 dfpwm
 [ channels u16 ] one-hot per channel role (Section 4.6): bit N = accepts role N
                  (bit0 mono · bit1 front-left · bit2 front-right · … up to 7.1)
@@ -407,6 +466,14 @@ is not.  How a producer mixes is implementation-defined.
 - Reconciliation of divergent resolution/fps/codec within a room is
   **implementation-defined** and out of scope; the container's self-describing
   fields make any such mid-stream change expressible without signaling.
+- The `raw-ANS` encoding (Section 4.5.3) is a per-client capability, so a shared
+  room uses it only while **every** subscriber advertises `CAP_VIDEO_ANS`. A
+  reference server keeps ANS on until an ANS-incapable subscriber joins, reverts
+  the whole room to `raw` keyframes (and its negotiated `compression`) for the
+  duration, and restores ANS once that subscriber leaves — the self-describing
+  per-chunk encoding makes the switch need no signaling. (Since a `raw` keyframe
+  is decodable by everyone, only the ANS→packed direction must fence off
+  already-buffered ANS chunks from the new subscriber.)
 
 ### 5.6. STATUS and the Playback Clock
 

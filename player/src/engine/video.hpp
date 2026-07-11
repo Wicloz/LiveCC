@@ -14,6 +14,7 @@ namespace ccmfplayer {
 inline constexpr std::uint8_t kFrameEncRaw = 0;
 inline constexpr std::uint8_t kFrameEncDelta = 1;
 inline constexpr std::uint8_t kFrameEncRepeat = 2;
+inline constexpr std::uint8_t kFrameEncRawAns = 3;  // rANS+RLE keyframe (spec 4.5.3)
 
 // A blit char is 0x80 plus a 5-bit dither index (spec 4.5.1); valid values
 // are exactly [kBlitCharMin, kBlitCharMax].

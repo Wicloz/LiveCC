@@ -25,6 +25,44 @@ def _solid_frame(rgb, w, h):
     return np.tile(np.array(rgb, dtype=np.uint8), (h * 3, w * 2, 1))
 
 
+def test_ans_frame_unit_roundtrip():
+    w, h = 12, 7
+    glyph, fg, bg = _grids(w, h, seed=3)
+    pal = bytes(range(48))
+    payload = ccmf.video_payload(
+        w, h, ccmf.palette_unit(pal) + ccmf.ans_frame_unit(2000, glyph, fg, bg))
+    dw, dh, frames = ccmf.parse_video_payload(payload)
+    assert (dw, dh) == (w, h)
+    assert len(frames) == 1
+    f = frames[0]
+    assert f.encoding == ccmf.ENC_RAW_ANS
+    assert f.duration == 2000
+    np.testing.assert_array_equal(f.glyph, glyph)
+    np.testing.assert_array_equal(f.fg, fg)
+    np.testing.assert_array_equal(f.bg, bg)
+    np.testing.assert_array_equal(f.palette.ravel(), np.frombuffer(pal, np.uint8))
+
+
+def test_ans_keyframe_then_delta():
+    # An ANS keyframe is a RAP: a following delta applies against it normally.
+    w, h = 10, 6
+    g0, f0, b0 = _grids(w, h, seed=4)
+    g1, f1, b1 = g0.copy(), f0.copy(), b0.copy()
+    g1[0, 0] = 0x8F
+    f1[0, 0] = 3
+    body = ccmf.delta_spans((g0, f0, b0), (g1, f1, b1))
+    pal = bytes(range(48))
+    payload = ccmf.video_payload(
+        w, h,
+        ccmf.palette_unit(pal)
+        + ccmf.ans_frame_unit(1000, g0, f0, b0)
+        + ccmf.delta_frame_unit(1000, body))
+    _, _, frames = ccmf.parse_video_payload(payload)
+    assert len(frames) == 2
+    np.testing.assert_array_equal(frames[1].glyph, g1)
+    np.testing.assert_array_equal(frames[1].fg, f1)
+
+
 # --------------------------------------------------------------------------- #
 # Chunk framing
 # --------------------------------------------------------------------------- #

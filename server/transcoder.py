@@ -52,7 +52,7 @@ from typing import AsyncGenerator, Deque, Iterable, Iterator, Optional
 
 import numpy as np
 
-from cc_encoder import GopEncoder
+from cc_encoder import GopEncoder, VideoConfig
 
 # --------------------------------------------------------------------------- #
 # Logging
@@ -849,6 +849,7 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
                      gop_samples: Optional[int] = None,
                      letterbox: bool = True,
                      compression: int = 0,          # ccmf.COMPRESSION_NONE
+                     config: Optional[VideoConfig] = None,
                      ) -> AsyncGenerator[tuple[int, bytes], None]:
     """Yield (pts_samples, CCMF video chunk) pairs — each chunk one self-contained
     GOP (~GOP_SECONDS of palette + raw/delta/repeat units, see cc_encoder.GopEncoder).
@@ -884,9 +885,12 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
     ytdlp: subprocess.Popen | None = None
     ffmpeg: subprocess.Popen | None = None
     splitter = _FrameSplitter(px_w, px_h)
+    # A live config (from a StreamSession) lets ANS turn on/off between GOPs as a
+    # sync room's membership changes; static callers just pass `compression`.
     gop = GopEncoder(gop_samples=GOP_SAMPLES if gop_samples is None else gop_samples,
                      nominal_duration=round(SAMPLE_RATE / fps),
-                     compression=compression)
+                     compression=compression,
+                     config=config)
     ev_loop = asyncio.get_running_loop()
     probe = _FirstPtsProbe()
     base_off = 0                # samples; resolved against timeline at first frame
@@ -960,10 +964,10 @@ async def iter_video(youtube_url: str, term_w: int, term_h: int, fps: int,
                 next_i = idx + (_encode_stride(enc_ema, fps) if adaptive else 1)
                 encoded += 1
                 if done is not None:                 # this frame opened a new GOP
-                    yield done
+                    yield done[0], done[1]           # (pts, chunk); is_ans is internal
         done = await ev_loop.run_in_executor(_executor, gop.flush)
         if done is not None:                         # trailing partial GOP
-            yield done
+            yield done[0], done[1]
     except asyncio.CancelledError:
         raise
     except Exception:

@@ -84,13 +84,28 @@ class _SyncGroup:
         self.session = session
         self._subs: set[WebSocket] = set()
         self._sub_channels: dict[WebSocket, int] = {}
+        self._sub_ans: dict[WebSocket, bool] = {}
         self._subs_lock = asyncio.Lock()
         self._run_task: Optional[asyncio.Task] = None
 
-    async def subscribe(self, ws: WebSocket, caps_channels: int) -> None:
+    def _apply_ans(self) -> None:
+        """ANS stays on only while EVERY current subscriber can decode it
+        (spec §4.5.3 is a per-client capability).  Synchronous — the caller
+        relies on this completing (and purging undecodable buffered chunks)
+        before the joiner can receive any fanout."""
+        use_ans = bool(self._sub_ans) and all(self._sub_ans.values())
+        self.session.set_use_ans(use_ans)
+
+    async def subscribe(self, ws: WebSocket, caps_channels: int,
+                        caps_ans: bool) -> None:
         async with self._subs_lock:
             self._subs.add(ws)
             self._sub_channels[ws] = caps_channels
+            self._sub_ans[ws] = caps_ans
+            # Re-derive ANS synchronously, still under the lock and with no await
+            # since the add -- so a just-joined ANS-incapable subscriber cannot
+            # receive a buffered ANS chunk before the format switches off.
+            self._apply_ans()
         self._reconcile_channels()
         # A mid-stream joiner has missed the room's STATUS playing, so it has
         # no clock to present against — anchor it to the running clock now
@@ -107,7 +122,10 @@ class _SyncGroup:
         async with self._subs_lock:
             self._subs.discard(ws)
             self._sub_channels.pop(ws, None)
+            self._sub_ans.pop(ws, None)
             empty = not self._subs
+            if not empty:
+                self._apply_ans()   # last ANS-incapable member may have left -> resume
         if empty and self._run_task and not self._run_task.done():
             self._run_task.cancel()
         elif not empty:
@@ -192,6 +210,10 @@ def _negotiate(room: ccmf.Room, caps: ccmf.Caps) -> Optional[dict]:
     compression = (ccmf.COMPRESSION_LZ4
                    if caps.compress_mask & ccmf.CAP_COMPRESS_LZ4
                    else ccmf.COMPRESSION_NONE)
+    # Prefer the ANS keyframe encoding whenever the client can decode it
+    # (spec §4.5.3).  In a sync room this is only the INITIAL setting; the
+    # group turns ANS off/on as ANS-incapable members join/leave.
+    use_ans = bool(caps.video_mask & ccmf.CAP_VIDEO_ANS)
     return {
         "url": room.url,
         "w": w,
@@ -205,6 +227,7 @@ def _negotiate(room: ccmf.Room, caps: ccmf.Caps) -> Optional[dict]:
         "audio_codec": codec or PCM,
         "caps_channels": caps.channels,
         "compression": compression,
+        "use_ans": use_ans,
     }
 
 
@@ -365,7 +388,8 @@ async def ws_play(websocket: WebSocket):
         if not await _await_start(websocket):
             await _release_sync_group(room.key(), websocket)
             return
-        await group.subscribe(websocket, caps.channels)
+        await group.subscribe(websocket, caps.channels,
+                              bool(caps.video_mask & ccmf.CAP_VIDEO_ANS))
         group.start_if_needed()
         try:
             await _until_quit_or_disconnect(websocket)

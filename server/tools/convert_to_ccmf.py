@@ -63,6 +63,7 @@ if str(_SERVER_DIR) not in sys.path:
 
 import ccmf  # noqa: E402  (needs the sys.path insert above)
 import dfpwm  # noqa: E402
+from cc_encoder import VideoConfig  # noqa: E402
 from cc_media import GRIDS, have_ffmpeg  # noqa: E402
 from transcoder import (  # noqa: E402
     AUDIO_CHUNK_SECONDS,
@@ -358,6 +359,9 @@ async def _render(args: argparse.Namespace) -> int:
     channels_mask = _parse_channels(args.channels) if want_audio else 0
     codec_id = ccmf.CODEC_PCM8 if args.audio_codec == "pcm" else ccmf.CODEC_DFPWM
     compression = ccmf.COMPRESSION_LZ4 if args.compression == "lz4" else ccmf.COMPRESSION_NONE
+    # ANS keyframes are self-entropy-coded, so the chunk is left uncompressed
+    # (spec §4.5.3); packed keyframes still honour --compression.
+    video_config = VideoConfig(compression=compression, use_ans=args.ans)
     roles = negotiate_channel_roles(channels_mask) if want_audio else []
 
     end = args.end
@@ -470,7 +474,7 @@ async def _render(args: argparse.Namespace) -> int:
                               source_path=source_path, timeline=timeline,
                               adaptive=False, trim_start=trim_start,
                               trim_duration=trim_duration, gop_samples=gop_samples,
-                              letterbox=False, compression=compression)
+                              letterbox=False, config=video_config)
             async for pts, chunk in agen:
                 if video_bar is not None:
                     video_bar.update(max(0.0, (pts - last_pts) / ccmf.SAMPLE_RATE))
@@ -595,6 +599,9 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--audio-codec", choices=["pcm", "dfpwm"], default="pcm",
                     help="wire audio codec (default: pcm; dfpwm trades fidelity "
                          "for ~8x less space)")
+    ap.add_argument("--ans", action="store_true",
+                    help="entropy-code keyframes with the ANS encoding (spec §4.5.3); "
+                         "smaller keyframes, and the chunk is then left uncompressed")
     ap.add_argument("--compression", choices=["none", "lz4"], default="none",
                     help="per-chunk payload compression (spec §4.1.2): none "
                          "(default), or lz4 — smaller files that the CC client and "

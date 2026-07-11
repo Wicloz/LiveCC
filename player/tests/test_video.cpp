@@ -125,6 +125,32 @@ TEST(DecodeVideoPayload, MatchesPythonReferenceForSyntheticGop) {
     EXPECT_EQ(repeat.bg, delta.bg);
 }
 
+// Cross-checked against server/ccmf.py's ans_frame_unit for a 2x2 GOP:
+//   palette = bytes(range(48)); glyph = [[0x80,0x81],[0x9F,0x90]];
+//   fg = [[0,1],[2,3]]; bg = [[4,5],[6,7]] -> the byte list below.
+// Exercises the rANS+RLE (spec 4.5.3) decoder against the reference encoder.
+TEST(DecodeVideoPayload, AnsKeyframeMatchesPythonReference) {
+    const auto payload = MakeBytes({
+        2,0,2,0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,
+        24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,
+        176,208,7,75,0,0,4,0,0,4,1,0,4,16,0,4,31,0,4,5,0,0,0,1,0,180,0,1,1,1,1,
+        4,0,0,4,1,0,4,2,0,4,3,0,4,5,0,0,0,1,0,228,0,1,1,1,1,4,4,0,4,5,0,4,6,0,4,
+        7,0,4,5,0,0,0,1,0,228,0,1,1,1,1,
+    });
+
+    const DecodedGop gop = DecodeVideoPayload(payload);
+    ASSERT_EQ(gop.width, 2);
+    ASSERT_EQ(gop.height, 2);
+    ASSERT_EQ(gop.frames.size(), 1u);
+
+    const Frame& ans = gop.frames[0];
+    EXPECT_EQ(ans.duration, 2000);
+    EXPECT_EQ(ans.glyph, (std::vector<std::uint8_t>{0x80, 0x81, 0x9F, 0x90}));
+    EXPECT_EQ(ans.fg, (std::vector<std::uint8_t>{0, 1, 2, 3}));
+    EXPECT_EQ(ans.bg, (std::vector<std::uint8_t>{4, 5, 6, 7}));
+    // An ANS keyframe is a RAP: a following delta must apply against it.
+}
+
 TEST(DecodeVideoPayload, TooShortHeaderThrows) {
     const auto payload = MakeBytes({0, 0, 1});  // needs 4 bytes for width/height
     EXPECT_THROW((void)DecodeVideoPayload(payload), CcmfError);

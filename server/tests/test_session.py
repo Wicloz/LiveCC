@@ -16,6 +16,46 @@ def run(coro):
 # TimedBuffer
 # --------------------------------------------------------------------------- #
 
+def test_timedbuffer_purge_drops_matching_items():
+    async def go():
+        b = TimedBuffer(10, drop_oldest=False)
+        await b.put(0.0, b"keep0")
+        await b.put(0.1, b"dropme")
+        await b.put(0.2, b"keep1")
+        dropped = b.purge(lambda d: d == b"dropme")
+        assert dropped == 1
+        assert [d for _, d in b.pop_due(9.9)] == [b"keep0", b"keep1"]
+    run(go())
+
+
+def test_set_use_ans_purges_buffered_ans_chunks():
+    # Turning ANS off (an ANS-incapable joiner) must evict already-buffered ANS
+    # GOPs so that joiner never receives one; packed chunks stay.
+    import numpy as np
+    from cc_encoder import GopEncoder, VideoConfig
+
+    async def go():
+        s = StreamSession("u", w=6, h=4, fps=24, want_audio=False, use_ans=True)
+        s._setup_buffers()
+        frame = np.random.default_rng(0).integers(
+            0, 256, (4 * 3, 6 * 2, 3), dtype=np.uint8)
+        ans_gop = GopEncoder(config=VideoConfig(use_ans=True))
+        ans_gop.add(0, frame)
+        _, ans_chunk, is_ans = ans_gop.flush(next_pts=2000)
+        assert is_ans
+        packed_gop = GopEncoder(config=VideoConfig(use_ans=False))
+        packed_gop.add(0, frame)
+        _, packed_chunk, _ = packed_gop.flush(next_pts=2000)
+
+        await s.video_buf.put(0.0, ans_chunk)
+        await s.video_buf.put(0.1, packed_chunk)
+        s.set_use_ans(False)
+        remaining = [d for _, d in s.video_buf.pop_due(9.9)]
+        assert remaining == [packed_chunk]           # the ANS GOP was purged
+        assert s.video_config.use_ans is False
+    run(go())
+
+
 def test_pop_due_releases_in_pts_order():
     async def go():
         b = TimedBuffer(10, drop_oldest=False)
@@ -103,7 +143,7 @@ def _ended(bins):
 
 def _patch(monkeypatch, n_video, n_audio, is_live, ext="webm", moov_at_end=True):
     async def fake_video(url, w, h, fps, start=0, end=None, source_path=None,
-                         loop=False, timeline=None, compression=0):
+                         loop=False, timeline=None, compression=0, config=None):
         # iter_video yields (pts_samples, GOP chunk); one fake chunk per "GOP"
         for i in range(n_video):
             pts = round(i * ccmf.SAMPLE_RATE / fps)
@@ -225,7 +265,7 @@ def _patch_offset_audio(monkeypatch, video_secs, audio_start_s, audio_secs):
     # Video from pts 0 (a --start section's keyframe pre-roll); audio content
     # beginning `audio_start_s` later, chunks of 0.1 s.
     async def fake_video(url, w, h, fps, start=0, end=None, source_path=None,
-                         loop=False, timeline=None, compression=0):
+                         loop=False, timeline=None, compression=0, config=None):
         for i in range(video_secs):
             pts = i * ccmf.SAMPLE_RATE
             yield pts, ccmf.chunk(pts, ccmf.TYPE_VIDEO, b"\x00" * 16)
@@ -332,7 +372,7 @@ def test_reconfigure_channels_adds_and_removes_roles_live(monkeypatch):
     # the session timeline), and roles nobody wants anymore stop being served
     # (buffer closed) without tearing anything else down.
     async def fake_video(url, w, h, fps, start=0, end=None, source_path=None,
-                         loop=False, timeline=None, compression=0):
+                         loop=False, timeline=None, compression=0, config=None):
         if False:
             yield 0, b""
 
@@ -416,7 +456,7 @@ def test_live_skip_reannounces_clock(monkeypatch):
     jump = 30 * ccmf.SAMPLE_RATE
 
     async def fake_video(url, w, h, fps, start=0, end=None, source_path=None,
-                         loop=False, timeline=None, compression=0):
+                         loop=False, timeline=None, compression=0, config=None):
         if False:
             yield 0, b""
 
@@ -502,7 +542,7 @@ def test_live_audio_flows_despite_unaligned_skewed_pipelines(monkeypatch):
 
     def make_fakes(use_timeline):
         async def fake_video(url, w, h, fps, start=0, end=None, source_path=None,
-                             loop=False, timeline=None, compression=0):
+                             loop=False, timeline=None, compression=0, config=None):
             ev = asyncio.get_running_loop()
             await asyncio.sleep(video_delay)
             off = (await timeline.offset_samples("video", None)) if use_timeline else 0
@@ -790,7 +830,7 @@ def test_cancel_finalizes_producer_generator(monkeypatch):
     closed = {"video": False}
 
     async def fake_video(url, w, h, fps, start=0, end=None, source_path=None,
-                         loop=False, timeline=None, compression=0):
+                         loop=False, timeline=None, compression=0, config=None):
         i = 0
         try:
             while True:
@@ -802,7 +842,7 @@ def test_cancel_finalizes_producer_generator(monkeypatch):
             closed["video"] = True
 
     async def fake_audio(url, rate, roles, decode_channels=1, start=0, end=None,
-                         source_path=None, loop=False, timeline=None, compression=0):
+                         source_path=None, loop=False, timeline=None, compression=0, config=None):
         if False:
             yield 0, {}
 

@@ -278,6 +278,21 @@ def test_render_merges_video_and_audio_in_pts_order(tmp_path, monkeypatch):
     assert {t for t, _ in entries} == {ccmf.TYPE_VIDEO, ccmf.TYPE_AUDIO}
 
 
+def test_ans_flag_threads_use_ans_config_to_iter_video(tmp_path, monkeypatch):
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"x")
+    seen = {}
+
+    async def _capture_iter_video(*a, **kw):
+        seen["config"] = kw.get("config")
+        yield 0, ccmf.chunk(0, ccmf.TYPE_VIDEO, b"v0")
+
+    monkeypatch.setattr(convert_to_ccmf, "iter_video", _capture_iter_video)
+    args = _make_args(tmp_path, clip, extra=["--no-audio", "--ans"])
+    assert asyncio.run(convert_to_ccmf._render(args)) == 0
+    assert seen["config"] is not None and seen["config"].use_ans is True
+
+
 def test_render_no_video_produces_error(tmp_path, monkeypatch):
     clip = tmp_path / "clip.mp4"
     clip.write_bytes(b"x")

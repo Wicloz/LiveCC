@@ -147,7 +147,7 @@ def test_gop_opens_with_palette_and_raw_keyframe():
     frame = rng.integers(0, 256, size=(20 * 3, 10 * 2, 3), dtype=np.uint8)
     gop = _gop()
     gop.add(0, frame)
-    _pts, chunk_bytes = gop.flush(next_pts=2000)
+    _pts, chunk_bytes, _ans = gop.flush(next_pts=2000)
     _w, _h, frames = _decode(chunk_bytes)
     assert [f.encoding for f in frames] == [ccmf.ENC_RAW]
 
@@ -158,9 +158,44 @@ def test_unchanged_frame_becomes_a_repeat_unit():
     gop = _gop()
     gop.add(0, frame)
     gop.add(2000, frame)              # byte-identical: no content change
-    _pts, chunk_bytes = gop.flush(next_pts=4000)
+    _pts, chunk_bytes, _ans = gop.flush(next_pts=4000)
     _w, _h, frames = _decode(chunk_bytes)
     assert [f.encoding for f in frames] == [ccmf.ENC_RAW, ccmf.ENC_REPEAT]
+
+
+def test_ans_gop_emits_ans_keyframe_and_no_chunk_compression():
+    from cc_encoder import VideoConfig
+    rng = np.random.default_rng(0)
+    frame = rng.integers(0, 256, size=(20 * 3, 10 * 2, 3), dtype=np.uint8)
+    # compression is set too, but an ANS GOP must NOT double-compress the chunk.
+    cfg = VideoConfig(compression=ccmf.COMPRESSION_LZ4, use_ans=True)
+    gop = GopEncoder(gop_samples=ccmf.SAMPLE_RATE * 2,
+                     nominal_duration=2000, config=cfg)
+    gop.add(0, frame)
+    pts, chunk_bytes, is_ans = gop.flush(next_pts=2000)
+    assert is_ans is True
+    assert chunk_bytes[11] == ccmf.COMPRESSION_NONE      # not LZ4
+    _w, _h, frames = _decode(chunk_bytes)
+    assert frames[0].encoding == ccmf.ENC_RAW_ANS
+
+
+def test_ans_toggle_at_gop_boundary_via_live_config():
+    from cc_encoder import VideoConfig
+    rng = np.random.default_rng(1)
+    frame = rng.integers(0, 256, size=(20 * 3, 10 * 2, 3), dtype=np.uint8)
+    cfg = VideoConfig(use_ans=True)
+    gop = GopEncoder(gop_samples=ccmf.SAMPLE_RATE, nominal_duration=2000, config=cfg)
+    d0 = gop.add(0, frame)
+    assert d0 is None
+    cfg.use_ans = False                          # flip between GOPs
+    d1 = gop.add(ccmf.SAMPLE_RATE, frame)        # crosses the GOP boundary -> flush #0
+    assert d1 is not None and d1[2] is True       # first GOP was ANS
+    _, _, frames0 = _decode(d1[1])
+    assert frames0[0].encoding == ccmf.ENC_RAW_ANS
+    _pts, chunk1, is_ans1 = gop.flush(next_pts=2 * ccmf.SAMPLE_RATE)
+    assert is_ans1 is False                        # second GOP reverted to packed
+    _, _, frames1 = _decode(chunk1)
+    assert frames1[0].encoding == ccmf.ENC_RAW
 
 
 def test_unchanged_frame_skips_the_re_encode(monkeypatch):
@@ -190,7 +225,7 @@ def test_scene_cut_appends_a_rekey_without_flushing_the_chunk():
     gop = _gop()
     assert gop.add(0, dark) is None
     assert gop.add(2000, bright) is None      # scene cut: must NOT flush
-    _pts, chunk_bytes = gop.flush(next_pts=4000)
+    _pts, chunk_bytes, _ans = gop.flush(next_pts=4000)
     _w, _h, frames = _decode(chunk_bytes)
     assert [f.encoding for f in frames] == [ccmf.ENC_RAW, ccmf.ENC_RAW]
     # The new content really did need a new palette -- confirms the resend
@@ -213,7 +248,7 @@ def test_rekey_does_not_resend_an_unchanged_palette():
     pal_entries = [e for e in gop._entries if e[0] == "pal"]
     assert len(pal_entries) == 1
 
-    _pts, chunk_bytes = gop.flush(next_pts=4000)
+    _pts, chunk_bytes, _ans = gop.flush(next_pts=4000)
     _w, _h, frames = _decode(chunk_bytes)
     assert [f.encoding for f in frames] == [ccmf.ENC_RAW, ccmf.ENC_RAW]
     assert np.array_equal(frames[0].palette, frames[1].palette)
@@ -256,7 +291,7 @@ def test_a_palette_change_is_always_immediately_followed_by_a_raw_frame():
     assert len(chunks) > 3, "test didn't actually exercise multiple chunks"
 
     raw_with_new_palette = raw_with_same_palette = 0
-    for _gop_pts, chunk_bytes in chunks:
+    for _gop_pts, chunk_bytes, _is_ans in chunks:
         _w, _h, frames = _decode(chunk_bytes)
         for j, f in enumerate(frames):
             changed_palette = j == 0 or not np.array_equal(f.palette, frames[j - 1].palette)

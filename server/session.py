@@ -45,6 +45,7 @@ from typing import Optional
 
 import ccmf
 import dfpwm
+from cc_encoder import VideoConfig
 from transcoder import (
     ALL_CHANNEL_ROLES,
     AUDIO_CHUNK_SECONDS,
@@ -141,6 +142,16 @@ class TimedBuffer:
     def empty(self) -> bool:
         return not self._dq
 
+    def purge(self, pred) -> int:
+        """Drop every buffered item whose data satisfies `pred`; return the count
+        dropped.  Used when a wire-format change (ANS turning off) makes some
+        buffered chunks undecodable by a newly-joined subscriber."""
+        before = len(self._dq)
+        self._dq = collections.deque((p, d) for p, d in self._dq if not pred(d))
+        if len(self._dq) < self._max:
+            self._not_full.set()
+        return before - len(self._dq)
+
     def close(self) -> None:
         self._closed = True
         self._not_full.set()
@@ -175,7 +186,8 @@ class StreamSession:
                  rate: int = 48000, audio_codec=PCM,
                  caps_channels: int = ccmf.CAP_CHANNEL_MONO,
                  dynamic_channels: bool = False,
-                 compression: int = ccmf.COMPRESSION_NONE) -> None:
+                 compression: int = ccmf.COMPRESSION_NONE,
+                 use_ans: bool = False) -> None:
         self.url = url
         self.w, self.h, self.fps = w, h, fps
         self.want_audio = want_audio
@@ -185,6 +197,11 @@ class StreamSession:
         self.requested_channels = caps_channels
         self.dynamic_channels = dynamic_channels
         self.compression = compression                   # payload compression (spec §4.1.2)
+        # Live video encoding knobs (read by the GopEncoder inside iter_video at
+        # each GOP boundary).  use_ans may flip during a sync room's lifetime as
+        # ANS-incapable subscribers come and go (set_use_ans); packed GOPs then
+        # use `compression`, ANS GOPs never do (spec §4.5.3).
+        self.video_config = VideoConfig(compression=compression, use_ans=use_ans)
         self.source_channels = 1                         # probed in run() if needed
         self._codec_id = ccmf.CODEC_PCM8 if audio_codec.name == "pcm" \
             else ccmf.CODEC_DFPWM
@@ -291,6 +308,21 @@ class StreamSession:
             return
         self._apply_channel_target()
 
+    def set_use_ans(self, use_ans: bool) -> None:
+        """Turn the ANS video encoding on or off for this (sync-room) session as
+        its membership changes -- ANS stays on only while EVERY subscriber can
+        decode it (main._SyncGroup computes the AND).  The GopEncoder picks up
+        the new setting at the next GOP boundary; when turning OFF we also purge
+        any ANS GOPs already buffered so the ANS-incapable joiner that triggered
+        the change never receives one (packed GOPs are decodable by all, so
+        turning ON needs no purge).  Synchronous and await-free, so it can't
+        interleave with the scheduler releasing chunks."""
+        if self.video_config.use_ans == use_ans:
+            return
+        self.video_config.use_ans = use_ans
+        if not use_ans and self.video_buf is not None:
+            self.video_buf.purge(ccmf.video_chunk_is_ans)
+
     # ----- producers -------------------------------------------------------
 
     async def _produce_video(self) -> None:
@@ -309,12 +341,18 @@ class StreamSession:
             agen = iter_video(self.url, self.w, self.h, self.fps,
                               start=self._start_eff, end=self._end_eff,
                               source_path=self._source_path, loop=self.loop,
-                              timeline=self._timeline, compression=self.compression)
+                              timeline=self._timeline, config=self.video_config)
             # iter_video yields finished CCMF GOP chunks tagged with their first
             # frame's PTS in samples (already on the shared timeline); it may
             # skip source frames to keep up (adaptive pacing) — so trust its
             # pts, don't count.
             async for pts, chunk in agen:
+                # A GOP that was opened as ANS just before use_ans flipped off
+                # (an ANS-incapable subscriber joining) flushes AFTER the flip;
+                # drop it so that subscriber never receives an undecodable chunk.
+                # The already-buffered ANS GOPs are cleared by set_use_ans().
+                if not self.video_config.use_ans and ccmf.video_chunk_is_ans(chunk):
+                    continue
                 await self.video_buf.put(pts / ccmf.SAMPLE_RATE, chunk)
         except Exception:
             log.exception("video producer failed")

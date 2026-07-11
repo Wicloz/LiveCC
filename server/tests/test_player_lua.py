@@ -136,6 +136,42 @@ def video_gop(pts, cell=(0x81, 1, 0), w=2, h=1, extra_delta=True):
     return ccmf.chunk(pts, ccmf.TYPE_VIDEO, ccmf.video_payload(w, h, units))
 
 
+def _grids(w, h, seed):
+    rng = np.random.default_rng(seed)
+    # A mix of a dominant run (flat background) and scattered variation, so both
+    # the RLE and the rANS stages are exercised.
+    glyph = np.where(rng.random((h, w)) < 0.7, 0x80,
+                     rng.integers(0x80, 0xA0, (h, w))).astype(np.uint8)
+    fg = np.where(rng.random((h, w)) < 0.7, 5,
+                  rng.integers(0, 16, (h, w))).astype(np.uint8)
+    bg = np.where(rng.random((h, w)) < 0.8, 0,
+                  rng.integers(0, 16, (h, w))).astype(np.uint8)
+    return glyph, fg, bg
+
+
+def raw_keyframe_chunk(pts, glyph, fg, bg):
+    h, w = glyph.shape
+    units = ccmf.palette_unit(bytes(48)) + ccmf.raw_frame_unit(2000, glyph, fg, bg)
+    return ccmf.chunk(pts, ccmf.TYPE_VIDEO, ccmf.video_payload(w, h, units))
+
+
+def ans_keyframe_chunk(pts, glyph, fg, bg):
+    h, w = glyph.shape
+    units = ccmf.palette_unit(bytes(48)) + ccmf.ans_frame_unit(2000, glyph, fg, bg)
+    return ccmf.chunk(pts, ccmf.TYPE_VIDEO, ccmf.video_payload(w, h, units))
+
+
+def _rendered_blits(chunk_bytes, w, h):
+    p = load_player()
+    p.anchor(0)
+    p.handle_message(chunk_bytes)
+    p.at_clock(0)
+    p.drain_due()
+    blits = p.stub[b"blits"]
+    return [(bytes(blits[i + 1][b"text"]), bytes(blits[i + 1][b"fg"]),
+             bytes(blits[i + 1][b"bg"])) for i in range(len(blits))]
+
+
 # --------------------------------------------------------------------------- #
 # Handshake + capability negotiation
 # --------------------------------------------------------------------------- #
@@ -484,6 +520,36 @@ def test_video_units_render_only_when_due():
     p.drain_due()
     assert len(blits) == 2
     assert len(blits[2][b"text"]) == 1         # the single changed cell
+
+
+def test_caps_advertise_ans_video_encoding():
+    p = load_player()
+    caps = ccmf.parse_caps(ccmf.parse_message(p.sent()[1])[1])
+    assert caps.video_mask & ccmf.CAP_VIDEO_ANS
+
+
+def test_ans_keyframe_renders_identically_to_packed():
+    # The ANS keyframe is only a different transport for the same cells: the
+    # blits it produces must be byte-for-byte what the bit-packed raw keyframe
+    # of the same grid produces (cross-validates the Lua rANS/RLE decoder
+    # against the encoder in rans.py / ccmf.py).
+    w, h = 9, 5
+    glyph, fg, bg = _grids(w, h, seed=7)
+    packed = _rendered_blits(raw_keyframe_chunk(0, glyph, fg, bg), w, h)
+    ans = _rendered_blits(ans_keyframe_chunk(0, glyph, fg, bg), w, h)
+    assert ans == packed
+    assert len(ans) == h                       # one blit per row
+
+
+def test_ans_keyframe_flat_content():
+    # A fully-solid frame is the RLE best case: it must still round-trip.
+    w, h = 12, 4
+    glyph = np.full((h, w), 0x8F, np.uint8)
+    fg = np.full((h, w), 3, np.uint8)
+    bg = np.full((h, w), 7, np.uint8)
+    packed = _rendered_blits(raw_keyframe_chunk(0, glyph, fg, bg), w, h)
+    ans = _rendered_blits(ans_keyframe_chunk(0, glyph, fg, bg), w, h)
+    assert ans == packed
 
 
 def test_consecutive_palettes_are_permissive_and_last_one_wins():

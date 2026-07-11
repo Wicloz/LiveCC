@@ -54,6 +54,7 @@ Sub-pixel bit layout within a cell (matches the client's glyph decoding):
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -890,6 +891,21 @@ def encode_frame(frame_rgb: np.ndarray, adaptive: bool = True):
 # GOP encoder — frames in, CCMF video chunks out
 # --------------------------------------------------------------------------- #
 
+
+@dataclass
+class VideoConfig:
+    """The two negotiated knobs that steer video chunk encoding, held in a
+    mutable object so a running GopEncoder picks up changes at the next GOP
+    boundary (a sync room turns ANS on/off as its membership changes -- see
+    main._SyncGroup / session.StreamSession).
+
+    `use_ans` selects ENC_RAW_ANS keyframes (rANS+RLE, spec §4.5.3); an ANS GOP
+    is NEVER additionally chunk-compressed (its planes are already entropy
+    coded), so `compression` applies only to packed GOPs (and, in the session,
+    to audio chunks)."""
+    compression: int = ccmf.COMPRESSION_NONE
+    use_ans: bool = False
+
 class GopEncoder:
     """Accumulate encoded frames into self-contained CCMF video chunks (GOPs).
 
@@ -940,9 +956,14 @@ class GopEncoder:
     def __init__(self, gop_samples: int = ccmf.SAMPLE_RATE,
                  nominal_duration: int = 2000,
                  max_chunk_bytes: int = 96 * 1024,
-                 compression: int = ccmf.COMPRESSION_NONE) -> None:
+                 compression: int = ccmf.COMPRESSION_NONE,
+                 use_ans: bool = False,
+                 config: Optional[VideoConfig] = None) -> None:
         self.gop_samples = gop_samples          # target GOP span (default 1 s)
-        self.compression = compression          # payload compression (spec §4.1.2)
+        # A live config the encoder re-reads at each GOP boundary; the
+        # compression/use_ans args are a convenience for static callers (a fixed
+        # config).  Whichever is passed, self.config is the single source of truth.
+        self.config = config or VideoConfig(compression=compression, use_ans=use_ans)
         self.nominal_duration = min(nominal_duration, ccmf.MAX_DURATION)
         self.max_chunk_bytes = max_chunk_bytes  # stay under CC's 128 KiB ws cap
         self._entries: list[tuple] = []         # ("pal", bytes) | (enc, pts, body)
@@ -954,6 +975,10 @@ class GopEncoder:
         self._prev = None                       # (glyph, fg, bg) of the last frame
         self._prev_rgb = None                   # subsampled pixels of the last frame
         self._prev_frame = None                 # full pixels of the last frame
+        # Settings captured from self.config when the open GOP was opened, so a
+        # GOP is internally consistent even if the live config flips mid-GOP.
+        self._gop_ans = False
+        self._gop_compression = ccmf.COMPRESSION_NONE
 
     @staticmethod
     def _subsample(frame_rgb: np.ndarray) -> np.ndarray:
@@ -975,6 +1000,11 @@ class GopEncoder:
     _CHUNK_OVERHEAD = 11 + 5                     # chunk header + video payload head
 
     def _open_gop(self, pts: int, frame_rgb: np.ndarray) -> None:
+        # Latch the wire format for this whole GOP.  An ANS GOP is never also
+        # chunk-compressed (planes are already entropy coded, spec §4.5.3).
+        self._gop_ans = self.config.use_ans
+        self._gop_compression = (ccmf.COMPRESSION_NONE if self._gop_ans
+                                 else self.config.compression)
         pal_rgb = generate_palette(frame_rgb)
         self._tables = _palette_tables(pal_rgb)
         self._pal_bytes = pal_rgb.tobytes()
@@ -987,10 +1017,11 @@ class GopEncoder:
                        + self._FRAME_OVERHEAD
                        + ccmf.raw_planes_size(self._w, self._h))
 
-    def add(self, pts: int, frame_rgb: np.ndarray) -> Optional[tuple[int, bytes]]:
+    def add(self, pts: int, frame_rgb: np.ndarray
+            ) -> Optional[tuple[int, bytes, bool]]:
         """Feed the next frame (absolute `pts` in 48 kHz samples).  Returns the
-        finished (gop_pts, chunk_bytes) when this frame starts a new GOP, else
-        None.  Call flush() after the last frame."""
+        finished (gop_pts, chunk_bytes, is_ans) when this frame starts a new GOP,
+        else None.  Call flush() after the last frame."""
         done = None
         if self._entries and pts - self._gop_pts >= self.gop_samples:
             done = self._flush(next_pts=pts)
@@ -1071,13 +1102,14 @@ class GopEncoder:
         self._prev_frame = np.asarray(frame_rgb)
         return done
 
-    def flush(self, next_pts: Optional[int] = None) -> Optional[tuple[int, bytes]]:
-        """Close the open GOP -> (gop_pts, chunk_bytes), or None if empty."""
+    def flush(self, next_pts: Optional[int] = None
+              ) -> Optional[tuple[int, bytes, bool]]:
+        """Close the open GOP -> (gop_pts, chunk_bytes, is_ans), or None if empty."""
         if not self._entries:
             return None
         return self._flush(next_pts)
 
-    def _flush(self, next_pts: Optional[int]) -> tuple[int, bytes]:
+    def _flush(self, next_pts: Optional[int]) -> tuple[int, bytes, bool]:
         frame_pts = [e[1] for e in self._entries if e[0] != "pal"]
         # Duration of frame i = gap to frame i+1; the last runs to the next GOP
         # (or the nominal frame interval at end of stream).  Clamped to the u16
@@ -1097,15 +1129,20 @@ class GopEncoder:
             enc, _pts, body = entry
             duration = next(durations)
             if enc == ccmf.ENC_RAW:
-                units.append(ccmf.raw_frame_unit(duration, *body))
+                # A keyframe is serialized as ENC_RAW_ANS or the bit-packed
+                # ENC_RAW per this GOP's latched format.
+                units.append(ccmf.ans_frame_unit(duration, *body) if self._gop_ans
+                             else ccmf.raw_frame_unit(duration, *body))
             elif enc == ccmf.ENC_DELTA:
                 units.append(ccmf.delta_frame_unit(duration, body))
             else:
                 units.append(ccmf.repeat_frame_unit(duration))
 
         payload = ccmf.video_payload(self._w, self._h, b"".join(units))
-        out = (self._gop_pts, ccmf.chunk(self._gop_pts, ccmf.TYPE_VIDEO, payload,
-                                         compression=self.compression))
+        out = (self._gop_pts,
+               ccmf.chunk(self._gop_pts, ccmf.TYPE_VIDEO, payload,
+                          compression=self._gop_compression),
+               self._gop_ans)
         self._entries = []
         return out
 

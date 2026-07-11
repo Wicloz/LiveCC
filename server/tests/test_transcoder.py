@@ -23,7 +23,7 @@ def _encode_one_gop(frame, fps=10):
     from cc_encoder import GopEncoder
     gop = GopEncoder(nominal_duration=round(ccmf.SAMPLE_RATE / fps))
     gop.add(0, frame)
-    _pts, chunk = gop.flush()
+    _pts, chunk, _is_ans = gop.flush()
     pts, ctype, payload, _ = ccmf.parse_chunk(chunk)
     assert (pts, ctype) == (0, ccmf.TYPE_VIDEO)
     return ccmf.parse_video_payload(payload)

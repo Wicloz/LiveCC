@@ -407,7 +407,7 @@ local function caps_body()
     local flags = (WANT_VIDEO and 1 or 0) + (WANT_AUDIO and 2 or 0)
     local fps = math.max(1, math.min(255, floor(WANTED_FPS)))
     return string.char(flags)
-        .. string.char(0)                -- video: no optional encodings yet
+        .. string.char(1)                -- video: ENC_RAW_ANS decodable (bit 0, spec §4.5.3)
         .. string.char(3)                -- audio: pcm8 + dfpwm both decodable
         .. pack_u16(channels_mask())
         .. string.char(5)                -- compression: none + lz4 (bits 0,2)
@@ -751,6 +751,90 @@ local function render_delta(data, W, count)
     end
 end
 
+-- ── rANS + RLE plane decoder (ENC_RAW_ANS keyframes, spec §4.5.3) ──────────────
+-- Mirrors server/rans.py exactly.  Byte-renormalized rANS over the tiny
+-- glyph/colour alphabets: every step is math.floor / % / *, no bit ops, so it
+-- stays cheap on CC.  A plane is RLE'd first, so flat content (letterboxing,
+-- solid backgrounds) decodes in a handful of symbols instead of W·H.
+local _RANS_L = 65536            -- 2^16
+local _RANS_M = 4096             -- 2^12 total frequency (scale)
+
+-- Decode one plane blob at payload[pos..] for `n` cells -> (out table, next pos).
+-- `out` is filled with symbol values (0-based cell index 1..n in the table).
+local function decode_plane(data, pos, n, out)
+    local k = data:byte(pos); pos = pos + 1
+    local syms, freqs, cums = {}, {}, {}
+    local acc = 0
+    for i = 1, k do
+        local s = data:byte(pos)
+        local f = data:byte(pos + 1) + data:byte(pos + 2) * 256
+        pos = pos + 3
+        syms[i] = s; freqs[i] = f; cums[i] = acc
+        acc = acc + f
+    end
+    local rans_len = u24(data, pos); pos = pos + 3
+    local rp = pos                       -- rANS byte cursor
+    local lp = pos + rans_len            -- length-token cursor
+
+    -- Initial state: 4 bytes big-endian (see rans.py's output reversal).
+    local x = data:byte(rp) * 16777216 + data:byte(rp + 1) * 65536
+            + data:byte(rp + 2) * 256 + data:byte(rp + 3)
+    rp = rp + 4
+
+    local cells = 0
+    while cells < n do
+        local slot = x % _RANS_M
+        -- Linear scan (symbols are frequency-descending, so the common ones win
+        -- in one or two compares).
+        local i = 1
+        while i < k and cums[i + 1] <= slot do i = i + 1 end
+        local s = syms[i]
+        x = freqs[i] * floor(x / _RANS_M) + slot - cums[i]
+        while x < _RANS_L do
+            x = x * 256 + data:byte(rp); rp = rp + 1
+        end
+
+        local b = data:byte(lp); lp = lp + 1
+        local length
+        if b < 255 then
+            length = b
+        else
+            length = data:byte(lp) + data:byte(lp + 1) * 256; lp = lp + 2
+        end
+        for _ = 1, length do
+            cells = cells + 1
+            out[cells] = s
+        end
+    end
+    return lp
+end
+
+-- Render an ENC_RAW_ANS keyframe: decode the three planes, then blit row by row
+-- exactly like render_raw (the entropy coding is only the transport).
+local function render_ans(body, W, H)
+    local unpack = table.unpack or unpack
+    local n = W * H
+    local gcode, fg, bg = {}, {}, {}
+    local pos = 1
+    pos = decode_plane(body, pos, n, gcode)
+    pos = decode_plane(body, pos, n, fg)
+    decode_plane(body, pos, n, bg)
+
+    local text, fgc, bgc = {}, {}, {}
+    for i = 1, n do
+        text[i] = 128 + gcode[i]         -- glyph index -> blit char
+        fgc[i] = HEXB[fg[i]]
+        bgc[i] = HEXB[bg[i]]
+    end
+    for y = 1, H do
+        local base = (y - 1) * W
+        screen.setCursorPos(1, y)
+        screen.blit(string.char(unpack(text, base + 1, base + W)),
+                    string.char(unpack(fgc, base + 1, base + W)),
+                    string.char(unpack(bgc, base + 1, base + W)))
+    end
+end
+
 -- Parse one video chunk payload into queued, absolutely-timestamped units.
 -- Palette units take the PTS of the frame that follows them, so the due-drain
 -- pops palette + keyframe together and flushes them in one redraw.
@@ -773,6 +857,11 @@ local function queue_video(chunk_pts, payload)
                 vqueue[#vqueue + 1] = { pts = cur, w = W, h = H,
                                         raw = payload:sub(pos, pos + raw_bytes - 1) }
                 pos = pos + raw_bytes
+            elseif enc == 3 then         -- ANS keyframe: length-prefixed body
+                local body_len = u24(payload, pos)
+                local body = payload:sub(pos + 3, pos + 3 + body_len - 1)
+                pos = pos + 3 + body_len
+                vqueue[#vqueue + 1] = { pts = cur, w = W, h = H, ans = body }
             elseif enc == 1 then         -- delta: walk the spans to find its end
                 local count = u16(payload, pos)
                 local body = pos + 2
@@ -805,7 +894,7 @@ local function prune_video(origin)
     for i = 1, #vqueue do
         local e = vqueue[i]
         if e.pts > origin then break end
-        if e.raw then keep = i end
+        if e.raw or e.ans then keep = i end          -- ANS keyframes are RAPs too
     end
     if not keep then return end
     if keep > 1 and vqueue[keep - 1].palette then keep = keep - 1 end
@@ -829,6 +918,8 @@ local function drain_due()
             apply_palette(e.palette)
         elseif e.raw then
             render_raw(e.raw, e.w, e.h)
+        elseif e.ans then
+            render_ans(e.ans, e.w, e.h)
         elseif e.delta then
             render_delta(e.delta, e.w, e.count)
         end

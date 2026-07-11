@@ -15,6 +15,66 @@ void CheckAvailable(std::span<const std::byte> payload, std::size_t pos, std::si
     }
 }
 
+// rANS + RLE plane decoder (spec 4.5.3) -- mirrors server/rans.py and the Lua
+// client exactly (byte-renormalized rANS, M = 2^12; a linear scan over the
+// frequency-descending cumulative table; run lengths as byte tokens).  Writes
+// `n` symbols into `out` and returns the offset just past the plane blob.
+constexpr std::uint32_t kRansL = 1u << 16;
+constexpr std::uint32_t kRansM = 1u << 12;
+
+std::size_t DecodeAnsPlane(std::span<const std::byte> payload, std::size_t pos,
+                           std::size_t n, std::vector<std::uint8_t>& out) {
+    auto at = [&](std::size_t k) -> std::uint8_t {
+        if (k >= payload.size()) throw CcmfError("truncated ANS plane");
+        return std::to_integer<std::uint8_t>(payload[k]);
+    };
+    const std::size_t k = at(pos);
+    ++pos;
+    std::vector<std::uint8_t> syms(k);
+    std::vector<std::uint32_t> freqs(k), cums(k);
+    std::uint32_t acc = 0;
+    for (std::size_t i = 0; i < k; ++i) {
+        syms[i] = at(pos);
+        freqs[i] = static_cast<std::uint32_t>(at(pos + 1)) | (static_cast<std::uint32_t>(at(pos + 2)) << 8);
+        cums[i] = acc;
+        acc += freqs[i];
+        pos += 3;
+    }
+    if (k == 0) throw CcmfError("ANS plane has no symbols");
+    const std::size_t ransLen =
+        static_cast<std::size_t>(at(pos)) | (static_cast<std::size_t>(at(pos + 1)) << 8)
+        | (static_cast<std::size_t>(at(pos + 2)) << 16);
+    pos += 3;
+    std::size_t rp = pos;             // rANS byte cursor
+    std::size_t lp = pos + ransLen;   // length-token cursor
+
+    std::uint32_t x = (static_cast<std::uint32_t>(at(rp)) << 24)
+                    | (static_cast<std::uint32_t>(at(rp + 1)) << 16)
+                    | (static_cast<std::uint32_t>(at(rp + 2)) << 8)
+                    | static_cast<std::uint32_t>(at(rp + 3));
+    rp += 4;
+
+    out.resize(n);
+    std::size_t cells = 0;
+    while (cells < n) {
+        const std::uint32_t slot = x & (kRansM - 1);
+        std::size_t i = 0;
+        while (i + 1 < k && cums[i + 1] <= slot) ++i;
+        x = freqs[i] * (x >> 12) + slot - cums[i];
+        while (x < kRansL) x = (x << 8) | at(rp++);
+
+        const std::uint8_t b = at(lp++);
+        std::size_t length = b;
+        if (b == 255) {
+            length = static_cast<std::size_t>(at(lp)) | (static_cast<std::size_t>(at(lp + 1)) << 8);
+            lp += 2;
+        }
+        if (cells + length > n) throw CcmfError("ANS plane run overruns the grid");
+        for (std::size_t c = 0; c < length; ++c) out[cells++] = syms[i];
+    }
+    return lp;
+}
+
 Palette ReadPalette(std::span<const std::byte> payload, std::size_t pos) {
     Palette palette;
     for (std::size_t entry = 0; entry < 16; ++entry) {
@@ -143,6 +203,29 @@ DecodedGop DecodeVideoPayload(std::span<const std::byte> payload) {
                     bg[start + i] = static_cast<std::uint8_t>(colour >> 4);
                 }
                 pos += static_cast<std::size_t>(length) * 2;
+            }
+        } else if (enc == kFrameEncRawAns) {
+            CheckAvailable(payload, pos, 3, "ANS frame body length");
+            const std::size_t bodyLen =
+                static_cast<std::size_t>(ReadLittleEndian<3>(payload.subspan(pos, 3)));
+            pos += 3;
+            const std::size_t bodyEnd = pos + bodyLen;
+            if (bodyEnd > payload.size()) {
+                throw CcmfError("truncated ANS frame body");
+            }
+            std::vector<std::uint8_t> gcode;
+            pos = DecodeAnsPlane(payload, pos, n, gcode);
+            pos = DecodeAnsPlane(payload, pos, n, fg);
+            pos = DecodeAnsPlane(payload, pos, n, bg);
+            if (pos != bodyEnd) {
+                throw CcmfError("ANS frame body length mismatch");
+            }
+            glyph.resize(n);
+            for (std::size_t i = 0; i < n; ++i) {
+                if (gcode[i] > 0x1F) {
+                    throw CcmfError("ANS glyph index out of range");
+                }
+                glyph[i] = static_cast<std::uint8_t>(kBlitCharMin + gcode[i]);
             }
         } else if (enc == kFrameEncRepeat) {
             if (glyph.empty()) {

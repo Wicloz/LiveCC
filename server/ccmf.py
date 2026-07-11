@@ -29,6 +29,8 @@ from typing import Iterator, Optional
 
 import numpy as np
 
+import rans
+
 # --------------------------------------------------------------------------- #
 # Container constants
 # --------------------------------------------------------------------------- #
@@ -48,6 +50,7 @@ COMPRESSION_ZSTD = 3            # deferred (native clients only)
 ENC_RAW = 0
 ENC_DELTA = 1
 ENC_REPEAT = 2
+ENC_RAW_ANS = 3                  # keyframe, rANS+RLE entropy-coded (spec §4.5.3)
 
 # Audio codecs (a-hdr high nibble) and channel roles (a-hdr low nibble, spec §4.6).
 CODEC_PCM8 = 0
@@ -131,6 +134,33 @@ def parse_chunk(buf: bytes, offset: int = 0) -> tuple[int, int, bytes, int]:
         raise ValueError("truncated chunk payload")
     payload = decompress_payload(buf[offset + _CHUNK_HEADER:end], compression)
     return pts, ctype, payload, end
+
+
+def video_chunk_is_ans(chunk: bytes) -> bool:
+    """Cheap peek: does this container chunk carry an ENC_RAW_ANS keyframe?
+
+    Used by the session to keep ANS chunks away from a non-ANS subscriber
+    (§4.5.3 is a negotiated capability).  An ANS GOP is never chunk-compressed,
+    so a compressed chunk is definitely not ANS and needs no inflate; otherwise
+    the first frame unit's encoding (all keyframes in a GOP share it) decides.
+    Returns False for anything malformed or non-video — a conservative answer
+    (treat as decodable-by-all) is safe here."""
+    try:
+        if len(chunk) < _CHUNK_HEADER or chunk[0] != MARKER:
+            return False
+        if chunk[10] != TYPE_VIDEO or chunk[11] != COMPRESSION_NONE:
+            return False
+        pos = _CHUNK_HEADER + 4                        # skip header + [w u16][h u16]
+        while pos < len(chunk):
+            flags = chunk[pos]
+            pos += 1
+            if not flags & 0x80:                       # palette unit: skip 48 B body
+                pos += 48
+                continue
+            return ((flags >> 4) & 0x07) == ENC_RAW_ANS
+    except IndexError:
+        return False
+    return False
 
 
 def iter_chunks(buf: bytes) -> Iterator[tuple[int, int, bytes]]:
@@ -222,6 +252,23 @@ def raw_frame_unit(duration: int, glyph: np.ndarray, fg: np.ndarray,
 def repeat_frame_unit(duration: int) -> bytes:
     """repeat frame unit: hold the current frame for `duration` samples."""
     return bytes([0x80 | (ENC_REPEAT << 4)]) + struct.pack("<H", duration)
+
+
+def ans_frame_unit(duration: int, glyph: np.ndarray, fg: np.ndarray,
+                   bg: np.ndarray) -> bytes:
+    """raw-ANS frame unit (spec §4.5.3): a keyframe whose three planes are
+    rANS+RLE entropy-coded (rans.py) rather than bit-packed.  Body is length-
+    prefixed (u24) so a parser can skip the whole frame without decoding it, as
+    its size is data-dependent.  `glyph` holds blit chars (0x80 + index); the
+    stored glyph plane is the bare 5-bit index."""
+    g = (np.asarray(glyph, np.uint8).ravel() - np.uint8(0x80))
+    body = (rans.encode_plane(g, 32)
+            + rans.encode_plane(np.asarray(fg, np.uint8).ravel(), 16)
+            + rans.encode_plane(np.asarray(bg, np.uint8).ravel(), 16))
+    if len(body) >= 1 << 24:
+        raise ValueError(f"ANS frame body exceeds u24 length: {len(body)}")
+    return (bytes([0x80 | (ENC_RAW_ANS << 4)]) + struct.pack("<H", duration)
+            + len(body).to_bytes(3, "little") + body)
 
 
 def delta_spans(prev: tuple[np.ndarray, np.ndarray, np.ndarray],
@@ -350,6 +397,20 @@ def parse_video_payload(payload: bytes) -> tuple[int, int, list[DecodedFrame]]:
                 gf[start:start + length] = cells[:, 0]
                 ff[start:start + length] = cells[:, 1] & 0x0F
                 bf[start:start + length] = cells[:, 1] >> 4
+        elif enc == ENC_RAW_ANS:
+            (body_len,) = struct.unpack_from("<I", payload[pos:pos + 3] + b"\x00")
+            body_end = pos + 3 + body_len
+            if body_end > len(payload):
+                raise ValueError("truncated ANS frame body")
+            pos += 3
+            gplane, pos = rans.decode_plane(payload, pos, n, 32)
+            fplane, pos = rans.decode_plane(payload, pos, n, 16)
+            bplane, pos = rans.decode_plane(payload, pos, n, 16)
+            if pos != body_end:
+                raise ValueError("ANS frame body length mismatch")
+            glyph = (gplane + np.uint8(0x80)).reshape(h, w)
+            fg = fplane.reshape(h, w)
+            bg = bplane.reshape(h, w)
         elif enc == ENC_REPEAT:
             if glyph is None:
                 raise ValueError("repeat frame before any raw keyframe")
@@ -419,6 +480,9 @@ def parse_status(body: bytes) -> tuple[int, Optional[int]]:
     return state, None
 
 # CAPS bitmask values.
+# video_mask gates OPTIONAL frame encodings (raw/delta/repeat are mandatory);
+# a client sets CAP_VIDEO_ANS iff it can decode ENC_RAW_ANS keyframes (spec §4.5.3).
+CAP_VIDEO_ANS = 0x01
 CAP_AUDIO_PCM8 = 0x01
 CAP_AUDIO_DFPWM = 0x02
 CAP_COMPRESS_NONE = 1 << COMPRESSION_NONE     # 0x01, mandatory
