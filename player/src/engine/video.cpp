@@ -23,13 +23,18 @@ constexpr std::uint32_t kRansL = 1u << 16;
 constexpr std::uint32_t kRansM = 1u << 12;
 
 std::size_t DecodeAnsPlane(std::span<const std::byte> payload, std::size_t pos,
-                           std::size_t n, std::vector<std::uint8_t>& out) {
+                           std::size_t n, std::uint8_t nsym, std::size_t width,
+                           std::vector<std::uint8_t>& out) {
     auto at = [&](std::size_t k) -> std::uint8_t {
         if (k >= payload.size()) throw CcmfError("truncated ANS plane");
         return std::to_integer<std::uint8_t>(payload[k]);
     };
-    // mode 0 = RLE+rANS (run values + length tokens); mode 1 = plain rANS (one
-    // symbol per cell) -- whichever the encoder found smaller.
+    // A leading `filter` byte selects an optional spatial predictor (0 none,
+    // 1 sub/left, 2 up), reversed after the entropy decode.  mode 0 = RLE+rANS
+    // (run values + length tokens); mode 1 = plain rANS (one symbol per cell) --
+    // whichever the encoder found smaller.
+    const std::uint8_t filter = at(pos);
+    ++pos;
     const std::uint8_t mode = at(pos);
     ++pos;
     const std::size_t k = at(pos);
@@ -69,24 +74,37 @@ std::size_t DecodeAnsPlane(std::span<const std::byte> payload, std::size_t pos,
         return i;
     };
 
+    std::size_t endpos;
     if (mode == 1) {                  // plain rANS: one symbol per cell
         for (std::size_t cell = 0; cell < n; ++cell) out[cell] = syms[nextSymbol()];
-        return lpEnd;                 // rANS stream end
+        endpos = lpEnd;               // rANS stream end
+    } else {
+        std::size_t cells = 0;        // mode 0: RLE + rANS run values
+        while (cells < n) {
+            const std::size_t i = nextSymbol();
+            const std::uint8_t b = at(lp++);
+            std::size_t length = b;
+            if (b == 255) {
+                length = static_cast<std::size_t>(at(lp)) | (static_cast<std::size_t>(at(lp + 1)) << 8);
+                lp += 2;
+            }
+            if (cells + length > n) throw CcmfError("ANS plane run overruns the grid");
+            for (std::size_t c = 0; c < length; ++c) out[cells++] = syms[i];
+        }
+        endpos = lp;
     }
 
-    std::size_t cells = 0;            // mode 0: RLE + rANS run values
-    while (cells < n) {
-        const std::size_t i = nextSymbol();
-        const std::uint8_t b = at(lp++);
-        std::size_t length = b;
-        if (b == 255) {
-            length = static_cast<std::size_t>(at(lp)) | (static_cast<std::size_t>(at(lp + 1)) << 8);
-            lp += 2;
-        }
-        if (cells + length > n) throw CcmfError("ANS plane run overruns the grid");
-        for (std::size_t c = 0; c < length; ++c) out[cells++] = syms[i];
+    // Reverse the spatial predictor: a MATCH token (value nsym) copies its
+    // already-reconstructed left (sub) or upper (up) neighbour.  Row-start cells
+    // are never MATCH tokens, so a plain forward scan needs no boundary test.
+    if (filter == 1) {                                    // sub (left)
+        for (std::size_t idx = 1; idx < n; ++idx)
+            if (out[idx] == nsym) out[idx] = out[idx - 1];
+    } else if (filter == 2 && width > 0) {                // up
+        for (std::size_t idx = width; idx < n; ++idx)
+            if (out[idx] == nsym) out[idx] = out[idx - width];
     }
-    return lp;
+    return endpos;
 }
 
 Palette ReadPalette(std::span<const std::byte> payload, std::size_t pos) {
@@ -228,9 +246,9 @@ DecodedGop DecodeVideoPayload(std::span<const std::byte> payload) {
                 throw CcmfError("truncated ANS frame body");
             }
             std::vector<std::uint8_t> gcode;
-            pos = DecodeAnsPlane(payload, pos, n, gcode);
-            pos = DecodeAnsPlane(payload, pos, n, fg);
-            pos = DecodeAnsPlane(payload, pos, n, bg);
+            pos = DecodeAnsPlane(payload, pos, n, 32, width, gcode);
+            pos = DecodeAnsPlane(payload, pos, n, 16, width, fg);
+            pos = DecodeAnsPlane(payload, pos, n, 16, width, bg);
             if (pos != bodyEnd) {
                 throw CcmfError("ANS frame body length mismatch");
             }

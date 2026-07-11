@@ -760,10 +760,13 @@ local _RANS_L = 65536            -- 2^16
 local _RANS_M = 4096             -- 2^12 total frequency (scale)
 
 -- Decode one plane blob at payload[pos..] for `n` cells -> (out table, next pos).
--- `out` is filled with symbol values (0-based cell index 1..n in the table).
--- mode 0 = RLE+rANS (run values + length tokens); mode 1 = plain rANS (one
--- symbol per cell) -- whichever the encoder found smaller.
-local function decode_plane(data, pos, n, out)
+-- `out` is filled with symbol values (cell index 1..n in the table).  A leading
+-- `filter` byte selects an optional spatial predictor (0 none, 1 sub/left, 2
+-- up); a MATCH token (value == `nsym`) marks a cell equal to its neighbour, so
+-- after the entropy decode we reverse the predictor in place.  mode 0 = RLE+rANS,
+-- mode 1 = plain rANS -- whichever the encoder found smaller.
+local function decode_plane(data, pos, n, out, nsym, width)
+    local filter = data:byte(pos); pos = pos + 1
     local mode = data:byte(pos); pos = pos + 1
     local k = data:byte(pos); pos = pos + 1
     local syms, freqs, cums = {}, {}, {}
@@ -784,6 +787,7 @@ local function decode_plane(data, pos, n, out)
             + data:byte(rp + 2) * 256 + data:byte(rp + 3)
     rp = rp + 4
 
+    local endpos
     if mode == 1 then                    -- plain rANS: one symbol per cell
         for cell = 1, n do
             local slot = x % _RANS_M
@@ -795,35 +799,50 @@ local function decode_plane(data, pos, n, out)
                 x = x * 256 + data:byte(rp); rp = rp + 1
             end
         end
-        return lp                        -- rANS stream end == lp
+        endpos = lp                      -- rANS stream end == lp
+    else
+        local cells = 0                  -- mode 0: RLE + rANS run values
+        while cells < n do
+            local slot = x % _RANS_M
+            -- Linear scan (symbols are frequency-descending, so the common ones
+            -- win in one or two compares).
+            local i = 1
+            while i < k and cums[i + 1] <= slot do i = i + 1 end
+            local s = syms[i]
+            x = freqs[i] * floor(x / _RANS_M) + slot - cums[i]
+            while x < _RANS_L do
+                x = x * 256 + data:byte(rp); rp = rp + 1
+            end
+
+            local b = data:byte(lp); lp = lp + 1
+            local length
+            if b < 255 then
+                length = b
+            else
+                length = data:byte(lp) + data:byte(lp + 1) * 256; lp = lp + 2
+            end
+            for _ = 1, length do
+                cells = cells + 1
+                out[cells] = s
+            end
+        end
+        endpos = lp
     end
 
-    local cells = 0                      -- mode 0: RLE + rANS run values
-    while cells < n do
-        local slot = x % _RANS_M
-        -- Linear scan (symbols are frequency-descending, so the common ones win
-        -- in one or two compares).
-        local i = 1
-        while i < k and cums[i + 1] <= slot do i = i + 1 end
-        local s = syms[i]
-        x = freqs[i] * floor(x / _RANS_M) + slot - cums[i]
-        while x < _RANS_L do
-            x = x * 256 + data:byte(rp); rp = rp + 1
+    -- Reverse the spatial predictor: replace each MATCH token (value nsym) with
+    -- its already-reconstructed left (sub) or upper (up) neighbour.  Row-start
+    -- cells are never MATCH tokens (the encoder keeps them literal), so a plain
+    -- forward scan is correct without a per-cell row-boundary test.
+    if filter == 1 then                  -- sub (left)
+        for idx = 2, n do
+            if out[idx] == nsym then out[idx] = out[idx - 1] end
         end
-
-        local b = data:byte(lp); lp = lp + 1
-        local length
-        if b < 255 then
-            length = b
-        else
-            length = data:byte(lp) + data:byte(lp + 1) * 256; lp = lp + 2
-        end
-        for _ = 1, length do
-            cells = cells + 1
-            out[cells] = s
+    elseif filter == 2 then              -- up
+        for idx = width + 1, n do
+            if out[idx] == nsym then out[idx] = out[idx - width] end
         end
     end
-    return lp
+    return endpos
 end
 
 -- Render an ENC_RAW_ANS keyframe: decode the three planes, then blit row by row
@@ -833,9 +852,9 @@ local function render_ans(body, W, H)
     local n = W * H
     local gcode, fg, bg = {}, {}, {}
     local pos = 1
-    pos = decode_plane(body, pos, n, gcode)
-    pos = decode_plane(body, pos, n, fg)
-    decode_plane(body, pos, n, bg)
+    pos = decode_plane(body, pos, n, gcode, 32, W)
+    pos = decode_plane(body, pos, n, fg, 16, W)
+    decode_plane(body, pos, n, bg, 16, W)
 
     local text, fgc, bgc = {}, {}, {}
     for i = 1, n do

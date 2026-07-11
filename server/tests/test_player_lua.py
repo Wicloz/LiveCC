@@ -552,6 +552,29 @@ def test_ans_keyframe_flat_content():
     assert ans == packed
 
 
+def test_ans_keyframe_with_spatial_filters_renders_identically_to_packed():
+    # Structured content that triggers the Sub/Up predictors: the Lua decoder
+    # must reverse the filter and produce the exact same blits as packed.
+    w, h = 20, 10
+
+    def corr(nsym, seed):    # horizontal correlation broken into many runs (Sub wins)
+        r = np.random.default_rng(seed)
+        g = r.integers(0, nsym, (h, w))
+        for c in range(1, w):
+            g[:, c] = np.where(r.random(h) < 0.7, g[:, c - 1], g[:, c])
+        return g.astype(np.uint8)
+
+    glyph = (corr(32, 1) + 0x80).astype(np.uint8)
+    fg, bg = corr(16, 2), corr(16, 3)
+    # The glyph plane must use the Sub filter (body layout: flags,dur(2),
+    # bodylen(3) then plane 0's leading filter byte at index 6), so this isn't a
+    # vacuous no-filter test.
+    assert ccmf.ans_frame_unit(2000, glyph, fg, bg)[6] == 1        # FILTER_SUB
+    packed = _rendered_blits(raw_keyframe_chunk(0, glyph, fg, bg), w, h)
+    ans = _rendered_blits(ans_keyframe_chunk(0, glyph, fg, bg), w, h)
+    assert ans == packed
+
+
 def test_consecutive_palettes_are_permissive_and_last_one_wins():
     # Spec: a palette unit MUST NOT be immediately followed by another one
     # (docs/cc-media-format.md §4.4) -- but this client is deliberately

@@ -109,7 +109,8 @@ def find_media(stream: str | None = None) -> list[Path]:
              if p.is_file()
              and not p.name.startswith(".")          # .gitignore and other dotfiles
              and p.name.lower() != "readme.md"
-             and p.suffix.lower() != ".ccmf"]         # our OUTPUT format, not a source clip
+             and p.suffix.lower() != ".ccmf"          # our OUTPUT format, not a source clip
+             and not p.name.lower().endswith(".ccmf.tmp")]   # convert_to_ccmf's in-progress temp
     if stream is None:
         return files
     return [p for p in files if stream in media_streams(p)]

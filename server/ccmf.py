@@ -298,10 +298,11 @@ def ans_frame_unit(duration: int, glyph: np.ndarray, fg: np.ndarray,
     prefixed (u24) so a parser can skip the whole frame without decoding it, as
     its size is data-dependent.  `glyph` holds blit chars (0x80 + index); the
     stored glyph plane is the bare 5-bit index."""
+    w = np.asarray(glyph).shape[1]
     g = (np.asarray(glyph, np.uint8).ravel() - np.uint8(0x80))
-    body = (rans.encode_plane(g, 32)
-            + rans.encode_plane(np.asarray(fg, np.uint8).ravel(), 16)
-            + rans.encode_plane(np.asarray(bg, np.uint8).ravel(), 16))
+    body = (rans.encode_plane(g, 32, w)
+            + rans.encode_plane(np.asarray(fg, np.uint8).ravel(), 16, w)
+            + rans.encode_plane(np.asarray(bg, np.uint8).ravel(), 16, w))
     if len(body) >= 1 << 24:
         raise ValueError(f"ANS frame body exceeds u24 length: {len(body)}")
     return (bytes([0x80 | (ENC_RAW_ANS << 4)]) + struct.pack("<H", duration)
@@ -440,9 +441,9 @@ def parse_video_payload(payload: bytes) -> tuple[int, int, list[DecodedFrame]]:
             if body_end > len(payload):
                 raise ValueError("truncated ANS frame body")
             pos += 3
-            gplane, pos = rans.decode_plane(payload, pos, n, 32)
-            fplane, pos = rans.decode_plane(payload, pos, n, 16)
-            bplane, pos = rans.decode_plane(payload, pos, n, 16)
+            gplane, pos = rans.decode_plane(payload, pos, n, 32, w)
+            fplane, pos = rans.decode_plane(payload, pos, n, 16, w)
+            bplane, pos = rans.decode_plane(payload, pos, n, 16, w)
             if pos != body_end:
                 raise ValueError("ANS frame body length mismatch")
             glyph = (gplane + np.uint8(0x80)).reshape(h, w)

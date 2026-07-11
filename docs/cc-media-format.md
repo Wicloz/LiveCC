@@ -298,7 +298,8 @@ Each **plane** is entropy-coded in one of two modes; the encoder emits whichever
 is smaller (`mode` byte):
 
 ```
-plane = [ mode u8 ]                      0 = RLE+rANS · 1 = plain rANS
+plane = [ filter u8 ]                    0 none · 1 sub (left) · 2 up
+        [ mode u8 ]                      0 = RLE+rANS · 1 = plain rANS
         [ k u8 ]                         distinct symbols present
         [ sym u8, freq u16 ] × k         normalized frequencies, Σ = 4096, desc.
         [ rans_len u24 ]                 byte length of the rANS stream
@@ -307,9 +308,21 @@ plane = [ mode u8 ]                      0 = RLE+rANS · 1 = plain rANS
 length token = a byte < 255 (the length), or 0xFF followed by a u16.
 ```
 
-- **mode 0 (RLE+rANS)**: the plane is run-length encoded; the run *values* are
-  range-ANS (rANS) coded and the run *lengths* are the byte tokens above. Flat
-  content (letterboxing, solid fills) collapses to a handful of runs.
+- **filter** — an optional spatial predictor applied *before* entropy coding.
+  Palette indices aren't ordered, so instead of PNG's arithmetic difference the
+  "residual" is a **MATCH token** (symbol value `= nsym`, i.e. 32 for glyph, 16
+  for fg/bg) wherever a cell equals its neighbour, else the literal value:
+  filter `1` (**sub**) compares the cell to its **left** neighbour (first column
+  stays literal); filter `2` (**up**) compares to the cell **above** (first row
+  literal). A MATCH-dominated stream entropy-codes the run *structure* far
+  cheaper than mode 0's raw length bytes, shrinking structured keyframes ~8%.
+  The decoder reverses the predictor after the entropy decode — row-start cells
+  are never MATCH tokens, so a plain forward scan needs no boundary test. An
+  encoder chooses the filter however it likes (a reference encoder uses a cheap
+  size estimate of each candidate); a decoder simply obeys the `filter` byte.
+- **mode 0 (RLE+rANS)**: the (filtered) plane is run-length encoded; the run
+  *values* are range-ANS (rANS) coded and the run *lengths* are the byte tokens
+  above. Flat content (letterboxing, solid fills) collapses to a handful of runs.
 - **mode 1 (plain rANS)**: every cell is rANS-coded directly, no length tokens.
   This wins on high-detail/dithered content, where runs degenerate to length 1
   and mode 0's per-run length tokens would otherwise bloat the plane past even
