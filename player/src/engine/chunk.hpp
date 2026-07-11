@@ -28,8 +28,8 @@ inline constexpr std::uint8_t kChunkTypeVideo = 0;
 inline constexpr std::uint8_t kChunkTypeAudio = 1;
 
 // Compression values (spec 4.1.2). This native player decodes none/lz4/brotli/
-// bzip2; `deflate`/`zstd` (1/3) are reserved and rejected on decode.  Every
-// compressed format is framed [uncompressed size u32 LE][codec stream].
+// bzip2; any other value is rejected on decode.  Every compressed format is
+// framed [uncompressed size u32 LE][codec stream].
 inline constexpr std::uint8_t kCompressionNone = 0;
 inline constexpr std::uint8_t kCompressionLz4 = 2;
 inline constexpr std::uint8_t kCompressionBrotli = 4;

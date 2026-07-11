@@ -995,7 +995,7 @@ end
 -- spec §4.1/§4.4/§4.6) as it's received.  Routed through console() like every
 -- other status line, so it's silenced when the terminal itself is the display
 -- (it would otherwise scribble over the video, same reasoning as elsewhere).
-local COMPRESSION_NAMES = { [0] = "none", [1] = "deflate", [2] = "lz4", [3] = "zstd" }
+local COMPRESSION_NAMES = { [0] = "none", [2] = "lz4" }
 local CODEC_NAMES = { [0] = "pcm8", [1] = "dfpwm" }
 
 -- Walk a GOP's unit stream (spec §4.5) just to tally it for --verbose — same
@@ -1104,7 +1104,7 @@ local function handle_message(msg)
         if compression == 2 then                     -- LZ4 (spec §4.1.2): [size u32][block]
             payload = lz4_decompress(payload:sub(5))
         elseif compression ~= 0 then
-            return                                    -- deflate/zstd: not decodable on CC
+            return                                    -- brotli/bzip2/etc: not decodable on CC
         end
         if VERBOSE then verbose_chunk(pts, length, ctype, compression, payload) end
         if ctype == TYPE_VIDEO and WANT_VIDEO then

@@ -127,8 +127,8 @@ with wide margin.
 #### 4.1.2. Compression
 
 `compression` selects a payload-wide compression applied uniformly to **any**
-chunk type: `0` none · `1` deflate · `2` lz4 · `3` zstd · `4` brotli · `5`
-bzip2. The whole payload is compressed as one blob; the consumer inflates it
+chunk type: `0` none · `2` lz4 · `4` brotli · `5` bzip2 (values `1` and `3` are
+unused). The whole payload is compressed as one blob; the consumer inflates it
 before dispatching by `type`, so type-specific decoders never handle
 compression. Every compressed format is framed **`[uncompressed size u32 LE]
 [codec stream]`** (the size lets a decoder allocate the output up front).
@@ -142,7 +142,6 @@ Formats:
 - **`brotli`** — a raw brotli stream. Native clients only (bit-level entropy
   coding).
 - **`bzip2`** — a bzip2 stream (`BZh…`). Native clients only.
-- **`deflate` / `zstd`** — reserved and **not yet produced**.
 
 It is chosen **per chunk**, so a producer compresses what benefits (a video
 GOP's `delta`/packed frames, PCM8 audio) and leaves the rest `none`. Per-
@@ -441,8 +440,8 @@ The server **MUST NOT** echo the chosen configuration; clients learn actual
 [ audio u8 ]     bitmask: bit0 pcm8 · bit1 dfpwm
 [ channels u16 ] one-hot per channel role (Section 4.6): bit N = accepts role N
                  (bit0 mono · bit1 front-left · bit2 front-right · … up to 7.1)
-[ compress u8 ]  bitmask: bit0 none · bit1 deflate · bit2 lz4 · bit3 zstd
-                 · bit4 brotli · bit5 bzip2 (bit N = can inflate compression N)
+[ compress u8 ]  bitmask: bit0 none · bit2 lz4 · bit4 brotli · bit5 bzip2
+                 (bit N = can inflate compression N; bits 1, 3 unused)
 [ width  u16 ]   requested grid width, in character cells (Section 4.5)
 [ height u16 ]   requested grid height, in character cells (Section 4.5)
 [ fps    u8  ]

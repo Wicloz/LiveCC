@@ -9,7 +9,7 @@ the decode side.
 1. Container Format — self-describing chunks:
        [marker 1B][PTS u48][length u24][type u8][compression u8][payload]
    PTS is absolute in 48 kHz samples; `compression` compresses the whole payload of
-   any type (none + LZ4 §4.1.2; deflate/zstd deferred for native clients).  A video payload is a
+   any type (none + LZ4/brotli/bzip2, §4.1.2).  A video payload is a
    self-contained GOP ([w u16][h u16] + a unit stream); an audio payload is
    [a-hdr u8] + samples.
 
@@ -42,11 +42,10 @@ TYPE_VIDEO = 0
 TYPE_AUDIO = 1
 
 COMPRESSION_NONE = 0
-COMPRESSION_DEFLATE = 1          # deferred (native clients only)
 COMPRESSION_LZ4 = 2              # spec §4.1.2: [uncompressed size u32 LE][raw LZ4 block]
-COMPRESSION_ZSTD = 3            # deferred (native clients only)
 COMPRESSION_BROTLI = 4          # native clients only (§4.1.2); [size u32 LE][brotli stream]
 COMPRESSION_BZIP2 = 5           # native clients only; [size u32 LE][bzip2 stream]
+# Values 1 and 3 are unused.
 
 # Frame-unit encodings (unit flags bits 6-4).
 ENC_RAW = 0
@@ -81,7 +80,7 @@ def compress_payload(payload: bytes, compression: int) -> bytes:
     framed as [uncompressed size u32 LE][codec stream] (the size lets a decoder
     allocate up front; LZ4's raw block needs it, and it keeps the others
     uniform); `none` is a passthrough.  LZ4 is the only format the CC/Lua client
-    can inflate; brotli/bzip2 are for native clients (deflate/zstd reserved)."""
+    can inflate; brotli/bzip2 are for native clients."""
     if compression == COMPRESSION_NONE:
         return payload
     size = len(payload).to_bytes(4, "little")
