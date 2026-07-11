@@ -5,11 +5,26 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Default to an optimized build on single-config generators (Ninja, Makefiles):
+# an unset CMAKE_BUILD_TYPE there means NO optimization flags at all (~ -O0), so a
+# plain `cmake ..` would silently ship an unoptimized player. Multi-config
+# generators (Visual Studio, Xcode) pick the config at build time, so leave them.
+get_property(_player_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(NOT _player_multi_config AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+    message(STATUS "player: no CMAKE_BUILD_TYPE set, defaulting to Release.")
+endif()
+
 # Emit compile_commands.json for editor tooling (clangd etc.); harmless if unused.
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(PLAYER_BUILD_TESTS "Build the ccmf_engine unit test suite" ON)
 option(PLAYER_COVERAGE "Instrument ccmf_engine with --coverage (GCC/Clang only)" OFF)
+
+# Probe once whether the toolchain can do interprocedural (link-time) optimization;
+# enabled per-target on release configs after the targets are defined (see below).
+include(CheckIPOSupported)
+check_ipo_supported(RESULT player_ipo_supported OUTPUT player_ipo_error LANGUAGES CXX)
 
 include(FetchContent)
 
@@ -36,6 +51,25 @@ endif()
 
 add_subdirectory(src/engine)
 add_subdirectory(src/app)
+
+# Interprocedural / link-time optimization for RELEASE-class builds only.
+# ccmf_engine is a static library split across translation units, and the hot
+# decode/render path crosses those boundaries (engine.cpp -> video/audio/chunk/
+# index/resync.cpp; app -> engine), so cross-TU inlining and dead-code stripping
+# only happen with IPO/LTO. Debug builds deliberately trade this away for build
+# speed and debuggability. Set per-target so it never disturbs the fetched
+# raylib/gtest builds.
+if(player_ipo_supported)
+    foreach(_player_tgt ccmf_engine player)
+        set_property(TARGET ${_player_tgt}
+                     PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+        set_property(TARGET ${_player_tgt}
+                     PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO TRUE)
+    endforeach()
+else()
+    message(STATUS "player: IPO/LTO unavailable; release builds will not use it "
+                   "(${player_ipo_error})")
+endif()
 
 if(PLAYER_BUILD_TESTS)
     # Match the runtime library GoogleTest links against to the rest of the
