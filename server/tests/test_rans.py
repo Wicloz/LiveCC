@@ -25,7 +25,20 @@ def test_single_cell():
 
 def test_two_symbols_runs():
     plane = np.array([0] * 300 + [5] * 400 + [0] * 5 + [5], np.uint8)
-    _roundtrip(plane, 16)
+    blob = _roundtrip(plane, 16)
+    assert blob[0] == 0            # run-heavy -> RLE mode wins
+
+
+def test_noisy_plane_uses_plain_mode_and_avoids_length_token_bloat():
+    # High-detail content degenerates RLE to length-1 runs; the encoder must fall
+    # back to plain rANS (mode 1) so per-run length tokens don't bloat the plane
+    # past the bit-packed size.
+    rng = np.random.default_rng(9)
+    plane = rng.integers(0, 32, 4000, dtype=np.uint8)
+    blob = _roundtrip(plane, 32)
+    assert blob[0] == 1            # plain rANS mode chosen
+    packed = (4000 + 7) // 8 * 5   # 5-bit glyph packing size
+    assert len(blob) < packed * 1.2   # near entropy, not ~3 B/cell RLE bloat
 
 
 def test_all_symbols_glyph():

@@ -289,17 +289,26 @@ A chunk carrying a `raw-ANS` unit **MUST NOT** also be chunk-compressed
 so a second pass only wastes CPU. Packed (`raw`) GOPs are unaffected and may
 still be compressed.
 
-Each **plane** is run-length encoded, then the run *values* are range-ANS
-(rANS) coded and the run *lengths* are byte tokens:
+Each **plane** is entropy-coded in one of two modes; the encoder emits whichever
+is smaller (`mode` byte):
 
 ```
-plane = [ k u8 ]                         distinct run-value symbols present
+plane = [ mode u8 ]                      0 = RLE+rANS · 1 = plain rANS
+        [ k u8 ]                         distinct symbols present
         [ sym u8, freq u16 ] × k         normalized frequencies, Σ = 4096, desc.
         [ rans_len u24 ]                 byte length of the rANS stream
         [ rans bytes ]                   4-byte initial state (big-endian) + renorm bytes
-        [ length token ... ]             one run length per run, until W·H cells
+        [ length token ... ]             (mode 0 only) one run length per run
 length token = a byte < 255 (the length), or 0xFF followed by a u16.
 ```
+
+- **mode 0 (RLE+rANS)**: the plane is run-length encoded; the run *values* are
+  range-ANS (rANS) coded and the run *lengths* are the byte tokens above. Flat
+  content (letterboxing, solid fills) collapses to a handful of runs.
+- **mode 1 (plain rANS)**: every cell is rANS-coded directly, no length tokens.
+  This wins on high-detail/dithered content, where runs degenerate to length 1
+  and mode 0's per-run length tokens would otherwise bloat the plane past even
+  the bit-packed `raw` plane. Decode reads exactly W·H symbols.
 
 **rANS parameters** (fixed): total frequency `M = 4096` (`2^12`), lower bound
 `L = 2^16`, byte renormalization. These keep every intermediate below `2^24`, so

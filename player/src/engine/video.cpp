@@ -28,8 +28,13 @@ std::size_t DecodeAnsPlane(std::span<const std::byte> payload, std::size_t pos,
         if (k >= payload.size()) throw CcmfError("truncated ANS plane");
         return std::to_integer<std::uint8_t>(payload[k]);
     };
+    // mode 0 = RLE+rANS (run values + length tokens); mode 1 = plain rANS (one
+    // symbol per cell) -- whichever the encoder found smaller.
+    const std::uint8_t mode = at(pos);
+    ++pos;
     const std::size_t k = at(pos);
     ++pos;
+    if (k == 0) throw CcmfError("ANS plane has no symbols");
     std::vector<std::uint8_t> syms(k);
     std::vector<std::uint32_t> freqs(k), cums(k);
     std::uint32_t acc = 0;
@@ -40,13 +45,13 @@ std::size_t DecodeAnsPlane(std::span<const std::byte> payload, std::size_t pos,
         acc += freqs[i];
         pos += 3;
     }
-    if (k == 0) throw CcmfError("ANS plane has no symbols");
     const std::size_t ransLen =
         static_cast<std::size_t>(at(pos)) | (static_cast<std::size_t>(at(pos + 1)) << 8)
         | (static_cast<std::size_t>(at(pos + 2)) << 16);
     pos += 3;
     std::size_t rp = pos;             // rANS byte cursor
-    std::size_t lp = pos + ransLen;   // length-token cursor
+    const std::size_t lpEnd = pos + ransLen;
+    std::size_t lp = lpEnd;           // length-token cursor (mode 0)
 
     std::uint32_t x = (static_cast<std::uint32_t>(at(rp)) << 24)
                     | (static_cast<std::uint32_t>(at(rp + 1)) << 16)
@@ -55,14 +60,23 @@ std::size_t DecodeAnsPlane(std::span<const std::byte> payload, std::size_t pos,
     rp += 4;
 
     out.resize(n);
-    std::size_t cells = 0;
-    while (cells < n) {
+    auto nextSymbol = [&]() -> std::size_t {
         const std::uint32_t slot = x & (kRansM - 1);
         std::size_t i = 0;
         while (i + 1 < k && cums[i + 1] <= slot) ++i;
         x = freqs[i] * (x >> 12) + slot - cums[i];
         while (x < kRansL) x = (x << 8) | at(rp++);
+        return i;
+    };
 
+    if (mode == 1) {                  // plain rANS: one symbol per cell
+        for (std::size_t cell = 0; cell < n; ++cell) out[cell] = syms[nextSymbol()];
+        return lpEnd;                 // rANS stream end
+    }
+
+    std::size_t cells = 0;            // mode 0: RLE + rANS run values
+    while (cells < n) {
+        const std::size_t i = nextSymbol();
         const std::uint8_t b = at(lp++);
         std::size_t length = b;
         if (b == 255) {

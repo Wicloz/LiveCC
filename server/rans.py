@@ -14,18 +14,27 @@ cheap `math.floor` / `%` / `string.byte` in Lua, no bit twiddling anywhere.
 
 Layout of one encoded plane (all little-endian, byte-aligned):
 
-    [k u8]                       number of distinct run-value symbols present
+    [mode u8]                    0 = RLE+rANS, 1 = plain rANS
+    [k u8]                       number of distinct symbols present
     k × [sym u8][freq u16]       normalized frequencies, sum == M, freq desc.
-    [rans_len u24]               byte length of the rANS value stream
+    [rans_len u24]               byte length of the rANS stream
     [rans bytes]                 4-byte final state (big-endian) + renorm bytes
-    [length tokens ...]          one run length per run, until n cells filled
+    [length tokens ...]          (mode 0 only) one run length per run
 
-A plane is first run-length encoded into (value, length) runs.  The run VALUES
-(skewed — a few colours/glyphs dominate) go through rANS; the run LENGTHS (close
-to uniform in the log domain, poor entropy targets) are plain byte tokens: a
-byte < 255 is the length itself, else 0xFF followed by a u16.  Flat content
-(letterboxing, solid backgrounds, borders) collapses to a handful of runs, so
-the decoder does far less work per keyframe than unpacking W·H bit-packed cells.
+Two per-plane modes, encoder picks the smaller:
+
+  * **mode 0 (RLE+rANS)** — the plane is run-length encoded into (value, length)
+    runs; the run VALUES (skewed — a few colours/glyphs dominate) go through
+    rANS, and the run LENGTHS (near-uniform in the log domain, poor entropy
+    targets) are plain byte tokens: a byte < 255 is the length, else 0xFF + u16.
+    Flat content (letterboxing, solid fills) collapses to a handful of runs.
+  * **mode 1 (plain rANS)** — every cell is rANS-coded directly, no run lengths.
+    This wins on high-detail/dithered content where runs degenerate to length 1
+    and mode 0's one-byte-per-run length tokens would dominate (there, mode 0 can
+    exceed even the bit-packed `raw` plane; mode 1 stays near the entropy).
+
+So flat planes keep the big RLE win and noisy planes fall back to pure entropy
+coding — the plane is never bloated by run-length overhead it can't amortise.
 
 The rANS parameters (M = 2**12 total frequency, RANS_L = 2**16 low bound, byte
 rendrmalization) keep every intermediate below 2**24 < 2**53, so the whole thing
@@ -100,29 +109,33 @@ def _pack_length(out: bytearray, length: int) -> None:
         out.append((length >> 8) & 0xFF)
 
 
-def encode_plane(plane: np.ndarray, nsym: int) -> bytes:
-    """Encode a 1-D array of symbols in [0, nsym) -> a self-delimiting plane blob."""
-    plane = np.asarray(plane, dtype=np.uint8)
-    values, lengths = _rle(plane)
-
-    counts = np.bincount(values, minlength=nsym).astype(np.int64)
+def _build_table(counts: np.ndarray) -> tuple[dict, dict, bytes]:
+    """Normalize `counts` to sum _M and serialize the frequency table (symbols
+    frequency-descending) -> (freq{sym:f}, cum{sym:exclusive-prefix}, head bytes)."""
     freqs = _normalize_freqs(counts)
-
-    # Frequency table, symbols ordered by descending frequency (fast linear-scan
-    # decode).  cum[] is the exclusive prefix sum in that same order.
     present = np.nonzero(freqs)[0]
     present = present[np.argsort(-freqs[present])]
     freq = {int(s): int(freqs[s]) for s in present}
     cum: dict[int, int] = {}
     acc = 0
+    head = bytearray([len(present)])
     for s in present:
-        cum[int(s)] = acc
-        acc += int(freqs[s])
+        s = int(s)
+        cum[s] = acc
+        acc += freq[s]
+        head.append(s)
+        head.append(freq[s] & 0xFF)
+        head.append((freq[s] >> 8) & 0xFF)
+    return freq, cum, bytes(head)
 
-    # rANS-encode the run values in reverse (decoder emits them forward).
+
+def _rans_encode(symbols: np.ndarray, freq: dict, cum: dict) -> bytes:
+    """rANS-encode a symbol array in reverse (decoder emits forward) -> the byte
+    stream: 4-byte final state (big-endian, after the whole-buffer reversal) then
+    renorm bytes."""
     x = _RANS_L
     buf = bytearray()
-    for s in values[::-1]:
+    for s in symbols[::-1]:
         s = int(s)
         f = freq[s]
         x_max = f << (16 - _SCALE_BITS + 8)      # ((RANS_L >> SCALE) << 8) * f
@@ -132,64 +145,86 @@ def encode_plane(plane: np.ndarray, nsym: int) -> bytes:
         x = (x // f) * _M + (x % f) + cum[s]
     for i in range(4):                            # final state, low byte first
         buf.append((x >> (8 * i)) & 0xFF)
-    rans = bytes(reversed(buf))                   # reverse -> forward-readable
+    return bytes(reversed(buf))                   # reverse -> forward-readable
 
-    head = bytearray()
-    head.append(len(present))
-    for s in present:
-        s = int(s)
-        head.append(s)
-        head.append(freq[s] & 0xFF)
-        head.append((freq[s] >> 8) & 0xFF)
-    head.append(len(rans) & 0xFF)
-    head.append((len(rans) >> 8) & 0xFF)
-    head.append((len(rans) >> 16) & 0xFF)
 
+def _rans_len_bytes(rans: bytes) -> bytes:
+    return bytes([len(rans) & 0xFF, (len(rans) >> 8) & 0xFF, (len(rans) >> 16) & 0xFF])
+
+
+def encode_plane(plane: np.ndarray, nsym: int) -> bytes:
+    """Encode a 1-D array of symbols in [0, nsym) -> a self-delimiting plane blob,
+    picking the smaller of mode 0 (RLE+rANS) and mode 1 (plain rANS)."""
+    plane = np.asarray(plane, dtype=np.uint8)
+
+    # mode 1: plain rANS over every cell (no run lengths).
+    freq1, cum1, head1 = _build_table(np.bincount(plane, minlength=nsym).astype(np.int64))
+    rans1 = _rans_encode(plane, freq1, cum1)
+    m1 = b"\x01" + head1 + _rans_len_bytes(rans1) + rans1
+
+    # mode 0: RLE, rANS over the run values, run lengths as byte tokens.
+    values, lengths = _rle(plane)
+    freq0, cum0, head0 = _build_table(np.bincount(values, minlength=nsym).astype(np.int64))
+    rans0 = _rans_encode(values, freq0, cum0)
     lens = bytearray()
     for L in lengths:
         _pack_length(lens, int(L))
+    m0 = b"\x00" + head0 + _rans_len_bytes(rans0) + rans0 + bytes(lens)
 
-    return bytes(head) + rans + bytes(lens)
+    return m0 if len(m0) <= len(m1) else m1
 
 
-def decode_plane(data: bytes, offset: int, n: int, nsym: int) -> tuple[np.ndarray, int]:
-    """Decode one plane blob at `data[offset:]` for `n` cells -> (plane, next_offset).
-    Mirrors the Lua/C++ decoders exactly (linear-scan symbol lookup, byte renorm)."""
-    pos = offset
+def _read_table(data: bytes, pos: int) -> tuple[list, list, list, int, int]:
+    """Read a frequency table + rANS length -> (syms, freqs, cums, rans_start, next)."""
     k = data[pos]; pos += 1
     syms = [0] * k
     freqs = [0] * k
     cums = [0] * k
     acc = 0
     for i in range(k):
-        s = data[pos]
-        f = data[pos + 1] | (data[pos + 2] << 8)
-        pos += 3
-        syms[i] = s
-        freqs[i] = f
+        syms[i] = data[pos]
+        freqs[i] = data[pos + 1] | (data[pos + 2] << 8)
         cums[i] = acc
-        acc += f
+        acc += freqs[i]
+        pos += 3
     rans_len = data[pos] | (data[pos + 1] << 8) | (data[pos + 2] << 16)
     pos += 3
-    rp = pos                                       # rANS byte cursor
-    lp = pos + rans_len                            # length-token cursor
-    pos = lp                                        # (block end updated below)
+    return syms, freqs, cums, pos, pos + rans_len
 
-    # Initial state: 4 bytes big-endian (see encode_plane's reversal).
+
+def decode_plane(data: bytes, offset: int, n: int, nsym: int) -> tuple[np.ndarray, int]:
+    """Decode one plane blob at `data[offset:]` for `n` cells -> (plane, next_offset).
+    Mirrors the Lua/C++ decoders exactly (linear-scan symbol lookup, byte renorm)."""
+    mode = data[offset]
+    syms, freqs, cums, rp, lp = _read_table(data, offset + 1)
+    k = len(syms)
+
+    # Initial state: 4 bytes big-endian (see _rans_encode's reversal).
     x = (data[rp] << 24) | (data[rp + 1] << 16) | (data[rp + 2] << 8) | data[rp + 3]
     rp += 4
 
     out = np.empty(n, dtype=np.uint8)
-    cells = 0
+    if mode == 1:                                  # plain rANS: one symbol per cell
+        for i in range(n):
+            slot = x & _MASK
+            j = 0
+            while j + 1 < k and cums[j + 1] <= slot:
+                j += 1
+            x = freqs[j] * (x >> _SCALE_BITS) + slot - cums[j]
+            out[i] = syms[j]
+            while x < _RANS_L:
+                x = (x << 8) | data[rp]
+                rp += 1
+        return out, lp                             # rANS stream end == lp
+
+    cells = 0                                       # mode 0: RLE + rANS run values
     while cells < n:
         slot = x & _MASK
-        # Find the symbol whose cumulative interval contains slot (descending
-        # frequency order -> the common symbols are found first).
-        i = 0
-        while i + 1 < k and cums[i + 1] <= slot:
-            i += 1
-        s = syms[i]
-        x = freqs[i] * (x >> _SCALE_BITS) + slot - cums[i]
+        j = 0
+        while j + 1 < k and cums[j + 1] <= slot:
+            j += 1
+        s = syms[j]
+        x = freqs[j] * (x >> _SCALE_BITS) + slot - cums[j]
         while x < _RANS_L:
             x = (x << 8) | data[rp]
             rp += 1

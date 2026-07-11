@@ -761,7 +761,10 @@ local _RANS_M = 4096             -- 2^12 total frequency (scale)
 
 -- Decode one plane blob at payload[pos..] for `n` cells -> (out table, next pos).
 -- `out` is filled with symbol values (0-based cell index 1..n in the table).
+-- mode 0 = RLE+rANS (run values + length tokens); mode 1 = plain rANS (one
+-- symbol per cell) -- whichever the encoder found smaller.
 local function decode_plane(data, pos, n, out)
+    local mode = data:byte(pos); pos = pos + 1
     local k = data:byte(pos); pos = pos + 1
     local syms, freqs, cums = {}, {}, {}
     local acc = 0
@@ -774,14 +777,28 @@ local function decode_plane(data, pos, n, out)
     end
     local rans_len = u24(data, pos); pos = pos + 3
     local rp = pos                       -- rANS byte cursor
-    local lp = pos + rans_len            -- length-token cursor
+    local lp = pos + rans_len            -- length-token cursor (mode 0)
 
     -- Initial state: 4 bytes big-endian (see rans.py's output reversal).
     local x = data:byte(rp) * 16777216 + data:byte(rp + 1) * 65536
             + data:byte(rp + 2) * 256 + data:byte(rp + 3)
     rp = rp + 4
 
-    local cells = 0
+    if mode == 1 then                    -- plain rANS: one symbol per cell
+        for cell = 1, n do
+            local slot = x % _RANS_M
+            local i = 1
+            while i < k and cums[i + 1] <= slot do i = i + 1 end
+            x = freqs[i] * floor(x / _RANS_M) + slot - cums[i]
+            out[cell] = syms[i]
+            while x < _RANS_L do
+                x = x * 256 + data:byte(rp); rp = rp + 1
+            end
+        end
+        return lp                        -- rANS stream end == lp
+    end
+
+    local cells = 0                      -- mode 0: RLE + rANS run values
     while cells < n do
         local slot = x % _RANS_M
         -- Linear scan (symbols are frequency-descending, so the common ones win
