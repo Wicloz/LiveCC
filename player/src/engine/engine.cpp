@@ -342,6 +342,14 @@ std::size_t PlaybackEngine::PullAudio(std::span<std::int16_t> out) noexcept {
     const std::size_t framesRequested = out.size() / channels;
     std::size_t framesWritten = 0;
 
+    // Scratch buffers reused across every segment/channel below, so a warmed
+    // PullAudio does no per-call heap allocation for these -- allocation in the
+    // audio-feed path is exactly what real-time audio wants to avoid. (The
+    // per-channel `sources` still comes from ResolveOutputSources by value; only
+    // these two, which we build ourselves, are hoisted out of the loop.)
+    std::vector<std::uint8_t> present;
+    std::vector<const ActiveRole*> srcRoles;
+
     while (framesWritten < framesRequested) {
         if (activeAudio_.empty() || audioCursorPts_ >= activeAudioValidUntil_ ||
             audioCursorPts_ < activeAudioValidFrom_) {
@@ -375,7 +383,7 @@ std::size_t PlaybackEngine::PullAudio(std::span<std::int16_t> out) noexcept {
 
         // Roles present in this segment, and (once per segment) the source
         // roles that feed each fixed output channel.
-        std::vector<std::uint8_t> present;
+        present.clear();
         present.reserve(activeAudio_.size());
         for (const ActiveRole& role : activeAudio_) {
             present.push_back(role.role);
@@ -384,7 +392,7 @@ std::size_t PlaybackEngine::PullAudio(std::span<std::int16_t> out) noexcept {
         for (std::size_t ch = 0; ch < channels; ++ch) {
             const std::vector<std::uint8_t> sources =
                 ResolveOutputSources(outputRoles_[ch], present);
-            std::vector<const ActiveRole*> srcRoles;
+            srcRoles.clear();
             srcRoles.reserve(sources.size());
             for (std::uint8_t wanted : sources) {
                 for (const ActiveRole& role : activeAudio_) {
