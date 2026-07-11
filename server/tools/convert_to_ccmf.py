@@ -358,15 +358,21 @@ async def _render(args: argparse.Namespace) -> int:
 
     channels_mask = _parse_channels(args.channels) if want_audio else 0
     codec_id = ccmf.CODEC_PCM8 if args.audio_codec == "pcm" else ccmf.CODEC_DFPWM
-    compression = ccmf.COMPRESSION_LZ4 if args.compression == "lz4" else ccmf.COMPRESSION_NONE
+    _COMPRESSION = {
+        "none": ccmf.COMPRESSION_NONE,
+        "lz4": ccmf.COMPRESSION_LZ4,
+        "brotli": ccmf.COMPRESSION_BROTLI,
+        "bzip2": ccmf.COMPRESSION_BZIP2,
+    }
     # ANS keyframes are self-entropy-coded, so the chunk is left uncompressed
-    # (spec §4.5.3); packed keyframes still honour --compression.
-    video_config = VideoConfig(compression=compression, use_ans=args.ans)
+    # (spec §4.5.3); packed keyframes honour --video-compression.
+    video_config = VideoConfig(compression=_COMPRESSION[args.video_compression],
+                               use_ans=args.video_codec == "ans")
     # DFPWM output is already near-maximum-entropy (an adaptive 1-bit predictive
-    # codec), so LZ4 gains ~nothing on it and just costs a Lua inflate on the CC
-    # client; only PCM8 audio benefits from compression.
-    audio_compression = (compression if codec_id == ccmf.CODEC_PCM8
-                         else ccmf.COMPRESSION_NONE)
+    # codec), so compression gains ~nothing on it and just costs a Lua inflate on
+    # the CC client; only PCM8 audio honours --audio-compression.
+    audio_compression = (_COMPRESSION[args.audio_compression]
+                         if codec_id == ccmf.CODEC_PCM8 else ccmf.COMPRESSION_NONE)
     roles = negotiate_channel_roles(channels_mask) if want_audio else []
 
     end = args.end
@@ -604,16 +610,23 @@ def build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--audio-codec", choices=["pcm", "dfpwm"], default="pcm",
                     help="wire audio codec (default: pcm; dfpwm trades fidelity "
                          "for ~8x less space)")
-    ap.add_argument("--ans", action="store_true",
-                    help="entropy-code keyframes with the ANS encoding (spec §4.5.3); "
-                         "smaller keyframes, and the chunk is then left uncompressed")
-    ap.add_argument("--compression", choices=["none", "lz4"], default="none",
-                    help="per-chunk payload compression (spec §4.1.2): none "
-                         "(default), or lz4 — smaller files that the CC client and "
-                         "the C++ player both decode")
-    ap.add_argument("--channels", default="mono",
+    ap.add_argument("--video-codec", choices=["packed", "ans"], default="packed",
+                    help="keyframe encoding (spec §4.5): packed (default, bit-packed "
+                         "planes) or ans (entropy-coded keyframes, §4.5.3 — smaller, "
+                         "and the chunk is then left uncompressed)")
+    _COMPRESSION_CHOICES = ["none", "lz4", "brotli", "bzip2"]
+    _COMPRESSION_HELP = ("per-chunk payload compression (spec §4.1.2): none; lz4 "
+                         "(default; CC client + C++ player both decode); brotli / "
+                         "bzip2 (smaller, C++ player only).")
+    ap.add_argument("--video-compression", choices=_COMPRESSION_CHOICES, default="lz4",
+                    help=_COMPRESSION_HELP + " Ignored for ANS video (never "
+                         "compressed).")
+    ap.add_argument("--audio-compression", choices=_COMPRESSION_CHOICES, default="lz4",
+                    help=_COMPRESSION_HELP + " Ignored for DFPWM audio (never "
+                         "compressed).")
+    ap.add_argument("--channels", default="stereo",
                     help=f"speaker layout: {', '.join(_CHANNEL_PRESETS)}, or a "
-                         f"comma list of roles ({', '.join(_ROLE_NAMES)}) (default: mono)")
+                         f"comma list of roles ({', '.join(_ROLE_NAMES)}) (default: stereo)")
     ap.add_argument("--gop-seconds", type=float, default=GOP_SECONDS,
                     help=f"video GOP span in seconds (default: {GOP_SECONDS:g})")
     ap.add_argument("--audio-chunk-seconds", type=float, default=AUDIO_CHUNK_SECONDS,

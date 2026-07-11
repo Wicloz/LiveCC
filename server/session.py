@@ -187,6 +187,7 @@ class StreamSession:
                  caps_channels: int = ccmf.CAP_CHANNEL_MONO,
                  dynamic_channels: bool = False,
                  compression: int = ccmf.COMPRESSION_NONE,
+                 compress_mask: Optional[int] = None,
                  use_ans: bool = False) -> None:
         self.url = url
         self.w, self.h, self.fps = w, h, fps
@@ -196,23 +197,24 @@ class StreamSession:
         self.codec = audio_codec
         self.requested_channels = caps_channels
         self.dynamic_channels = dynamic_channels
-        self.compression = compression                   # payload compression (spec §4.1.2)
-        # Live video encoding knobs (read by the GopEncoder inside iter_video at
-        # each GOP boundary).  use_ans may flip during a sync room's lifetime as
-        # ANS-incapable subscribers come and go (set_use_ans); packed GOPs then
-        # use `compression`, ANS GOPs never do (spec §4.5.3).
-        self.video_config = VideoConfig(compression=compression, use_ans=use_ans)
         self.source_channels = 1                         # probed in run() if needed
         self._codec_id = ccmf.CODEC_PCM8 if audio_codec.name == "pcm" \
             else ccmf.CODEC_DFPWM
-        # DFPWM is itself an adaptive 1-bit predictive codec, so its output is
-        # already near-maximum-entropy: LZ4 gains ~nothing on real audio (and
-        # slightly EXPANDS it), while still costing the CC client a Lua inflate
-        # per chunk.  So compress audio only when it's PCM8 (which does benefit,
-        # e.g. on quiet/sparse passages).  Video keeps `compression` regardless.
-        self._audio_compression = (self.compression
-                                   if self._codec_id == ccmf.CODEC_PCM8
-                                   else ccmf.COMPRESSION_NONE)
+        # The compression algorithms every current recipient can inflate (a CAPS
+        # `compress` bitmask; `none` is always in it).  For a private session
+        # this is the one client's caps, fixed; a sync room re-derives it as the
+        # intersection of its members on every join/leave, so the algorithm can
+        # DEGRADE when a weaker client joins and UPGRADE when it leaves
+        # (set_available_compression).  `compression` is the legacy single-algo
+        # form for direct callers/tests.
+        self._compress_available = ccmf.CAP_COMPRESS_NONE | (
+            compress_mask if compress_mask is not None else (1 << compression))
+        # Live video encoding knobs, read by the GopEncoder inside iter_video at
+        # each GOP boundary.  use_ans may flip as ANS-incapable subscribers come
+        # and go (set_use_ans); ANS GOPs are never compressed (spec §4.5.3).
+        self.video_config = VideoConfig(use_ans=use_ans)
+        self._audio_compression = ccmf.COMPRESSION_NONE
+        self._apply_compression()                        # sets both from the mask
 
         self.start = max(0.0, float(start))
         self.end: Optional[float] = float(end) if end else None
@@ -331,6 +333,55 @@ class StreamSession:
         if not use_ans and self.video_buf is not None:
             self.video_buf.purge(ccmf.video_chunk_is_ans)
 
+    def _apply_compression(self) -> None:
+        """Resolve the actual per-chunk-type algorithm from the currently
+        available set (ccmf.best_compression): the most-preferred each recipient
+        can inflate.  DFPWM is already near-max-entropy so it is never
+        compressed (spec §4.6); ANS video is handled in the GopEncoder (spec
+        §4.5.3)."""
+        self.video_config.compression = ccmf.best_compression(
+            ccmf.TYPE_VIDEO, self._compress_available)
+        self._audio_compression = (
+            ccmf.best_compression(ccmf.TYPE_AUDIO, self._compress_available)
+            if self._codec_id == ccmf.CODEC_PCM8 else ccmf.COMPRESSION_NONE)
+
+    def set_available_compression(self, compress_mask: int) -> None:
+        """Re-set the compression algorithms every recipient can inflate (a sync
+        room's membership changed).  Producers pick up the new per-type choice at
+        their next chunk; any buffered chunk whose algorithm is no longer in the
+        set (a DEGRADE — a weaker client joined) is purged so that client never
+        receives one it can't decode.  An UPGRADE only widens the set, so nothing
+        buffered becomes undecodable and no purge is needed.  Synchronous and
+        await-free (see set_use_ans)."""
+        compress_mask |= ccmf.CAP_COMPRESS_NONE          # none is mandatory
+        if compress_mask == self._compress_available:
+            return
+        self._compress_available = compress_mask
+        self._apply_compression()
+        for buf in self._all_buffers():
+            buf.purge(lambda data: not self._compression_available(data))
+
+    def _compression_available(self, chunk_bytes: bytes) -> bool:
+        """Can every current recipient inflate this chunk's compression?"""
+        return bool(self._compress_available & (1 << chunk_bytes[11]))
+
+    def _all_buffers(self):
+        bufs = list(self.audio_bufs.values())
+        if self.video_buf is not None:
+            bufs.append(self.video_buf)
+        return bufs
+
+    def _deliverable(self, chunk_bytes: bytes) -> bool:
+        """A last gate before buffering a freshly-produced chunk: drop it if a
+        mid-encode capability change (a subscriber joining) made its wire format
+        undecodable by a current recipient — a stale ANS GOP once ANS turned off,
+        or a chunk compressed with an algorithm no longer available.  The
+        already-buffered such chunks are purged by set_use_ans /
+        set_available_compression; this closes the in-flight window."""
+        if not self.video_config.use_ans and ccmf.video_chunk_is_ans(chunk_bytes):
+            return False
+        return self._compression_available(chunk_bytes)
+
     # ----- producers -------------------------------------------------------
 
     async def _produce_video(self) -> None:
@@ -355,11 +406,11 @@ class StreamSession:
             # skip source frames to keep up (adaptive pacing) — so trust its
             # pts, don't count.
             async for pts, chunk in agen:
-                # A GOP that was opened as ANS just before use_ans flipped off
-                # (an ANS-incapable subscriber joining) flushes AFTER the flip;
-                # drop it so that subscriber never receives an undecodable chunk.
-                # The already-buffered ANS GOPs are cleared by set_use_ans().
-                if not self.video_config.use_ans and ccmf.video_chunk_is_ans(chunk):
+                # Drop a chunk whose wire format a subscriber that joined mid-
+                # encode can't decode (stale ANS, or a now-unavailable
+                # compression); already-buffered such chunks are purged by the
+                # set_* reconfigurers.
+                if not self._deliverable(chunk):
                     continue
                 await self.video_buf.put(pts / ccmf.SAMPLE_RATE, chunk)
         except Exception:
@@ -406,6 +457,8 @@ class StreamSession:
                                        ccmf.audio_payload(self._codec_id, data,
                                                           channel=role),
                                        compression=self._audio_compression)
+                    if not self._deliverable(chunk):
+                        continue          # compression became unavailable mid-encode
                     await buf.put(pts / self.rate, chunk)
         except Exception:
             log.exception("audio producer failed (roles=%s)", self.producible_roles)

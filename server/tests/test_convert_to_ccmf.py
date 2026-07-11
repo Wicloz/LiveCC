@@ -278,7 +278,7 @@ def test_render_merges_video_and_audio_in_pts_order(tmp_path, monkeypatch):
     assert {t for t, _ in entries} == {ccmf.TYPE_VIDEO, ccmf.TYPE_AUDIO}
 
 
-def test_ans_flag_threads_use_ans_config_to_iter_video(tmp_path, monkeypatch):
+def test_video_codec_ans_threads_use_ans_config_to_iter_video(tmp_path, monkeypatch):
     clip = tmp_path / "clip.mp4"
     clip.write_bytes(b"x")
     seen = {}
@@ -288,9 +288,67 @@ def test_ans_flag_threads_use_ans_config_to_iter_video(tmp_path, monkeypatch):
         yield 0, ccmf.chunk(0, ccmf.TYPE_VIDEO, b"v0")
 
     monkeypatch.setattr(convert_to_ccmf, "iter_video", _capture_iter_video)
-    args = _make_args(tmp_path, clip, extra=["--no-audio", "--ans"])
+    args = _make_args(tmp_path, clip, extra=["--no-audio", "--video-codec", "ans"])
     assert asyncio.run(convert_to_ccmf._render(args)) == 0
     assert seen["config"] is not None and seen["config"].use_ans is True
+
+    # Default is packed.
+    args = _make_args(tmp_path, clip, extra=["--no-audio"])
+    assert asyncio.run(convert_to_ccmf._render(args)) == 0
+    assert seen["config"].use_ans is False
+
+
+def test_video_compression_choice_maps_to_config(tmp_path, monkeypatch):
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"x")
+    seen = {}
+
+    async def _capture(*a, **kw):
+        seen["config"] = kw.get("config")
+        yield 0, ccmf.chunk(0, ccmf.TYPE_VIDEO, b"v0")
+
+    monkeypatch.setattr(convert_to_ccmf, "iter_video", _capture)
+    args = _make_args(tmp_path, clip, extra=["--no-audio", "--video-compression", "brotli"])
+    assert asyncio.run(convert_to_ccmf._render(args)) == 0
+    assert seen["config"].compression == ccmf.COMPRESSION_BROTLI
+
+    # Both video/audio compression default to lz4.
+    args = _make_args(tmp_path, clip, extra=["--no-audio"])
+    assert asyncio.run(convert_to_ccmf._render(args)) == 0
+    assert seen["config"].compression == ccmf.COMPRESSION_LZ4
+
+
+def test_audio_compression_applies_to_pcm_but_not_dfpwm(tmp_path, monkeypatch):
+    clip = tmp_path / "clip.mp4"
+    clip.write_bytes(b"x")
+
+    async def _fake_audio(*a, **kw):
+        yield 0, {0: b"\x80" * 64}
+
+    monkeypatch.setattr(convert_to_ccmf, "iter_audio_roles", _fake_audio)
+
+    def _audio_compressions(path):
+        data = path.read_bytes()
+        off, out = 0, []
+        while off < len(data):
+            ctype, comp = data[off + 10], data[off + 11]
+            length = int.from_bytes(data[off + 7:off + 10], "little")
+            if ctype == ccmf.TYPE_AUDIO:
+                out.append(comp)
+            off += 12 + length
+        return set(out)
+
+    # PCM8 honours --audio-compression.
+    args = _make_args(tmp_path, clip,
+                      extra=["--no-video", "--audio-compression", "brotli"])
+    assert asyncio.run(convert_to_ccmf._render(args)) == 0
+    assert _audio_compressions(tmp_path / "out.ccmf") == {ccmf.COMPRESSION_BROTLI}
+
+    # DFPWM is never compressed, whatever --audio-compression asks for.
+    args = _make_args(tmp_path, clip, extra=["--no-video", "--audio-codec", "dfpwm",
+                                             "--audio-compression", "brotli"])
+    assert asyncio.run(convert_to_ccmf._render(args)) == 0
+    assert _audio_compressions(tmp_path / "out.ccmf") == {ccmf.COMPRESSION_NONE}
 
 
 def test_render_no_video_produces_error(tmp_path, monkeypatch):

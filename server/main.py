@@ -85,27 +85,35 @@ class _SyncGroup:
         self._subs: set[WebSocket] = set()
         self._sub_channels: dict[WebSocket, int] = {}
         self._sub_ans: dict[WebSocket, bool] = {}
+        self._sub_compress: dict[WebSocket, int] = {}
         self._subs_lock = asyncio.Lock()
         self._run_task: Optional[asyncio.Task] = None
 
-    def _apply_ans(self) -> None:
-        """ANS stays on only while EVERY current subscriber can decode it
-        (spec §4.5.3 is a per-client capability).  Synchronous — the caller
-        relies on this completing (and purging undecodable buffered chunks)
-        before the joiner can receive any fanout."""
-        use_ans = bool(self._sub_ans) and all(self._sub_ans.values())
-        self.session.set_use_ans(use_ans)
+    def _apply_caps(self) -> None:
+        """Re-derive the room's live per-member capabilities and push them to the
+        session.  ANS stays on only while EVERY subscriber can decode it (an AND);
+        compression uses the most-preferred algorithm every subscriber can
+        inflate (an intersection of the `compress` masks, ccmf.best_compression).
+        Synchronous — the caller relies on this completing (and purging any now-
+        undecodable buffered chunks) before a joiner can receive fanout."""
+        self.session.set_use_ans(bool(self._sub_ans) and all(self._sub_ans.values()))
+        available = ~0                               # intersection: start all-set
+        for mask in self._sub_compress.values():
+            available &= mask
+        self.session.set_available_compression(
+            available if self._sub_compress else ccmf.CAP_COMPRESS_NONE)
 
     async def subscribe(self, ws: WebSocket, caps_channels: int,
-                        caps_ans: bool) -> None:
+                        caps_ans: bool, caps_compress: int) -> None:
         async with self._subs_lock:
             self._subs.add(ws)
             self._sub_channels[ws] = caps_channels
             self._sub_ans[ws] = caps_ans
-            # Re-derive ANS synchronously, still under the lock and with no await
-            # since the add -- so a just-joined ANS-incapable subscriber cannot
-            # receive a buffered ANS chunk before the format switches off.
-            self._apply_ans()
+            self._sub_compress[ws] = caps_compress
+            # Re-derive caps synchronously, still under the lock and with no await
+            # since the add -- so a just-joined weaker subscriber cannot receive a
+            # buffered ANS/over-compressed chunk before the format degrades.
+            self._apply_caps()
         self._reconcile_channels()
         # A mid-stream joiner has missed the room's STATUS playing, so it has
         # no clock to present against — anchor it to the running clock now
@@ -123,9 +131,10 @@ class _SyncGroup:
             self._subs.discard(ws)
             self._sub_channels.pop(ws, None)
             self._sub_ans.pop(ws, None)
+            self._sub_compress.pop(ws, None)
             empty = not self._subs
             if not empty:
-                self._apply_ans()   # last ANS-incapable member may have left -> resume
+                self._apply_caps()   # a weaker member left -> ANS/compression may upgrade
         if empty and self._run_task and not self._run_task.done():
             self._run_task.cancel()
         elif not empty:
@@ -205,11 +214,11 @@ def _negotiate(room: ccmf.Room, caps: ccmf.Caps) -> Optional[dict]:
     h = _clamp(caps.height, 19, 1, 65535)
     if w * h > ccmf.MAX_GRID_CELLS:
         return None
-    # Opportunistic payload compression: use LZ4 when the client advertises it
-    # (the only compression a CC client can inflate, spec §4.1.2), else none.
-    compression = (ccmf.COMPRESSION_LZ4
-                   if caps.compress_mask & ccmf.CAP_COMPRESS_LZ4
-                   else ccmf.COMPRESSION_NONE)
+    # Forward the client's raw compression capabilities: the session resolves the
+    # most-preferred algorithm per chunk type (ccmf.best_compression), and a sync
+    # room re-derives the available set (an intersection) as members join/leave,
+    # so the algorithm degrades/upgrades with the room (spec §4.1.2/§5.5).
+    compress_mask = caps.compress_mask | ccmf.CAP_COMPRESS_NONE
     # Prefer the ANS keyframe encoding whenever the client can decode it
     # (spec §4.5.3).  In a sync room this is only the INITIAL setting; the
     # group turns ANS off/on as ANS-incapable members join/leave.
@@ -226,7 +235,7 @@ def _negotiate(room: ccmf.Room, caps: ccmf.Caps) -> Optional[dict]:
         "loop": room.loop,
         "audio_codec": codec or PCM,
         "caps_channels": caps.channels,
-        "compression": compression,
+        "compress_mask": compress_mask,
         "use_ans": use_ans,
     }
 
@@ -238,7 +247,9 @@ def _sync_signature(kwargs: dict) -> tuple:
     `caps_channels` is deliberately NOT part of this: channel roles aren't a
     mismatch to reject, they're a union to serve (_SyncGroup reconciles the
     session's produced roles to match every subscriber's request, added to or
-    dropped from as the room's membership changes).
+    dropped from as the room's membership changes).  `compress_mask` and
+    `use_ans` are likewise excluded: they're rectified live per member (the
+    algorithm/encoding degrades or upgrades), not a mismatch to reject.
     """
     return (
         kwargs["w"],
@@ -247,7 +258,6 @@ def _sync_signature(kwargs: dict) -> tuple:
         kwargs["want_audio"],
         kwargs["want_video"],
         kwargs["audio_codec"].name,
-        kwargs["compression"],
     )
 
 
@@ -389,7 +399,8 @@ async def ws_play(websocket: WebSocket):
             await _release_sync_group(room.key(), websocket)
             return
         await group.subscribe(websocket, caps.channels,
-                              bool(caps.video_mask & ccmf.CAP_VIDEO_ANS))
+                              bool(caps.video_mask & ccmf.CAP_VIDEO_ANS),
+                              caps.compress_mask | ccmf.CAP_COMPRESS_NONE)
         group.start_if_needed()
         try:
             await _until_quit_or_disconnect(websocket)

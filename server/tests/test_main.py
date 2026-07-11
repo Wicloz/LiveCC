@@ -171,16 +171,20 @@ def test_negotiate_defaults_prefer_pcm():
         "loop": True,
         "audio_codec": PCM,
         "caps_channels": ccmf.CAP_CHANNEL_MONO,
-        "compression": ccmf.COMPRESSION_NONE,   # default caps advertise none only
-        "use_ans": False,                        # default caps advertise no ANS
+        "compress_mask": ccmf.CAP_COMPRESS_NONE,  # default caps advertise none only
+        "use_ans": False,                          # default caps advertise no ANS
     }
 
 
-def test_negotiate_picks_lz4_when_advertised():
+def test_negotiate_forwards_compress_caps():
     room = ccmf.parse_room(ccmf.build_room("u"))
     caps = ccmf.parse_caps(ccmf.build_caps(
         compress_mask=ccmf.CAP_COMPRESS_NONE | ccmf.CAP_COMPRESS_LZ4))
-    assert main._negotiate(room, caps)["compression"] == ccmf.COMPRESSION_LZ4
+    # The session resolves the actual per-type algorithm; _negotiate just
+    # forwards the mask (with the mandatory none bit).
+    mask = main._negotiate(room, caps)["compress_mask"]
+    assert mask == (ccmf.CAP_COMPRESS_NONE | ccmf.CAP_COMPRESS_LZ4)
+    assert ccmf.best_compression(ccmf.TYPE_VIDEO, mask) == ccmf.COMPRESSION_LZ4
 
 
 def test_negotiate_falls_back_to_dfpwm():
@@ -255,7 +259,7 @@ def test_sync_group_reuse_and_release():
         assert g1 is g2
 
         ws = WS()
-        await g1.subscribe(ws, ccmf.CAP_CHANNEL_MONO, False)
+        await g1.subscribe(ws, ccmf.CAP_CHANNEL_MONO, False, ccmf.CAP_COMPRESS_NONE)
         await main._release_sync_group(room.key(), ws)
         assert room.key() not in main._sync_groups
 
@@ -302,12 +306,16 @@ class _FakeSession:
         self.requested_channels = 0
         self.reconcile_calls = 0
         self.use_ans = False
+        self.available_compression = ccmf.CAP_COMPRESS_NONE
 
     async def reconfigure_channels(self):
         self.reconcile_calls += 1
 
     def set_use_ans(self, use_ans):
         self.use_ans = use_ans
+
+    def set_available_compression(self, mask):
+        self.available_compression = mask | ccmf.CAP_COMPRESS_NONE
 
     def playback_origin(self):
         return None                      # not playing yet: no anchor to send
@@ -322,12 +330,12 @@ def test_sync_group_reconciles_channel_union_on_join_and_leave():
         group = main._SyncGroup(("u", None, None, False), (), fake_session)
         ws1, ws2 = object(), object()
 
-        await group.subscribe(ws1, ccmf.CAP_CHANNEL_MONO | ccmf.CAP_CHANNEL_LFE, False)
+        await group.subscribe(ws1, ccmf.CAP_CHANNEL_MONO | ccmf.CAP_CHANNEL_LFE, False, ccmf.CAP_COMPRESS_NONE)
         await asyncio.sleep(0.01)   # let the fire-and-forget reconcile task run
         assert fake_session.requested_channels == ccmf.CAP_CHANNEL_MONO | ccmf.CAP_CHANNEL_LFE
         assert fake_session.reconcile_calls == 1
 
-        await group.subscribe(ws2, ccmf.CAP_CHANNEL_FRONT_LEFT | ccmf.CAP_CHANNEL_FRONT_RIGHT, False)
+        await group.subscribe(ws2, ccmf.CAP_CHANNEL_FRONT_LEFT | ccmf.CAP_CHANNEL_FRONT_RIGHT, False, ccmf.CAP_COMPRESS_NONE)
         await asyncio.sleep(0.01)
         assert fake_session.requested_channels == (
             ccmf.CAP_CHANNEL_MONO | ccmf.CAP_CHANNEL_LFE
@@ -355,15 +363,44 @@ def test_sync_group_turns_ans_off_for_incompatible_member_and_back_on():
         group = main._SyncGroup(("u", None, None, False), (), fake_session)
         ws_ans, ws_plain = object(), object()
 
-        await group.subscribe(ws_ans, ccmf.CAP_CHANNEL_MONO, True)
+        await group.subscribe(ws_ans, ccmf.CAP_CHANNEL_MONO, True, ccmf.CAP_COMPRESS_NONE)
         assert fake_session.use_ans is True          # all members ANS-capable
 
-        await group.subscribe(ws_plain, ccmf.CAP_CHANNEL_MONO, False)
+        await group.subscribe(ws_plain, ccmf.CAP_CHANNEL_MONO, False, ccmf.CAP_COMPRESS_NONE)
         assert fake_session.use_ans is False         # one can't -> packed for all
 
         empty = await group.unsubscribe(ws_plain)
         assert not empty
         assert fake_session.use_ans is True          # incompatible member gone -> resume
+
+    asyncio.run(go())
+
+
+def test_sync_group_degrades_and_upgrades_compression_with_membership():
+    # A room's available compression is the intersection of its members' caps: a
+    # brotli/bzip2-capable native client alone keeps them; a CC client that only
+    # does lz4 forces the set down (degrade); when it leaves, the set widens back
+    # up (upgrade).
+    async def go():
+        fake_session = _FakeSession()
+        group = main._SyncGroup(("u", None, None, False), (), fake_session)
+        native = (ccmf.CAP_COMPRESS_NONE | ccmf.CAP_COMPRESS_LZ4
+                  | ccmf.CAP_COMPRESS_BROTLI | ccmf.CAP_COMPRESS_BZIP2)
+        cc = ccmf.CAP_COMPRESS_NONE | ccmf.CAP_COMPRESS_LZ4
+        ws_native, ws_cc = object(), object()
+
+        await group.subscribe(ws_native, ccmf.CAP_CHANNEL_MONO, False, native)
+        assert fake_session.available_compression == native
+        assert ccmf.best_compression(
+            ccmf.TYPE_VIDEO, fake_session.available_compression) == ccmf.COMPRESSION_BROTLI
+
+        await group.subscribe(ws_cc, ccmf.CAP_CHANNEL_MONO, False, cc)
+        assert fake_session.available_compression == cc          # degrade to the intersection
+        assert ccmf.best_compression(
+            ccmf.TYPE_VIDEO, fake_session.available_compression) == ccmf.COMPRESSION_LZ4
+
+        await group.unsubscribe(ws_cc)
+        assert fake_session.available_compression == native       # upgrade back
 
     asyncio.run(go())
 
@@ -386,7 +423,7 @@ def test_sync_group_anchors_late_joiner_to_running_clock():
     async def go():
         group = main._SyncGroup(("u", None, None, False), (), _PlayingSession())
         ws = _WS()
-        await group.subscribe(ws, ccmf.CAP_CHANNEL_MONO, False)
+        await group.subscribe(ws, ccmf.CAP_CHANNEL_MONO, False, ccmf.CAP_COMPRESS_NONE)
         statuses = [ccmf.parse_status(body) for op, body in
                     (ccmf.parse_message(b) for b in ws.sent)
                     if op == ccmf.OP_STATUS]
@@ -395,7 +432,7 @@ def test_sync_group_anchors_late_joiner_to_running_clock():
         # Before playback starts (origin None) nothing is sent.
         group2 = main._SyncGroup(("u", None, None, False), (), _FakeSession())
         ws2 = _WS()
-        await group2.subscribe(ws2, ccmf.CAP_CHANNEL_MONO, False)
+        await group2.subscribe(ws2, ccmf.CAP_CHANNEL_MONO, False, ccmf.CAP_COMPRESS_NONE)
         assert ws2.sent == []
 
     asyncio.run(go())

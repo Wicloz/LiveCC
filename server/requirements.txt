@@ -14,3 +14,7 @@ tqdm>=4.66.0
 # LZ4 block (de)compression for the CCMF `compression` field (spec §4.1.2): the
 # server compresses payloads; the Lua/C++ clients ship their own block decoders.
 lz4>=4.0.0
+# brotli: a stronger, native-client-only `compression` algorithm (spec §4.1.2),
+# preferred for video when every recipient can decode it (the C++ player can; the
+# CC/Lua client can't).  bzip2 needs no dependency — Python's `bz2` is stdlib.
+brotli>=1.1.0

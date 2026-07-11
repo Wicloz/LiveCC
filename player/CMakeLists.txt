@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
-project(player LANGUAGES CXX)
+# C is enabled for the fetched brotli/bzip2 sources (both are C libraries).
+project(player LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -39,6 +40,43 @@ FetchContent_Declare(
     GIT_SHALLOW    TRUE
 )
 FetchContent_MakeAvailable(raylib)
+
+# --- brotli (decoder) + bzip2: native-only chunk compression (spec 4.1.2). The
+# CC/Lua client can't inflate these (no native bit ops); the desktop player can.
+# Fetched and compiled as small static libs straight from upstream sources --
+# SOURCE_SUBDIR points at a dir with no CMakeLists.txt, so their own build never
+# runs and we own the target (and keep our /W4 -Werror off their code). --------
+FetchContent_Declare(
+    brotli
+    GIT_REPOSITORY https://github.com/google/brotli.git
+    GIT_TAG        v1.1.0
+    GIT_SHALLOW    TRUE
+    SOURCE_SUBDIR  do-not-configure
+)
+FetchContent_MakeAvailable(brotli)
+file(GLOB _brotli_dec_srcs
+     "${brotli_SOURCE_DIR}/c/common/*.c"
+     "${brotli_SOURCE_DIR}/c/dec/*.c")
+add_library(brotlidec_static STATIC ${_brotli_dec_srcs})
+target_include_directories(brotlidec_static PUBLIC "${brotli_SOURCE_DIR}/c/include")
+
+FetchContent_Declare(
+    bzip2
+    GIT_REPOSITORY https://gitlab.com/bzip2/bzip2.git
+    GIT_TAG        bzip2-1.0.8
+    GIT_SHALLOW    TRUE
+    SOURCE_SUBDIR  do-not-configure
+)
+FetchContent_MakeAvailable(bzip2)
+add_library(bz2_static STATIC
+    "${bzip2_SOURCE_DIR}/blocksort.c"
+    "${bzip2_SOURCE_DIR}/huffman.c"
+    "${bzip2_SOURCE_DIR}/crctable.c"
+    "${bzip2_SOURCE_DIR}/randtable.c"
+    "${bzip2_SOURCE_DIR}/compress.c"
+    "${bzip2_SOURCE_DIR}/decompress.c"
+    "${bzip2_SOURCE_DIR}/bzlib.c")
+target_include_directories(bz2_static PUBLIC "${bzip2_SOURCE_DIR}")
 
 # Warning flags for OUR code only (never applied globally, so they don't turn
 # into noise/failures inside fetched third-party sources like raylib/gtest).

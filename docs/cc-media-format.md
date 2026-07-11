@@ -127,26 +127,32 @@ with wide margin.
 #### 4.1.2. Compression
 
 `compression` selects a payload-wide compression applied uniformly to **any**
-chunk type: `0` none · `1` deflate · `2` lz4 · `3` zstd. The whole payload is
-compressed as one blob; the consumer inflates it before dispatching by `type`,
-so type-specific decoders never handle compression. Formats:
+chunk type: `0` none · `1` deflate · `2` lz4 · `3` zstd · `4` brotli · `5`
+bzip2. The whole payload is compressed as one blob; the consumer inflates it
+before dispatching by `type`, so type-specific decoders never handle
+compression. Every compressed format is framed **`[uncompressed size u32 LE]
+[codec stream]`** (the size lets a decoder allocate the output up front).
+Formats:
 
-- **`none`** — the payload is the raw bytes.
-- **`lz4`** — the payload is `[uncompressed size u32 LE][raw LZ4 block]`: read
-  the size, LZ4-block-decode the remainder into it, then interpret the result
-  per `type`. (Raw block = the standard LZ4 sequence format; no frame header.)
-- **`deflate` / `zstd`** — reserved, native-client only, and **not yet
-  produced**. Only `lz4` is realistically decodable on a CC/Lua client (it is
-  byte-oriented; CC has no native bit ops, and its WebSocket can't offload via
-  permessage-deflate).
+- **`none`** — the payload is the raw bytes (no size prefix).
+- **`lz4`** — the stream is a raw LZ4 block (standard LZ4 sequence format, no
+  frame header). The only format realistically decodable on a CC/Lua client: it
+  is byte-oriented, and CC has no native bit ops (its WebSocket also can't
+  offload via permessage-deflate).
+- **`brotli`** — a raw brotli stream. Native clients only (bit-level entropy
+  coding).
+- **`bzip2`** — a bzip2 stream (`BZh…`). Native clients only.
+- **`deflate` / `zstd`** — reserved and **not yet produced**.
 
 It is chosen **per chunk**, so a producer compresses what benefits (a video
-GOP's redundant `delta` frames, PCM8 audio) and leaves the rest `none`. Per-
+GOP's `delta`/packed frames, PCM8 audio) and leaves the rest `none`. Per-
 frame/per-unit compression is deliberately not offered — small deltas compress
 poorly in isolation, and the chunk is already the random-access unit. A client
 advertises what it can inflate via the CAPS `compress` bitmask (Section 5.4);
 a server **MUST** use only advertised algorithms, so a CC member never receives
-one it can't decode.
+one it can't decode. Which algorithm a negotiated stream actually uses is
+governed by a per-chunk-type preference, rectified as members join and leave
+(Section 5.5).
 
 A chunk carrying a `raw-ANS` keyframe (Section 4.5.3) **MUST** use `compression`
 = `none`: its planes are already entropy coded. This is per chunk, so audio and
@@ -436,6 +442,7 @@ The server **MUST NOT** echo the chosen configuration; clients learn actual
 [ channels u16 ] one-hot per channel role (Section 4.6): bit N = accepts role N
                  (bit0 mono · bit1 front-left · bit2 front-right · … up to 7.1)
 [ compress u8 ]  bitmask: bit0 none · bit1 deflate · bit2 lz4 · bit3 zstd
+                 · bit4 brotli · bit5 bzip2 (bit N = can inflate compression N)
 [ width  u16 ]   requested grid width, in character cells (Section 4.5)
 [ height u16 ]   requested grid height, in character cells (Section 4.5)
 [ fps    u8  ]
@@ -483,6 +490,20 @@ is not.  How a producer mixes is implementation-defined.
   per-chunk encoding makes the switch need no signaling. (Since a `raw` keyframe
   is decodable by everyone, only the ANS→packed direction must fence off
   already-buffered ANS chunks from the new subscriber.)
+- **Compression is likewise rectified per member.** Each chunk type has an
+  ordered preference of algorithms; a shared room uses, for each type, the
+  most-preferred algorithm **every** current subscriber can inflate (the
+  intersection of their `compress` masks — always non-empty, since `none` is
+  mandatory). The set is re-derived on every join/leave, so a weaker member
+  joining **degrades** the algorithm (e.g. brotli → lz4 when a CC client joins a
+  native room) and its leaving **upgrades** it again. On a degrade the server
+  fences off buffered chunks whose algorithm the new member can't inflate; an
+  upgrade needs no fencing (existing chunks stay decodable by all). A reference
+  server prefers brotli then bzip2 then lz4 for video, and bzip2 then brotli
+  then lz4 for audio; `raw-ANS` video and DFPWM audio are left uncompressed
+  regardless (Sections 4.5.3, 4.6). This preference/rectification policy is a
+  server choice — the wire only requires that a member never receive an
+  algorithm outside its advertised `compress` mask.
 
 ### 5.6. STATUS and the Playback Clock
 

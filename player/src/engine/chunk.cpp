@@ -1,5 +1,8 @@
 #include "engine/chunk.hpp"
 
+#include <brotli/decode.h>
+#include <bzlib.h>
+
 #include "engine/byteio.hpp"
 
 namespace ccmfplayer {
@@ -77,6 +80,36 @@ std::vector<std::byte> Lz4DecompressBlock(std::span<const std::byte> in,
     return out;
 }
 
+// brotli/bzip2 (spec 4.1.2, native clients only): both framed as
+// [uncompressed size u32 LE][codec stream].  The size lets us allocate the
+// output exactly, so each is one bounded buffer-to-buffer decode.
+std::vector<std::byte> BrotliDecompress(std::span<const std::byte> in, std::size_t outSize) {
+    std::vector<std::byte> out(outSize);
+    std::size_t decoded = outSize;
+    const auto rc = BrotliDecoderDecompress(
+        in.size(), reinterpret_cast<const std::uint8_t*>(in.data()),
+        &decoded, reinterpret_cast<std::uint8_t*>(out.data()));
+    if (rc != BROTLI_DECODER_RESULT_SUCCESS || decoded != outSize) {
+        throw CcmfError("brotli: decode failed");
+    }
+    return out;
+}
+
+std::vector<std::byte> Bzip2Decompress(std::span<const std::byte> in, std::size_t outSize) {
+    std::vector<std::byte> out(outSize);
+    unsigned int decoded = static_cast<unsigned int>(outSize);
+    // const_cast: libbz2's buffer API takes a non-const src pointer but does not
+    // write through it.
+    const int rc = BZ2_bzBuffToBuffDecompress(
+        reinterpret_cast<char*>(out.data()), &decoded,
+        const_cast<char*>(reinterpret_cast<const char*>(in.data())),
+        static_cast<unsigned int>(in.size()), 0, 0);
+    if (rc != BZ_OK || decoded != outSize) {
+        throw CcmfError("bzip2: decode failed");
+    }
+    return out;
+}
+
 }  // namespace
 
 std::vector<std::byte> DecompressPayload(std::span<const std::byte> payload,
@@ -84,11 +117,19 @@ std::vector<std::byte> DecompressPayload(std::span<const std::byte> payload,
     if (compression == kCompressionNone) {
         return std::vector<std::byte>(payload.begin(), payload.end());
     }
+    // Every compressed format shares the [uncompressed size u32 LE][stream] frame.
+    if (payload.size() < 4) throw CcmfError("truncated compressed payload");
+    const auto outSize =
+        static_cast<std::size_t>(ReadLittleEndian<4>(payload.subspan(0, 4)));
+    const auto stream = payload.subspan(4);
     if (compression == kCompressionLz4) {
-        if (payload.size() < 4) throw CcmfError("LZ4: truncated payload");
-        const auto outSize =
-            static_cast<std::size_t>(ReadLittleEndian<4>(payload.subspan(0, 4)));
-        return Lz4DecompressBlock(payload.subspan(4), outSize);
+        return Lz4DecompressBlock(stream, outSize);
+    }
+    if (compression == kCompressionBrotli) {
+        return BrotliDecompress(stream, outSize);
+    }
+    if (compression == kCompressionBzip2) {
+        return Bzip2Decompress(stream, outSize);
     }
     throw CcmfError("unsupported compression " + std::to_string(compression));
 }

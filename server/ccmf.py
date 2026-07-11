@@ -45,6 +45,8 @@ COMPRESSION_NONE = 0
 COMPRESSION_DEFLATE = 1          # deferred (native clients only)
 COMPRESSION_LZ4 = 2              # spec §4.1.2: [uncompressed size u32 LE][raw LZ4 block]
 COMPRESSION_ZSTD = 3            # deferred (native clients only)
+COMPRESSION_BROTLI = 4          # native clients only (§4.1.2); [size u32 LE][brotli stream]
+COMPRESSION_BZIP2 = 5           # native clients only; [size u32 LE][bzip2 stream]
 
 # Frame-unit encodings (unit flags bits 6-4).
 ENC_RAW = 0
@@ -75,15 +77,23 @@ _CHUNK_HEADER = 12               # marker + PTS + length + type + compression
 # --------------------------------------------------------------------------- #
 
 def compress_payload(payload: bytes, compression: int) -> bytes:
-    """Apply chunk-payload compression (spec §4.1.2).  LZ4 wraps the payload as
-    [uncompressed size u32 LE][raw LZ4 block]; `none` is a passthrough.  deflate/
-    zstd are reserved for native clients and not produced here."""
+    """Apply chunk-payload compression (spec §4.1.2).  Every compressed format is
+    framed as [uncompressed size u32 LE][codec stream] (the size lets a decoder
+    allocate up front; LZ4's raw block needs it, and it keeps the others
+    uniform); `none` is a passthrough.  LZ4 is the only format the CC/Lua client
+    can inflate; brotli/bzip2 are for native clients (deflate/zstd reserved)."""
     if compression == COMPRESSION_NONE:
         return payload
+    size = len(payload).to_bytes(4, "little")
     if compression == COMPRESSION_LZ4:
         import lz4.block                       # lazy: `none` path needs no lz4
-        return (len(payload).to_bytes(4, "little")
-                + lz4.block.compress(payload, store_size=False))
+        return size + lz4.block.compress(payload, store_size=False)
+    if compression == COMPRESSION_BROTLI:
+        import brotli
+        return size + brotli.compress(payload)
+    if compression == COMPRESSION_BZIP2:
+        import bz2
+        return size + bz2.compress(payload, 9)
     raise ValueError(f"unsupported compression {compression}")
 
 
@@ -91,13 +101,41 @@ def decompress_payload(data: bytes, compression: int) -> bytes:
     """Inverse of compress_payload."""
     if compression == COMPRESSION_NONE:
         return data
+    if len(data) < 4:
+        raise ValueError("truncated compressed payload")
+    size = int.from_bytes(data[:4], "little")
+    stream = data[4:]
     if compression == COMPRESSION_LZ4:
         import lz4.block
-        if len(data) < 4:
-            raise ValueError("truncated LZ4 payload")
-        size = int.from_bytes(data[:4], "little")
-        return lz4.block.decompress(data[4:], uncompressed_size=size)
+        return lz4.block.decompress(stream, uncompressed_size=size)
+    if compression == COMPRESSION_BROTLI:
+        import brotli
+        return brotli.decompress(stream)
+    if compression == COMPRESSION_BZIP2:
+        import bz2
+        return bz2.decompress(stream)
     raise ValueError(f"unsupported compression {compression}")
+
+
+# Ordered per-chunk-type compression preference (best first).  A negotiated
+# stream uses the most-preferred algorithm every current member can inflate
+# (spec §4.1.2/§5.5).  From bench_compression on real media: brotli leads on
+# video, bzip2 on PCM8 audio; lz4 is the CC-decodable fallback, none the floor.
+COMPRESSION_PREFERENCE = {
+    TYPE_VIDEO: (COMPRESSION_BROTLI, COMPRESSION_BZIP2, COMPRESSION_LZ4, COMPRESSION_NONE),
+    TYPE_AUDIO: (COMPRESSION_BZIP2, COMPRESSION_BROTLI, COMPRESSION_LZ4, COMPRESSION_NONE),
+}
+
+
+def best_compression(ctype: int, available_mask: int) -> int:
+    """The most-preferred compression for `ctype` whose bit is set in
+    `available_mask` (a CAPS `compress` bitmask — e.g. the intersection of a
+    room's members).  `none` is mandatory and last in every preference, so this
+    always returns a usable algorithm."""
+    for comp in COMPRESSION_PREFERENCE.get(ctype, (COMPRESSION_NONE,)):
+        if available_mask & (1 << comp):
+            return comp
+    return COMPRESSION_NONE
 
 
 def chunk(pts: int, ctype: int, payload: bytes,
@@ -487,6 +525,8 @@ CAP_AUDIO_PCM8 = 0x01
 CAP_AUDIO_DFPWM = 0x02
 CAP_COMPRESS_NONE = 1 << COMPRESSION_NONE     # 0x01, mandatory
 CAP_COMPRESS_LZ4 = 1 << COMPRESSION_LZ4       # 0x04
+CAP_COMPRESS_BROTLI = 1 << COMPRESSION_BROTLI  # 0x10 (native clients)
+CAP_COMPRESS_BZIP2 = 1 << COMPRESSION_BZIP2    # 0x20 (native clients)
 # channels: bit N = accepts channel role N (spec §5.4, roles per §4.6).
 CAP_CHANNEL_MONO = 1 << CHANNEL_MONO
 CAP_CHANNEL_FRONT_LEFT = 1 << CHANNEL_FRONT_LEFT

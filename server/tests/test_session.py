@@ -70,6 +70,46 @@ def test_dfpwm_audio_skips_compression_but_video_keeps_it():
     assert s_pcm._audio_compression == ccmf.COMPRESSION_LZ4
 
 
+def test_available_compression_resolves_per_type():
+    # A native client's full mask -> brotli video, bzip2 PCM8 audio (the per-type
+    # preferences); DFPWM audio always none.
+    mask = (ccmf.CAP_COMPRESS_NONE | ccmf.CAP_COMPRESS_LZ4
+            | ccmf.CAP_COMPRESS_BROTLI | ccmf.CAP_COMPRESS_BZIP2)
+    s = StreamSession("u", w=6, h=4, fps=24, want_audio=True,
+                      audio_codec=PCM, compress_mask=mask)
+    assert s.video_config.compression == ccmf.COMPRESSION_BROTLI
+    assert s._audio_compression == ccmf.COMPRESSION_BZIP2
+
+    s_df = StreamSession("u", w=6, h=4, fps=24, want_audio=True,
+                         audio_codec=DFPWM, compress_mask=mask)
+    assert s_df._audio_compression == ccmf.COMPRESSION_NONE   # DFPWM never compressed
+    assert s_df.video_config.compression == ccmf.COMPRESSION_BROTLI
+
+
+def test_set_available_compression_degrades_and_purges_undecodable_chunks():
+    async def go():
+        native = (ccmf.CAP_COMPRESS_NONE | ccmf.CAP_COMPRESS_LZ4
+                  | ccmf.CAP_COMPRESS_BROTLI | ccmf.CAP_COMPRESS_BZIP2)
+        s = StreamSession("u", w=6, h=4, fps=24, want_audio=False, compress_mask=native)
+        s._setup_buffers()
+        assert s.video_config.compression == ccmf.COMPRESSION_BROTLI
+
+        payload = b"hello world " * 40
+        brotli_chunk = ccmf.chunk(0, ccmf.TYPE_VIDEO, payload,
+                                  compression=ccmf.COMPRESSION_BROTLI)
+        lz4_chunk = ccmf.chunk(1, ccmf.TYPE_VIDEO, payload,
+                               compression=ccmf.COMPRESSION_LZ4)
+        await s.video_buf.put(0.0, brotli_chunk)
+        await s.video_buf.put(0.1, lz4_chunk)
+
+        # A CC client joins: only none+lz4 available -> brotli chunk purged.
+        s.set_available_compression(ccmf.CAP_COMPRESS_NONE | ccmf.CAP_COMPRESS_LZ4)
+        assert s.video_config.compression == ccmf.COMPRESSION_LZ4
+        remaining = [d for _, d in s.video_buf.pop_due(9.9)]
+        assert remaining == [lz4_chunk]              # the brotli chunk was evicted
+    run(go())
+
+
 def test_pop_due_releases_in_pts_order():
     async def go():
         b = TimedBuffer(10, drop_oldest=False)

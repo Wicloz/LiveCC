@@ -27,10 +27,13 @@ inline constexpr std::size_t kChunkHeaderSize = 12;
 inline constexpr std::uint8_t kChunkTypeVideo = 0;
 inline constexpr std::uint8_t kChunkTypeAudio = 1;
 
-// Compression values (spec 4.1.2). Only `none` and `lz4` are decodable here;
-// `deflate`/`zstd` are reserved for other native clients and rejected on decode.
+// Compression values (spec 4.1.2). This native player decodes none/lz4/brotli/
+// bzip2; `deflate`/`zstd` (1/3) are reserved and rejected on decode.  Every
+// compressed format is framed [uncompressed size u32 LE][codec stream].
 inline constexpr std::uint8_t kCompressionNone = 0;
 inline constexpr std::uint8_t kCompressionLz4 = 2;
+inline constexpr std::uint8_t kCompressionBrotli = 4;
+inline constexpr std::uint8_t kCompressionBzip2 = 5;
 
 // Thrown for anything that makes a chunk (or a whole file) unreadable: a bad
 // marker, a truncated header/payload, unsupported compression, or a
