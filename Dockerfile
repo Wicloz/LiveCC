@@ -11,6 +11,7 @@ ENV PYTHONUNBUFFERED=1
 
 COPY server/requirements.txt ./
 RUN pip install --no-cache-dir -Ur requirements.txt
+COPY server/requirements.dev.txt ./
 
 COPY server/ ./server/
 COPY lua/ ./lua/

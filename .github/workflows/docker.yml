@@ -50,4 +50,4 @@ jobs:
       - name: Run test suite inside the image
         run: |
           docker run --rm -w /app/server livecc:ci \
-            sh -c "pip install --no-cache-dir pytest && pytest -q -m 'not youtube'"
+            sh -c "pip install --no-cache-dir -Ur requirements.dev.txt && pytest -q -m 'not youtube'"

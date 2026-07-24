@@ -32,7 +32,7 @@ jobs:
           cache: pip
           cache-dependency-path: |
             server/requirements.txt
-            server/requirements-dev.txt
+            server/requirements.dev.txt
 
       # ffmpeg is needed by the audio/video integration tests; without it they
       # skip rather than fail.
@@ -46,7 +46,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r server/requirements-dev.txt
+          pip install -r server/requirements.dev.txt
 
       # Exclude the YouTube-facing test: GitHub's datacenter IPs get bot-blocked,
       # so it can't run reliably in CI regardless of deno/node being present.
